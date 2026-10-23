@@ -148,7 +148,7 @@ type Query struct {
 - CI builds `linux/amd64` and `linux/arm64` with `CGO_ENABLED=0`, runs `go vet` and staticcheck, the fast suite, a race-enabled binary, and the Alpine kernel job. The workflow triggers on the repository's actual default branch (`master`).
 - Define `model.Sample` (including `IntervalMS`), `model.Query` (matchers, host/scope, limit), and `model.TimeRange`.
 - Define the streaming `store.Store` interface, `store.Chunk`, and the config package.
-- Config schema (YAML, strict decoding): `interval`, `data_dir`, `proc_path`, `host`, `log_level`, `log_format`, `sources.{system,process,docker}`, `storage.{chunk_interval,primary,disk,s3}`, `retention`. `storage.primary` is the single active backend; per-backend `enabled` flags are not needed.
+- Config schema (YAML, strict decoding): `data_dir`, `proc_path`, `host`, `log_level`, `log_format`, `sources.{system,process,docker}` (each with `enabled` and `interval`), `storage.{chunk_interval,primary,s3}`, `retention`. `storage.primary` is the single active backend; per-backend `enabled` flags are not needed. `storage.chunk_interval` must divide one hour evenly, and `host` must be a single path component.
 - Wire `cobra` root and stub subcommands: `collect`, `query`, `tail`, `stats`, `config`, `version`.
 - `version` prints version, commit, and build date injected via `-ldflags`.
 - `FROM scratch` Dockerfile with the CA bundle copied in (already present) and a non-root user.
@@ -297,10 +297,10 @@ Dockerfile                     # FROM scratch, static binary, CA bundle
 - [x] Wire `cobra` root and stub subcommands.
 - [x] `version` subcommand with `-ldflags` metadata.
 - [x] Fix the CI trigger to the default branch (`master`).
-- [ ] Extend `model.Sample` with `IntervalMS`; add `LabelMatcher`, `Query.Host/Scope/Limit`, and the streaming `Store`/`Chunk` contract.
-- [ ] Add config: `host`, `proc_path`, `storage.chunk_interval` (validated to divide one hour, replacing `storage.s3.chunk_interval`), per-source `interval`, S3 `path_style`/`spool_dir`/`spool_max_bytes`; remove `flush_interval` and the per-backend `enabled` flags (`storage.primary` selects the backend).
-- [ ] Add `collect --dry-run`, `collect --once`, and `--data-dir` for `collect`/`query`.
-- [ ] Define exit code 3 for persistent store failure in `internal/cli`.
+- [x] Extend `model.Sample` with `IntervalMS`; add `LabelMatcher`, `Query.Host/Scope/Limit`, and the streaming `Store`/`Chunk` contract.
+- [x] Add config: `host`, `proc_path`, `storage.chunk_interval` (validated to divide one hour, replacing `storage.s3.chunk_interval`), per-source `interval`, S3 `path_style`/`spool_dir`/`spool_max_bytes`; remove `flush_interval` and the per-backend `enabled` flags (`storage.primary` selects the backend).
+- [x] Add `collect --dry-run`, `collect --once`, and `--data-dir` for `collect`/`query`.
+- [x] Define exit code 3 for persistent store failure in `internal/cli`.
 - [x] Update the integration-testing guidance to permit pure-function table tests (and add a `test-unit` recipe).
 
 ### Phase 1 — System Metrics, Disk, Query (v0.1)
@@ -311,7 +311,7 @@ Dockerfile                     # FROM scratch, static binary, CA bundle
 - [ ] Implement the chunk assembler: UTC-aligned 5-minute windows, per `(host, scope)`, sorted samples, partial flush.
 - [ ] Implement the disk store: `<host>/<scope>/YYYY/MM/DD/HH/<start>-<end>.jsonl.gz`, `.tmp` + rename, collision guard.
 - [ ] Implement streaming `query` with table, JSON, JSONL, and CSV output; `--since/--until/--host/--scope/--metric/--label/--limit`.
-- [ ] Add `collect --dry-run`, `collect --once`, `--data-dir`, and structured logging.
+- [ ] Implement `collect --dry-run` and `collect --once` behavior; the flags and `--data-dir` override are already wired in Phase 0, and structured logging is in place.
 - [ ] Add exit code 3 on persistent store failure and a startup free-space warning.
 - [ ] Golden tests for help text and config output; structural tests for chunk keys, ordering, and schema.
 - [ ] Fast suite: `collect --once`, query, formats, signals, dry-run, and error paths against real `/proc`.

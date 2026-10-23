@@ -4,7 +4,10 @@ Usage:
   smob collect [flags]
 
 Flags:
-  -h, --help   help for collect
+      --data-dir string   override data_dir from the configuration
+      --dry-run           validate the configuration and exit without writing
+  -h, --help              help for collect
+      --once              collect one snapshot from every enabled source and exit
 
 Global Flags:
       --config string       path to the YAML configuration file (default "/etc/smob/smob.yaml")

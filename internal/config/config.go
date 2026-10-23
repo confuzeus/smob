@@ -43,16 +43,21 @@ func (d Duration) Std() time.Duration {
 	return time.Duration(d)
 }
 
+// String returns the duration in Go syntax, such as "5m0s".
+func (d Duration) String() string {
+	return time.Duration(d).String()
+}
+
 // Config is the root of the YAML configuration.
 type Config struct {
-	Interval      Duration  `yaml:"interval"`
-	FlushInterval Duration  `yaml:"flush_interval"`
-	DataDir       string    `yaml:"data_dir"`
-	LogLevel      string    `yaml:"log_level"`
-	LogFormat     string    `yaml:"log_format"`
-	Sources       Sources   `yaml:"sources"`
-	Storage       Storage   `yaml:"storage"`
-	Retention     Retention `yaml:"retention"`
+	DataDir   string    `yaml:"data_dir"`
+	ProcPath  string    `yaml:"proc_path"`
+	Host      string    `yaml:"host"`
+	LogLevel  string    `yaml:"log_level"`
+	LogFormat string    `yaml:"log_format"`
+	Sources   Sources   `yaml:"sources"`
+	Storage   Storage   `yaml:"storage"`
+	Retention Retention `yaml:"retention"`
 }
 
 // Sources selects which metric sources the collector runs.
@@ -64,7 +69,8 @@ type Sources struct {
 
 // SystemSource configures host-wide metrics from /proc.
 type SystemSource struct {
-	Enabled bool `yaml:"enabled"`
+	Enabled  bool     `yaml:"enabled"`
+	Interval Duration `yaml:"interval"`
 }
 
 // ProcessSource configures per-process metrics from /proc/[pid].
@@ -72,36 +78,34 @@ type ProcessSource struct {
 	Enabled        bool     `yaml:"enabled"`
 	Filter         string   `yaml:"filter"`
 	TopN           int      `yaml:"top_n"`
+	Interval       Duration `yaml:"interval"`
 	RescanInterval Duration `yaml:"rescan_interval"`
 }
 
 // DockerSource configures per-container metrics from the Docker Engine API.
 type DockerSource struct {
-	Enabled bool   `yaml:"enabled"`
-	Socket  string `yaml:"socket"`
-	Exclude string `yaml:"exclude"`
+	Enabled  bool     `yaml:"enabled"`
+	Socket   string   `yaml:"socket"`
+	Exclude  string   `yaml:"exclude"`
+	Interval Duration `yaml:"interval"`
 }
 
 // Storage selects and configures the persistence backend.
 type Storage struct {
-	Primary string      `yaml:"primary"`
-	Disk    DiskStorage `yaml:"disk"`
-	S3      S3Storage   `yaml:"s3"`
-}
-
-// DiskStorage configures the local filesystem backend.
-type DiskStorage struct {
-	Enabled bool `yaml:"enabled"`
+	Primary       string    `yaml:"primary"`
+	ChunkInterval Duration  `yaml:"chunk_interval"`
+	S3            S3Storage `yaml:"s3"`
 }
 
 // S3Storage configures the S3-compatible backend.
 type S3Storage struct {
-	Enabled       bool     `yaml:"enabled"`
-	Endpoint      string   `yaml:"endpoint"`
-	Region        string   `yaml:"region"`
-	Bucket        string   `yaml:"bucket"`
-	Prefix        string   `yaml:"prefix"`
-	ChunkInterval Duration `yaml:"chunk_interval"`
+	Endpoint      string `yaml:"endpoint"`
+	Region        string `yaml:"region"`
+	Bucket        string `yaml:"bucket"`
+	Prefix        string `yaml:"prefix"`
+	PathStyle     *bool  `yaml:"path_style"`
+	SpoolDir      string `yaml:"spool_dir"`
+	SpoolMaxBytes int64  `yaml:"spool_max_bytes"`
 }
 
 // Retention bounds the data kept by the disk backend. S3 retention is left to
@@ -121,32 +125,38 @@ type DiskRetention struct {
 // file only needs to state what differs from these values.
 func Default() Config {
 	return Config{
-		Interval:      Duration(10 * time.Second),
-		FlushInterval: Duration(30 * time.Second),
-		DataDir:       "/var/lib/smob",
-		LogLevel:      "info",
-		LogFormat:     "text",
+		DataDir:   "/var/lib/smob",
+		ProcPath:  "/proc",
+		LogLevel:  "info",
+		LogFormat: "text",
 		Sources: Sources{
-			System: SystemSource{Enabled: true},
+			System: SystemSource{
+				Enabled:  true,
+				Interval: Duration(10 * time.Second),
+			},
 			Process: ProcessSource{
+				TopN:           20,
+				Interval:       Duration(30 * time.Second),
 				RescanInterval: Duration(30 * time.Second),
 			},
 			Docker: DockerSource{
-				Socket: "/var/run/docker.sock",
+				Socket:   "/var/run/docker.sock",
+				Interval: Duration(10 * time.Second),
 			},
 		},
 		Storage: Storage{
-			Primary: "disk",
-			Disk:    DiskStorage{Enabled: true},
+			Primary:       "disk",
+			ChunkInterval: Duration(5 * time.Minute),
 			S3: S3Storage{
-				ChunkInterval: Duration(time.Minute),
+				SpoolMaxBytes: 1 << 30,
 			},
 		},
 	}
 }
 
 // Load reads and decodes the configuration at path. The file is decoded
-// strictly: an unknown field is an error, never silently ignored.
+// strictly: an unknown field is an error, never silently ignored. Host
+// defaults to the machine's hostname when the file does not set one.
 func Load(path string) (Config, error) {
 	f, err := os.Open(path)
 	if err != nil {
@@ -157,6 +167,13 @@ func Load(path string) (Config, error) {
 	cfg, err := Parse(f)
 	if err != nil {
 		return Config{}, fmt.Errorf("parse config %s: %w", path, err)
+	}
+	if cfg.Host == "" {
+		host, err := os.Hostname()
+		if err != nil {
+			return Config{}, fmt.Errorf("resolve host: %w", err)
+		}
+		cfg.Host = host
 	}
 	return cfg, nil
 }

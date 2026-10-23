@@ -4,7 +4,8 @@ Usage:
   smob query [flags]
 
 Flags:
-  -h, --help   help for query
+      --data-dir string   override data_dir from the configuration
+  -h, --help              help for query
 
 Global Flags:
       --config string       path to the YAML configuration file (default "/etc/smob/smob.yaml")

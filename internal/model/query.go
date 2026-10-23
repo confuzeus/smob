@@ -20,9 +20,32 @@ func (r TimeRange) Contains(t time.Time) bool {
 	return true
 }
 
-// Query selects samples from a store.
+// LabelOp is the comparison applied by a LabelMatcher.
+type LabelOp int
+
+const (
+	// LabelEqual requires the label value to equal the matcher value.
+	LabelEqual LabelOp = iota
+	// LabelRegex requires the label value to match the matcher value as a
+	// regular expression.
+	LabelRegex
+)
+
+// LabelMatcher constrains one sample label.
+type LabelMatcher struct {
+	Name  string
+	Op    LabelOp
+	Value string
+}
+
+// Query selects samples from a store. Empty Host, Scope, and Metric fields are
+// unconstrained. Matchers in Labels are ANDed, and Limit is applied after
+// filtering and sorting. A zero Limit means unlimited.
 type Query struct {
 	Range  TimeRange
+	Host   string
+	Scope  string
 	Metric string
-	Labels map[string]string
+	Labels []LabelMatcher
+	Limit  int
 }

@@ -8,12 +8,14 @@ import "time"
 //
 // Timestamps are UTC. Every series is identified by Metric plus Labels; labels
 // describe the collection scope (for example scope=system) and any per-series
-// dimensions such as the network interface or process ID.
+// dimensions such as the network interface or process ID. IntervalMS records
+// the measurement window for rate samples and is zero for gauges.
 type Sample struct {
-	Timestamp time.Time         `json:"timestamp"`
-	Metric    string            `json:"metric"`
-	Value     float64           `json:"value"`
-	Labels    map[string]string `json:"labels,omitempty"`
+	Timestamp  time.Time         `json:"timestamp"`
+	Metric     string            `json:"metric"`
+	Value      float64           `json:"value"`
+	IntervalMS int64             `json:"interval_ms,omitempty"` // rate window; 0 for gauges
+	Labels     map[string]string `json:"labels,omitempty"`
 }
 
 // Label returns the value of the named label, or the empty string when it is

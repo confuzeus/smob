@@ -7,7 +7,7 @@ import (
 )
 
 func (a *app) queryCommand() *cobra.Command {
-	return &cobra.Command{
+	cmd := &cobra.Command{
 		Use:   "query",
 		Short: "Query recorded samples",
 		Args:  cobra.NoArgs,
@@ -18,4 +18,6 @@ func (a *app) queryCommand() *cobra.Command {
 			return errors.New("query: querying samples is not implemented in this build")
 		},
 	}
+	cmd.Flags().StringVar(&a.dataDir, "data-dir", "", "override data_dir from the configuration")
+	return cmd
 }

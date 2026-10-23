@@ -4,17 +4,30 @@ package store
 
 import (
 	"context"
+	"time"
 
 	"github.com/confuzeus/smob/internal/model"
 )
 
-// Store persists samples and reads them back.
+// Chunk is one closed, immutable time window of samples for a single collection
+// scope and host. Samples are stored sorted by timestamp, then metric, then
+// canonical label order.
+type Chunk struct {
+	Host    string
+	Scope   string
+	Start   time.Time
+	End     time.Time
+	Samples []model.Sample
+}
+
+// Store persists chunks and reads samples back.
 //
-// Write is called with a batch that shares a collection tick. Query returns the
-// matching samples in non-decreasing timestamp order. Close releases backend
-// resources and flushes anything still buffered.
+// Write stores a complete chunk. The collector owns chunk assembly, so a store
+// never buffers across Write calls. Query yields matching samples in
+// non-decreasing timestamp order and stops when yield returns an error.
+// Close releases backend resources.
 type Store interface {
-	Write(ctx context.Context, samples []model.Sample) error
-	Query(ctx context.Context, q model.Query) ([]model.Sample, error)
+	Write(ctx context.Context, chunk Chunk) error
+	Query(ctx context.Context, q model.Query, yield func(model.Sample) error) error
 	Close() error
 }

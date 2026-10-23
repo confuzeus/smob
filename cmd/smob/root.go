@@ -20,6 +20,7 @@ type buildInfo struct {
 type app struct {
 	info       buildInfo
 	configPath string
+	dataDir    string
 	logLevel   string
 	logFormat  string
 
@@ -69,6 +70,9 @@ func (a *app) load(cmd *cobra.Command) error {
 	}
 	if cmd.Flags().Changed("log-format") {
 		cfg.LogFormat = a.logFormat
+	}
+	if cmd.Flags().Changed("data-dir") {
+		cfg.DataDir = a.dataDir
 	}
 	if err := cfg.Validate(); err != nil {
 		return cli.UsageErrorf("%v", err)
