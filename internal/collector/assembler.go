@@ -7,7 +7,6 @@ import (
 	"log/slog"
 	"maps"
 	"slices"
-	"sort"
 	"time"
 
 	"github.com/confuzeus/smob/internal/model"
@@ -55,7 +54,7 @@ func (a *assembler) add(ctx context.Context, scope string, samples []model.Sampl
 	for i, sample := range samples {
 		batch[i] = a.stamp(scope, sample)
 	}
-	sortSamples(batch)
+	model.SortSamples(batch)
 
 	for _, sample := range batch {
 		start, end := windowFor(sample.Timestamp, a.interval)
@@ -108,7 +107,7 @@ func (a *assembler) write(ctx context.Context, scope string, cur *pendingChunk, 
 		end = cur.start.Add(time.Second)
 	}
 
-	sortSamples(cur.samples)
+	model.SortSamples(cur.samples)
 	chunk := store.Chunk{
 		Host:    a.host,
 		Scope:   scope,
@@ -148,35 +147,4 @@ func (a *assembler) stamp(scope string, sample model.Sample) model.Sample {
 	labels["scope"] = scope
 	sample.Labels = labels
 	return sample
-}
-
-// sortSamples orders a chunk by timestamp, then metric, then canonical label
-// order. Identical inputs therefore produce identical chunk contents.
-func sortSamples(samples []model.Sample) {
-	sort.SliceStable(samples, func(i, j int) bool {
-		a, b := samples[i], samples[j]
-		if !a.Timestamp.Equal(b.Timestamp) {
-			return a.Timestamp.Before(b.Timestamp)
-		}
-		if a.Metric != b.Metric {
-			return a.Metric < b.Metric
-		}
-		return labelsLess(a.Labels, b.Labels)
-	})
-}
-
-// labelsLess compares two label sets as sorted key/value pairs.
-func labelsLess(a, b map[string]string) bool {
-	aKeys := slices.Sorted(maps.Keys(a))
-	bKeys := slices.Sorted(maps.Keys(b))
-
-	for i := 0; i < len(aKeys) && i < len(bKeys); i++ {
-		if aKeys[i] != bKeys[i] {
-			return aKeys[i] < bKeys[i]
-		}
-		if a[aKeys[i]] != b[bKeys[i]] {
-			return a[aKeys[i]] < b[bKeys[i]]
-		}
-	}
-	return len(aKeys) < len(bKeys)
 }

@@ -5,7 +5,7 @@ Usage:
 
 Flags:
       --data-dir string   override data_dir from the configuration
-      --dry-run           validate the configuration and exit without writing
+      --dry-run           validate the configuration, sources, and store without writing samples
   -h, --help              help for collect
       --once              collect one snapshot from every enabled source and exit
 

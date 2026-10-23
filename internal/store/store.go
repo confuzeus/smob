@@ -4,10 +4,15 @@ package store
 
 import (
 	"context"
+	"errors"
 	"time"
 
 	"github.com/confuzeus/smob/internal/model"
 )
+
+// ErrPersistent marks a failure to durably persist a chunk, such as a full
+// disk. The CLI reports exit code 3 when an error wraps it.
+var ErrPersistent = errors.New("persistent store failure")
 
 // Chunk is one closed, immutable time window of samples for a single collection
 // scope and host. Samples are stored sorted by timestamp, then metric, then
@@ -18,6 +23,13 @@ type Chunk struct {
 	Start   time.Time
 	End     time.Time
 	Samples []model.Sample
+}
+
+// Checker is implemented by stores that can verify they are ready to accept
+// writes without persisting a chunk. The collector probes it at startup so an
+// unusable backend fails before collection begins.
+type Checker interface {
+	Check(ctx context.Context) error
 }
 
 // Store persists chunks and reads samples back.

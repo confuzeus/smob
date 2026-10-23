@@ -4,8 +4,16 @@ Usage:
   smob query [flags]
 
 Flags:
-      --data-dir string   override data_dir from the configuration
-  -h, --help              help for query
+      --data-dir string     override data_dir from the configuration
+      --format string       output format: table, json, jsonl, or csv (default "table")
+  -h, --help                help for query
+      --host string         restrict to one host
+      --label stringArray   label matcher: name=value or name~regex (repeatable)
+      --limit int           maximum samples; 0 means unlimited (default 10000)
+      --metric string       exact metric name
+      --scope string        restrict to system, process, or container
+      --since string        start time: a duration such as 1h, or an RFC3339 timestamp (default: last hour)
+      --until string        end time as an RFC3339 timestamp (default: now)
 
 Global Flags:
       --config string       path to the YAML configuration file (default "/etc/smob/smob.yaml")

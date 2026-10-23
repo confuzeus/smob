@@ -264,20 +264,6 @@ func TestConfigDefaults(t *testing.T) {
 	}
 }
 
-func TestCollectNotImplemented(t *testing.T) {
-	ctx, cancel := context.WithTimeout(context.Background(), time.Minute)
-	defer cancel()
-
-	path := validConfig(t)
-	res := runSmob(t, ctx, "collect", "--config", path)
-	if res.ExitCode != 1 {
-		t.Fatalf("exit = %d, want 1\nstdout:\n%s\nstderr:\n%s", res.ExitCode, res.Stdout, res.Stderr)
-	}
-	if !strings.Contains(res.Stderr, "not implemented") {
-		t.Errorf("stderr does not explain the missing feature:\n%s", res.Stderr)
-	}
-}
-
 func TestMissingConfig(t *testing.T) {
 	ctx, cancel := context.WithTimeout(context.Background(), time.Minute)
 	defer cancel()

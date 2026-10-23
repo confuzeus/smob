@@ -13,11 +13,10 @@ libraries. Disk and S3 use one time-aligned chunk format, so the backends are
 interchangeable and existing data can be copied between them with
 `aws s3 sync`.
 
-> **Project status:** smob is pre-v0.1. The repository currently provides the
-> CLI scaffolding, configuration loader, `version`, and `config` commands.
-> `collect`, `query`, `stats`, and `tail` are stubs in the current build. The
-> command and metric reference below describes the v0.1 contract and is the
-> target those commands are being built against. See the
+> **Project status:** smob is pre-v0.1. System metrics, the disk backend,
+> `collect`, and `query` are implemented. `stats` and `tail` remain stubs, and
+> process, S3, and Docker support are planned for later phases. The command and
+> metric reference below describes the v0.1 contract. See the
 > [design and implementation plan](docs/IMPLEMENTATION.md) for the roadmap.
 
 ## Features
@@ -84,7 +83,7 @@ Validate it and inspect the effective configuration:
 ./smob config --config ./smob.yaml
 ```
 
-Once collection lands in the current build, the target workflow is:
+The workflow is:
 
 ```sh
 # Run the collector in the foreground.
@@ -163,7 +162,7 @@ Commands:
 ### `collect`
 
 - `--dry-run` validates configuration, source inputs, and store access without
-  writing anything.
+  writing samples.
 - `--once` collects one snapshot from every enabled source, writes one partial
   chunk per scope, and exits. This is intended for testing and automation.
 - `--data-dir DIR` overrides `data_dir` from the configuration.
@@ -174,7 +173,8 @@ collection rather than silently dropping data.
 ### `query`
 
 Query defaults to the last hour when `--since` is omitted. `--until` defaults to
-now; `--until` without `--since` means the hour before `--until`.
+now; `--until` without `--since` means the hour before `--until`. A duration
+given to `--since` is measured back from `--until`.
 
 | Flag | Description |
 | --- | --- |
@@ -190,7 +190,8 @@ now; `--until` without `--since` means the hour before `--until`.
 
 Output is UTC everywhere. Table columns are `TIME`, `METRIC`, `VALUE`, `UNIT`,
 and `LABELS`; units come from the metric suffix. JSON is one array; JSONL
-streams one object per line for large ranges; CSV includes a header row.
+streams one object per line for large ranges; CSV has the columns `timestamp`,
+`metric`, `value`, `interval_ms`, and `labels`.
 Results are sorted by timestamp, then metric, then canonical labels. `--limit`
 is applied after filtering and sorting.
 

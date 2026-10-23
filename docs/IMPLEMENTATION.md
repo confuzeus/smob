@@ -84,7 +84,7 @@ Key layout:
 - `<root>` is `data_dir` for disk and `<prefix>` for S3.
 - Times in the path are UTC; file names use `YYYYMMDDTHHMMSSZ`.
 - Example: `web-1/system/2026/10/23/16/20261023T160000Z-20261023T160500Z.jsonl.gz`.
-- If a window is written twice (clock step or restart), the writer appends `-1`, `-2`, … instead of overwriting.
+- If a window is written twice (clock step or restart), the writer appends `-1`, `-2`, … before the extension instead of overwriting, producing `20261023T160000Z-20261023T160500Z-1.jsonl.gz`.
 - Samples are sorted by timestamp, then metric, then canonical label order, so identical inputs produce identical chunk contents regardless of backend. Map keys are sorted by `encoding/json`; gzip headers carry no file name or modification time.
 
 Write semantics:
@@ -146,6 +146,17 @@ type Query struct {
 }
 ```
 
+A missing label is treated as the empty string when matching, so `name=` matches
+an absent label and `name~.*` matches every sample. Regex matchers use Go's
+unanchored `MatchString` semantics; anchor with `^` and `$` for a full-value
+match. Query results are globally ordered by timestamp, then metric, then
+canonical label order, and a non-zero `Limit` stops the scan as soon as it is
+reached.
+
+`query` and `collect` share one configuration schema, so validation requires at
+least one enabled source even for a query-only host. That is accepted for v0.1;
+a dedicated query mode can relax it later if it causes friction.
+
 ## 4. Phase Breakdown
 
 **Phase 0 — Foundations (Week 1)**
@@ -168,7 +179,7 @@ type Query struct {
 - Implement the chunk assembler: UTC-aligned windows per `(host, scope)`, sorted samples, partial flush on shutdown.
 - Implement `internal/store/disk`: the layout above, `.tmp` + `rename(2)`, gzip, and a guard that refuses to overwrite an existing chunk.
 - Implement `query`: streaming table output by default, plus `--format json`, `jsonl`, and `csv`. Filters: `--since`, `--until`, `--host`, `--scope`, `--metric`, `--label name=value` (exact), `--label name~regex`, and `--limit` (default 10,000; `0` disables).
-- `collect` flags: `--dry-run` (validate config, `/proc` inputs, and store; write nothing), `--once` (collect one snapshot from every enabled source, write one partial chunk per scope, exit), and `--data-dir` (override `data_dir`, also honored by `query`).
+- `collect` flags: `--dry-run` (validate config, `/proc` inputs, and store; write no samples), `--once` (collect one snapshot from every enabled source, write one partial chunk per scope, exit), and `--data-dir` (override `data_dir`, also honored by `query`).
 - Add structured logging via `log/slog`, a `--log-level` flag, and a startup line with the effective config (redacted) and the resolved chunk key root.
 - Exit codes: 0 success, 1 runtime failure, 2 usage/config error, 3 persistent store failure (including `ENOSPC`). A store failure after retries stops collection rather than silently dropping data.
 - **Exit criterion:** `smob collect` writes real samples for at least an hour with no gaps; `smob query --since 1h` returns correct CPU, memory, and network figures; `collect --once` followed by `query` works in the fast test suite; a 24-hour soak shows flat memory and no missing chunks.
@@ -315,12 +326,12 @@ Dockerfile                     # FROM scratch, static binary, CA bundle
 - [x] Implement the system source: CPU %, memory bytes, per-interface RX/TX B/s; `boot_id` reset detection; interface add/remove handling.
 - [x] Implement the scheduler: per-source ticker with jitter, per-tick timeout, clean shutdown.
 - [x] Implement the chunk assembler: UTC-aligned 5-minute windows, per `(host, scope)`, sorted samples, partial flush.
-- [ ] Implement the disk store: `<host>/<scope>/YYYY/MM/DD/HH/<start>-<end>.jsonl.gz`, `.tmp` + rename, collision guard.
-- [ ] Implement streaming `query` with table, JSON, JSONL, and CSV output; `--since/--until/--host/--scope/--metric/--label/--limit`.
-- [ ] Implement `collect --dry-run` and `collect --once` behavior; the flags and `--data-dir` override are already wired in Phase 0, and structured logging is in place.
-- [ ] Add exit code 3 on persistent store failure and a startup free-space warning.
-- [ ] Golden tests for help text and config output; structural tests for chunk keys, ordering, and schema.
-- [ ] Fast suite: `collect --once`, query, formats, signals, dry-run, and error paths against real `/proc`.
+- [x] Implement the disk store: `<host>/<scope>/YYYY/MM/DD/HH/<start>-<end>.jsonl.gz`, `.tmp` + rename, collision guard.
+- [x] Implement streaming `query` with table, JSON, JSONL, and CSV output; `--since/--until/--host/--scope/--metric/--label/--limit`.
+- [x] Implement `collect --dry-run` and `collect --once` behavior; the flags and `--data-dir` override are already wired in Phase 0, and structured logging is in place.
+- [x] Add exit code 3 on persistent store failure and a startup free-space warning.
+- [x] Golden tests for help text and config output; structural tests for chunk keys, ordering, and schema.
+- [x] Fast suite: `collect --once`, query, formats, signals, dry-run, and error paths against real `/proc`.
 - [ ] Manual soak: 24h collection, verify no gaps, flat memory, and realistic chunk counts.
 
 ### Phase 2 — Process Metrics (v0.1)

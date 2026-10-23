@@ -20,9 +20,9 @@ change affects both.
 
 ## Project status
 
-smob is pre-v0.1. The CLI scaffolding, configuration loader, `version`, and
-`config` commands are implemented. `collect`, `query`, `stats`, and `tail` are
-stubs in the current build. The README describes the target v0.1 contract, not
+smob is pre-v0.1. System metrics, the disk backend, `collect`, and `query` are
+implemented. `stats` and `tail` remain stubs; process, S3, and Docker support
+are planned for later phases. The README describes the target v0.1 contract, not
 only current behavior.
 
 ## Commands
