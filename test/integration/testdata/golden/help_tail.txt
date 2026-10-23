@@ -1,0 +1,12 @@
+Follow the most recent samples
+
+Usage:
+  smob tail [flags]
+
+Flags:
+  -h, --help   help for tail
+
+Global Flags:
+      --config string       path to the YAML configuration file (default "/etc/smob/smob.yaml")
+      --log-format string   log format override: text, json
+      --log-level string    log level override: debug, info, warn, error

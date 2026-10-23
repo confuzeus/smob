@@ -1,0 +1,13 @@
+Print the effective configuration
+
+Usage:
+  smob config [flags]
+
+Flags:
+  -h, --help       help for config
+      --validate   validate the configuration and exit
+
+Global Flags:
+      --config string       path to the YAML configuration file (default "/etc/smob/smob.yaml")
+      --log-format string   log format override: text, json
+      --log-level string    log level override: debug, info, warn, error
