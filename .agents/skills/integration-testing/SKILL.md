@@ -250,7 +250,7 @@ func requireS3(t *testing.T) string {
 		if os.Getenv("SMOB_TEST_STRICT") == "1" {
 			t.Fatal("SMOB_TEST_STRICT=1 but SMOB_TEST_S3_ENDPOINT is not set")
 		}
-		t.Skip("SMOB_TEST_S3_ENDPOINT not set; run `make test-all`")
+		t.Skip("SMOB_TEST_S3_ENDPOINT not set; run `just test-all`")
 	}
 	return endpoint
 }
@@ -480,7 +480,7 @@ the gate.
       dependency, signal, or fallback.
 - [ ] The test waits on observable state; no fixed sleeps or retries.
 - [ ] Temp dirs, buckets, containers, and processes are cleaned up.
-- [ ] `make test` passes; `make test-all` passes when services are available.
+- [ ] `just test` passes; `just test-all` passes when services are available.
 - [ ] `SMOB_TEST_RACE=1` passes for collector or concurrency changes.
 - [ ] Golden changes were reviewed, not auto-accepted.
 - [ ] No production code was added solely to make testing easier.

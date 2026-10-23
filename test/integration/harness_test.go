@@ -83,9 +83,9 @@ func compareGolden(t *testing.T, name, got string) {
 
 	want, err := os.ReadFile(path)
 	if err != nil {
-		t.Fatalf("read golden %s: %v (run make test-update)", name, err)
+		t.Fatalf("read golden %s: %v (run just test-update)", name, err)
 	}
 	if got != string(want) {
-		t.Errorf("%s does not match its golden file; run make test-update and review the diff\ngot:\n%s", name, got)
+		t.Errorf("%s does not match its golden file; run just test-update and review the diff\ngot:\n%s", name, got)
 	}
 }

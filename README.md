@@ -24,7 +24,7 @@ The MVP can be delivered in four increments, each of which produces a usable too
 
 **Phase 0 — Foundations (Week 1)**
 
-- Initialize Go module, repository layout, Makefile, and CI (build, vet, integration tests, race).
+- Initialize Go module, repository layout, justfile, and CI (build, vet, integration tests, race).
 - Define `model` package: `Sample`, `Query`, `TimeRange`, label helpers.
 - Define `store.Store` interface and the `config` package (YAML or TOML — pick one, validate on load).
 - Wire up `cobra` root command and stub subcommands: `collect`, `query`, `tail`, `stats`, `config`, `version`.
@@ -94,7 +94,7 @@ The MVP can be delivered in four increments, each of which produces a usable too
 All testing is black-box integration testing; there are no unit tests. Every test builds the `smob` binary and drives it as a subprocess against real dependencies.
 
 - **Fast suite** (every change): config validation, `collect` → `query` against the host's real `/proc` and a temporary data directory, output formats, signal handling, and error paths that need no external service.
-- **Extended suite** (CI and `make test-all`): process scope with a CPU burner, MinIO for the S3 backend, a Docker daemon for container scope, retention, `tail`, and `stats`.
+- **Extended suite** (CI and `just test-all`): process scope with a CPU burner, MinIO for the S3 backend, a Docker daemon for container scope, retention, `tail`, and `stats`.
 - MinIO and Docker are compose/CI services configured through environment variables. Tests skip with a clear reason when a service is absent; CI runs in strict mode where a skip is a failure.
 - Tests assert schema, labels, ordering, and plausible ranges, not exact live metric values. `/proc`, storage, the clock, and the Docker API are never mocked.
 - Golden files cover only stable output (chunk schema, help text), with an explicit update flag.
@@ -127,7 +127,7 @@ Dockerfile                     # FROM scratch, static binary
 
 - [ ] `go mod init github.com/<org>/smob`; choose module path and license.
 - [ ] Create repository layout per the plan.
-- [ ] Add Makefile targets: `build`, `test`, `test-all`, `test-race`, `test-update`, `vet`, `docker`, `release`.
+- [ ] Add justfile recipes: `build`, `test`, `test-all`, `test-race`, `test-update`, `vet`, `docker`, `release`.
 - [ ] Set up CI: build on `linux/amd64` and `linux/arm64` with `CGO_ENABLED=0`; run `go vet -tags=integration` and the integration suite with a `-race` binary.
 - [ ] Write `FROM scratch` (or distroless-static) Dockerfile producing an image with the static binary.
 - [ ] Define `model.Sample`, `model.Query`, `model.TimeRange` with doc comments.
