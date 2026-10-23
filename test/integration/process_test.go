@@ -9,6 +9,7 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"runtime"
 	"strconv"
 	"strings"
 	"testing"
@@ -52,6 +53,22 @@ func startSleep(t *testing.T) *exec.Cmd {
 	return cmd
 }
 
+// startBusy starts a real CPU-bound process and returns it. yes writes to the
+// null device, so it burns a core without producing output. The process is
+// killed and reaped when the test ends.
+func startBusy(t *testing.T) *exec.Cmd {
+	t.Helper()
+	cmd := exec.Command("yes")
+	if err := cmd.Start(); err != nil {
+		t.Fatalf("start yes: %v", err)
+	}
+	t.Cleanup(func() {
+		_ = cmd.Process.Kill()
+		_ = cmd.Wait()
+	})
+	return cmd
+}
+
 // stopProcess kills cmd and reaps it. Cleanup ignores the repeated Wait.
 func stopProcess(t *testing.T, cmd *exec.Cmd) {
 	t.Helper()
@@ -72,6 +89,18 @@ func processSamples(t *testing.T, dataDir string, pid int) []wireSample {
 		}
 	}
 	return matches
+}
+
+// firstTimestamp returns the earliest timestamp in samples, which must not be
+// empty.
+func firstTimestamp(samples []wireSample) time.Time {
+	first := samples[0].Timestamp
+	for _, sample := range samples[1:] {
+		if sample.Timestamp.Before(first) {
+			first = sample.Timestamp
+		}
+	}
+	return first
 }
 
 func TestProcessCollectOnce(t *testing.T) {
@@ -196,6 +225,91 @@ func TestProcessTopN(t *testing.T) {
 	}
 	if len(pids) != 2 {
 		t.Fatalf("distinct pids = %d, want 2", len(pids))
+	}
+}
+
+func TestProcessCPUPercent(t *testing.T) {
+	dataDir := filepath.Join(t.TempDir(), "data")
+	busy := startBusy(t)
+	pid := busy.Process.Pid
+	cfg := processConfig(t, dataDir, "/proc", "^yes$", 0, "100ms", "30s")
+
+	ctx, cancel := context.WithTimeout(context.Background(), time.Minute)
+	defer cancel()
+	d := startSmob(t, ctx, "collect", "--config", cfg)
+	waitFor(t, 20*time.Second, "a CPU sample for the busy process", func() bool {
+		for _, sample := range processSamples(t, dataDir, pid) {
+			if sample.Metric == "process.cpu.percent" {
+				return true
+			}
+		}
+		return false
+	})
+	d.stop(t, 10*time.Second)
+
+	var cpuSamples, rssSamples []wireSample
+	for _, sample := range processSamples(t, dataDir, pid) {
+		switch sample.Metric {
+		case "process.cpu.percent":
+			cpuSamples = append(cpuSamples, sample)
+		case "process.memory.rss_bytes":
+			rssSamples = append(rssSamples, sample)
+		default:
+			t.Fatalf("unexpected metric %q for pid %d", sample.Metric, pid)
+		}
+	}
+	if len(cpuSamples) == 0 {
+		t.Fatalf("no CPU samples for the busy process")
+	}
+	if len(rssSamples) == 0 {
+		t.Fatalf("no RSS samples for the busy process")
+	}
+
+	wantLabels := map[string]string{
+		"host":  "test-host",
+		"scope": "process",
+		"pid":   strconv.Itoa(pid),
+		"comm":  "yes",
+	}
+	maxPercent := 100 * float64(runtime.NumCPU())
+	for _, sample := range cpuSamples {
+		if sample.Value <= 0 || sample.Value > maxPercent {
+			t.Fatalf("cpu = %v, want greater than zero and at most %v", sample.Value, maxPercent)
+		}
+		if sample.IntervalMS <= 0 || sample.IntervalMS > 10_000 {
+			t.Fatalf("interval_ms = %d, want a measured window", sample.IntervalMS)
+		}
+		if sample.Timestamp.Location() != time.UTC {
+			t.Fatalf("timestamp %s is not UTC", sample.Timestamp)
+		}
+		if !maps.Equal(sample.Labels, wantLabels) {
+			t.Fatalf("labels = %v, want %v", sample.Labels, wantLabels)
+		}
+	}
+
+	// The first tick records RSS only: a CPU rate needs two snapshots.
+	if !firstTimestamp(cpuSamples).After(firstTimestamp(rssSamples)) {
+		t.Fatalf("first CPU sample at %s is not after the first RSS sample at %s",
+			firstTimestamp(cpuSamples), firstTimestamp(rssSamples))
+	}
+
+	queried := runSmob(t, ctx, "query", "--config", cfg, "--since", "1h",
+		"--format", "json", "--metric", "process.cpu.percent",
+		"--label", "pid="+strconv.Itoa(pid))
+	if queried.ExitCode != 0 {
+		t.Fatalf("query exit = %d\nstderr:\n%s", queried.ExitCode, queried.Stderr)
+	}
+	out := decodeJSONSamples(t, queried.Stdout)
+	if len(out) != len(cpuSamples) {
+		t.Fatalf("query returned %d CPU samples, chunks hold %d", len(out), len(cpuSamples))
+	}
+	for _, sample := range out {
+		if sample.Metric != "process.cpu.percent" {
+			t.Fatalf("query returned metric %q", sample.Metric)
+		}
+		if sample.Labels["pid"] != strconv.Itoa(pid) {
+			t.Fatalf("query by pid returned pid %q", sample.Labels["pid"])
+		}
 	}
 }
 

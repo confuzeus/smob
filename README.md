@@ -13,10 +13,10 @@ libraries. Disk and S3 use one time-aligned chunk format, so the backends are
 interchangeable and existing data can be copied between them with
 `aws s3 sync`.
 
-> **Project status:** smob is pre-v0.1. System metrics, the disk backend,
-> `collect`, and `query` are implemented. `stats` and `tail` remain stubs, and
-> process, S3, and Docker support are planned for later phases. The command and
-> metric reference below describes the v0.1 contract. See the
+> **Project status:** smob is v0.1. System and process metrics, the disk
+> backend, `collect`, and `query` are implemented. `stats` and `tail` remain
+> stubs, and S3, Docker, retention, and aggregation are planned for v0.2. The
+> command and metric reference below describes the v0.1 contract. See the
 > [design and implementation plan](docs/IMPLEMENTATION.md) for the roadmap.
 
 ## Features
@@ -137,6 +137,8 @@ change meaning between versions.
   the series is expected.
 - Process labels use `comm`, which the kernel truncates to 15 bytes. Matching
   the full command line is not supported.
+- Process series are selected each tick: the top `N` by CPU, then RSS, then PID.
+  `top_n` defaults to 20; `0` records every matching process.
 
 ## CLI reference
 

@@ -193,7 +193,12 @@ a dedicated query mode can relax it later if it causes friction.
 - Config: `sources.process.{enabled,filter,top_n,interval,rescan_interval}`; the `/proc` root is the global `proc_path`.
 - Labels: `pid`, `comm`, `scope=process`. `starttime` is internal state, not a label.
 - Extend `query` label matching for `pid` and `comm` (exact and regex).
-- Benchmark per-tick cost on a host with ~1,000 processes and document the result.
+- Benchmark per-tick cost on a host with ~1,000 processes and document the
+  result. Measured on 2026-10-23 on an AMD Ryzen 5 PRO 5650GE (12 threads) with
+  1,001 live processes: ~37 ms per tick, from
+  `go test -run '^$' -bench BenchmarkCollect -benchtime 100x ./internal/source/process`.
+  At the default 30s cadence that is ~0.12% of one core, and the default top-20
+  writes 115,200 samples/day (two metrics per selected process).
 - **Exit criterion:** with a filter of `nginx|postgres`, `smob query` shows per-process CPU and RSS at the configured resolution, with no bogus first samples and no crashes while processes exit during a scan.
 
 **Phase 3 — S3 Backend (Week 5) → v0.2**
@@ -338,14 +343,14 @@ Dockerfile                     # FROM scratch, static binary, CA bundle
 
 - [x] Implement `/proc/[pid]/stat` (fields 14, 15, 22) and `status` (`VmRSS`) parsers, with fixtures for `comm` containing spaces and parentheses.
 - [x] Implement PID enumeration and rescan cadence; treat `ENOENT` as normal.
-- [ ] Implement process source: regex filter on `comm`, top-N by CPU/RSS/PID, 30s default interval.
-- [ ] Key rate state by `(pid, starttime)`; reset on PID reuse.
+- [x] Implement process source: regex filter on `comm`, top-N by CPU/RSS/PID, 30s default interval.
+- [x] Key rate state by `(pid, starttime)`; reset on PID reuse.
 - [x] Emit labels `pid`, `comm`, `scope=process`.
 - [x] Extend `query` label matching for `pid` and `comm` (exact and regex).
 - [x] Add process config fields and validation.
-- [ ] Benchmark per-tick cost with ~1,000 processes and document sample/day volume.
-- [ ] Integration test with a CPU burner; assert plausible process CPU and RSS.
-- [ ] Tag `v0.1.0`.
+- [x] Benchmark per-tick cost with ~1,000 processes and document sample/day volume.
+- [x] Integration test with a CPU burner; assert plausible process CPU and RSS.
+- [x] Tag `v0.1.0`.
 
 ### Phase 3 — S3 Backend (v0.2)
 
