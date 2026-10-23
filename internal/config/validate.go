@@ -33,9 +33,12 @@ func (c Config) Validate() error {
 		errs = append(errs, fmt.Errorf("log_format: must be text or json; got %q", c.LogFormat))
 	}
 
-	if c.Storage.ChunkInterval <= 0 {
+	switch {
+	case c.Storage.ChunkInterval <= 0:
 		errs = append(errs, errors.New("storage.chunk_interval: must be greater than zero"))
-	} else if time.Hour%c.Storage.ChunkInterval.Std() != 0 {
+	case c.Storage.ChunkInterval.Std()%time.Second != 0:
+		errs = append(errs, fmt.Errorf("storage.chunk_interval: must be a whole number of seconds (minimum 1s); got %s", c.Storage.ChunkInterval))
+	case time.Hour%c.Storage.ChunkInterval.Std() != 0:
 		errs = append(errs, fmt.Errorf("storage.chunk_interval: must divide one hour evenly; got %s", c.Storage.ChunkInterval))
 	}
 

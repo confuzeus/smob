@@ -33,7 +33,13 @@ The MVP ships in four increments: (1) system metrics with a disk backend, (2) pr
 On the wire, each sample is one JSON object per line:
 
 ```json
-{"timestamp":"2026-10-23T16:00:00.123456789Z","metric":"system.cpu.percent","value":12.5,"interval_ms":10000,"labels":{"host":"web-1","scope":"system","cpu":"all"}}
+{
+  "timestamp": "2026-10-23T16:00:00.123456789Z",
+  "metric": "system.cpu.percent",
+  "value": 12.5,
+  "interval_ms": 10000,
+  "labels": { "host": "web-1", "scope": "system", "cpu": "all" }
+}
 ```
 
 In Go:
@@ -67,7 +73,7 @@ Counter resets are not samples. If a counter decreases, or `/proc/sys/kernel/ran
 
 ## 3. Storage Format and Chunking
 
-A **chunk** is a half-open UTC window `[start, end)`, one collection scope, one host, and a sorted list of samples. The default chunk interval is **5 minutes**, shared by both backends and configurable as `storage.chunk_interval`. Five minutes is a deliberate compromise: one-minute chunks produce ~525k objects per year per host and scope, while hourly chunks make crash loss and query latency worse. The interval must divide one hour evenly so a chunk never crosses an hour directory boundary; validation rejects values such as `7m`.
+A **chunk** is a half-open UTC window `[start, end)`, one collection scope, one host, and a sorted list of samples. The default chunk interval is **5 minutes**, shared by both backends and configurable as `storage.chunk_interval`. Five minutes is a deliberate compromise: one-minute chunks produce ~525k objects per year per host and scope, while hourly chunks make crash loss and query latency worse. The interval must be a whole number of seconds of at least 1s and divide one hour evenly, so a chunk never crosses an hour directory boundary and its filename stays second-precision; validation rejects values such as `500ms`, `1500ms`, and `7m`.
 
 Key layout:
 
@@ -148,7 +154,7 @@ type Query struct {
 - CI builds `linux/amd64` and `linux/arm64` with `CGO_ENABLED=0`, runs `go vet` and staticcheck, the fast suite, a race-enabled binary, and the Alpine kernel job. The workflow triggers on the repository's actual default branch (`master`).
 - Define `model.Sample` (including `IntervalMS`), `model.Query` (matchers, host/scope, limit), and `model.TimeRange`.
 - Define the streaming `store.Store` interface, `store.Chunk`, and the config package.
-- Config schema (YAML, strict decoding): `data_dir`, `proc_path`, `host`, `log_level`, `log_format`, `sources.{system,process,docker}` (each with `enabled` and `interval`), `storage.{chunk_interval,primary,s3}`, `retention`. `storage.primary` is the single active backend; per-backend `enabled` flags are not needed. `storage.chunk_interval` must divide one hour evenly, and `host` must be a single path component.
+- Config schema (YAML, strict decoding): `data_dir`, `proc_path`, `host`, `log_level`, `log_format`, `sources.{system,process,docker}` (each with `enabled` and `interval`), `storage.{chunk_interval,primary,s3}`, `retention`. `storage.primary` is the single active backend; per-backend `enabled` flags are not needed. `storage.chunk_interval` must be a whole number of seconds and divide one hour evenly, and `host` must be a single path component.
 - Wire `cobra` root and stub subcommands: `collect`, `query`, `tail`, `stats`, `config`, `version`.
 - `version` prints version, commit, and build date injected via `-ldflags`.
 - `FROM scratch` Dockerfile with the CA bundle copied in (already present) and a non-root user.
@@ -232,20 +238,20 @@ type Query struct {
 
 ## 7. Risks and Mitigations
 
-| Risk | Mitigation |
-| --- | --- |
+| Risk                                                                         | Mitigation                                                                                                                                                           |
+| ---------------------------------------------------------------------------- | -------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
 | `/proc` parsing breaks on unusual kernels or fields containing spaces/parens | Pure parsers with table-driven fixture tests; Alpine and Debian integration jobs; `comm` parsed from the last `)`; fail loud at startup on unreadable required files |
-| S3 cost from many small objects | Shared 5-minute chunks (288 objects/day per host and scope); document object counts and bytes/day from the soak test; lifecycle policy for retention |
-| Per-process data volume explodes | 30s default process interval, top-N default 20, and a documented sample/day budget; `top_n: 0` is opt-in |
-| Queries exhaust memory on long ranges | Streaming `Store.Query`, `--limit`, JSONL/CSV output, hour-prefix pruning; no whole-corpus slices |
-| Clock steps produce bogus rates or overlapping chunks | Rates use the monotonic clock and record `interval_ms`; `boot_id` detects reboot; a backward wall-clock step > chunk interval starts a new chunk and logs a warning |
-| Disk fills up | Hourly retention sweeper, startup free-space warning, exit code 3 on `ENOSPC`, systemd restart policy |
-| S3 outage grows the spool without bound | `spool_max_bytes` cap with oldest-first drop and `error` logs; replay in key order; queries merge the spool locally |
-| Docker stats stream is heavy at scale | One-shot polling is the default; streams are opt-in; container rescan rather than a goroutine per container |
-| Docker socket is root-equivalent and unreadable by the image's UID | Document `--group-add`, socket mode, data-dir ownership, and the security trade-off; never mount the socket unless the container source is enabled |
-| Host system metrics inside a container describe the wrong namespace | Configurable `proc_path`; documented `/host/proc`, `--pid=host`, and `--network=host` mounts |
-| Shared buckets interleave hosts | `host` label and `<host>` path component; one writer per host/prefix is explicit |
-| Schedule slips | v0.1 ships after Phase 2 with system, process, disk, and query; S3, Docker, retention, and docs are v0.2; tail is already out of scope |
+| S3 cost from many small objects                                              | Shared 5-minute chunks (288 objects/day per host and scope); document object counts and bytes/day from the soak test; lifecycle policy for retention                 |
+| Per-process data volume explodes                                             | 30s default process interval, top-N default 20, and a documented sample/day budget; `top_n: 0` is opt-in                                                             |
+| Queries exhaust memory on long ranges                                        | Streaming `Store.Query`, `--limit`, JSONL/CSV output, hour-prefix pruning; no whole-corpus slices                                                                    |
+| Clock steps produce bogus rates or overlapping chunks                        | Rates use the monotonic clock and record `interval_ms`; `boot_id` detects reboot; a backward wall-clock step > chunk interval starts a new chunk and logs a warning  |
+| Disk fills up                                                                | Hourly retention sweeper, startup free-space warning, exit code 3 on `ENOSPC`, systemd restart policy                                                                |
+| S3 outage grows the spool without bound                                      | `spool_max_bytes` cap with oldest-first drop and `error` logs; replay in key order; queries merge the spool locally                                                  |
+| Docker stats stream is heavy at scale                                        | One-shot polling is the default; streams are opt-in; container rescan rather than a goroutine per container                                                          |
+| Docker socket is root-equivalent and unreadable by the image's UID           | Document `--group-add`, socket mode, data-dir ownership, and the security trade-off; never mount the socket unless the container source is enabled                   |
+| Host system metrics inside a container describe the wrong namespace          | Configurable `proc_path`; documented `/host/proc`, `--pid=host`, and `--network=host` mounts                                                                         |
+| Shared buckets interleave hosts                                              | `host` label and `<host>` path component; one writer per host/prefix is explicit                                                                                     |
+| Schedule slips                                                               | v0.1 ships after Phase 2 with system, process, disk, and query; S3, Docker, retention, and docs are v0.2; tail is already out of scope                               |
 
 ## 8. Testing Strategy
 
@@ -298,7 +304,7 @@ Dockerfile                     # FROM scratch, static binary, CA bundle
 - [x] `version` subcommand with `-ldflags` metadata.
 - [x] Fix the CI trigger to the default branch (`master`).
 - [x] Extend `model.Sample` with `IntervalMS`; add `LabelMatcher`, `Query.Host/Scope/Limit`, and the streaming `Store`/`Chunk` contract.
-- [x] Add config: `host`, `proc_path`, `storage.chunk_interval` (validated to divide one hour, replacing `storage.s3.chunk_interval`), per-source `interval`, S3 `path_style`/`spool_dir`/`spool_max_bytes`; remove `flush_interval` and the per-backend `enabled` flags (`storage.primary` selects the backend).
+- [x] Add config: `host`, `proc_path`, `storage.chunk_interval` (validated to be whole seconds that divide one hour, replacing `storage.s3.chunk_interval`), per-source `interval`, S3 `path_style`/`spool_dir`/`spool_max_bytes`; remove `flush_interval` and the per-backend `enabled` flags (`storage.primary` selects the backend).
 - [x] Add `collect --dry-run`, `collect --once`, and `--data-dir` for `collect`/`query`.
 - [x] Define exit code 3 for persistent store failure in `internal/cli`.
 - [x] Update the integration-testing guidance to permit pure-function table tests (and add a `test-unit` recipe).
@@ -306,9 +312,9 @@ Dockerfile                     # FROM scratch, static binary, CA bundle
 ### Phase 1 — System Metrics, Disk, Query (v0.1)
 
 - [x] Implement `/proc/stat`, `/proc/meminfo`, and `/proc/net/dev` parsers as pure `io.Reader` functions, with fixture-based table tests for edge cases.
-- [ ] Implement the system source: CPU %, memory bytes, per-interface RX/TX B/s; `boot_id` reset detection; interface add/remove handling.
-- [ ] Implement the scheduler: per-source ticker with jitter, per-tick timeout, clean shutdown.
-- [ ] Implement the chunk assembler: UTC-aligned 5-minute windows, per `(host, scope)`, sorted samples, partial flush.
+- [x] Implement the system source: CPU %, memory bytes, per-interface RX/TX B/s; `boot_id` reset detection; interface add/remove handling.
+- [x] Implement the scheduler: per-source ticker with jitter, per-tick timeout, clean shutdown.
+- [x] Implement the chunk assembler: UTC-aligned 5-minute windows, per `(host, scope)`, sorted samples, partial flush.
 - [ ] Implement the disk store: `<host>/<scope>/YYYY/MM/DD/HH/<start>-<end>.jsonl.gz`, `.tmp` + rename, collision guard.
 - [ ] Implement streaming `query` with table, JSON, JSONL, and CSV output; `--since/--until/--host/--scope/--metric/--label/--limit`.
 - [ ] Implement `collect --dry-run` and `collect --once` behavior; the flags and `--data-dir` override are already wired in Phase 0, and structured logging is in place.

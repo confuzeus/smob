@@ -71,6 +71,23 @@ func TestConfigValidate(t *testing.T) {
 			exit: 0,
 		},
 		{
+			name:  "chunk interval below one second",
+			body:  base + "storage:\n  chunk_interval: 500ms\n",
+			exit:  2,
+			wants: []string{"storage.chunk_interval", "whole number of seconds"},
+		},
+		{
+			name:  "chunk interval is a sub-second offset",
+			body:  base + "storage:\n  chunk_interval: 1500ms\n",
+			exit:  2,
+			wants: []string{"storage.chunk_interval", "whole number of seconds"},
+		},
+		{
+			name: "one second chunk interval",
+			body: base + "storage:\n  chunk_interval: 1s\n",
+			exit: 0,
+		},
+		{
 			name:  "host is not a path component",
 			body:  base + "host: bad/host\n",
 			exit:  2,
