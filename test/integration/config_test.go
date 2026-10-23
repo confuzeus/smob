@@ -129,13 +129,15 @@ func TestConfigValidate(t *testing.T) {
 			wants: []string{"sources: at least one source must be enabled"},
 		},
 		{
-			name: "process filter is not a regexp",
-			body: base + "sources:\n  process:\n    enabled: true\n    filter: \"[\"\n",
-			exit: 2,
-			wants: []string{
-				"sources.process.filter",
-				"sources.process: not implemented in this build",
-			},
+			name: "process source enabled",
+			body: base + "sources:\n  process:\n    enabled: true\n",
+			exit: 0,
+		},
+		{
+			name:  "process filter is not a regexp",
+			body:  base + "sources:\n  process:\n    enabled: true\n    filter: \"[\"\n",
+			exit:  2,
+			wants: []string{"sources.process.filter"},
 		},
 		{
 			name:  "zero process interval",

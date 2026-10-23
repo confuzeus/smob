@@ -157,6 +157,7 @@ func TestQueryFilters(t *testing.T) {
 		{"host", []string{"--host", "alpha"}, 3},
 		{"scope", []string{"--scope", "process"}, 2},
 		{"exact label", []string{"--label", "cpu=all"}, 1},
+		{"exact pid", []string{"--label", "pid=43"}, 1},
 		{"regex label", []string{"--label", "comm~nginx|postgres"}, 2},
 		{"missing label is empty", []string{"--label", "comm="}, 3},
 		{"combined", []string{"--scope", "process", "--label", "comm~nginx"}, 1},

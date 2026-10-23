@@ -86,7 +86,6 @@ func (c Config) Validate() error {
 				errs = append(errs, fmt.Errorf("sources.process.filter: %w", err))
 			}
 		}
-		errs = append(errs, errors.New("sources.process: not implemented in this build"))
 	}
 	if c.Sources.Docker.Enabled {
 		if c.Sources.Docker.Socket == "" {

@@ -11,6 +11,7 @@ import (
 
 	"github.com/confuzeus/smob/internal/cli"
 	"github.com/confuzeus/smob/internal/collector"
+	"github.com/confuzeus/smob/internal/source/process"
 	"github.com/confuzeus/smob/internal/source/system"
 	"github.com/confuzeus/smob/internal/store"
 	"github.com/spf13/cobra"
@@ -87,11 +88,24 @@ func (a *app) runCollect(ctx context.Context, dryRun, once bool) error {
 }
 
 // newSources constructs every enabled source. Configuration validation rejects
-// sources that are not implemented yet, so only the system source can appear.
+// sources that are not implemented yet.
 func (a *app) newSources() ([]collector.Source, error) {
 	var sources []collector.Source
 	if a.cfg.Sources.System.Enabled {
 		src, err := system.New(a.cfg.ProcPath, a.cfg.Sources.System.Interval.Std(), a.logger)
+		if err != nil {
+			return nil, err
+		}
+		sources = append(sources, src)
+	}
+	if a.cfg.Sources.Process.Enabled {
+		src, err := process.New(process.Options{
+			ProcPath:       a.cfg.ProcPath,
+			Filter:         a.cfg.Sources.Process.Filter,
+			TopN:           a.cfg.Sources.Process.TopN,
+			Interval:       a.cfg.Sources.Process.Interval.Std(),
+			RescanInterval: a.cfg.Sources.Process.RescanInterval.Std(),
+		}, a.logger)
 		if err != nil {
 			return nil, err
 		}

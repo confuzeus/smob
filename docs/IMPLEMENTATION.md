@@ -186,7 +186,7 @@ a dedicated query mode can relax it later if it causes friction.
 
 **Phase 2 — Process Metrics (Week 4) → v0.1 feature-complete**
 
-- Implement `internal/source/process`: enumerate `/proc/[pid]`, parse `stat` (find the last `)` to handle `comm` containing spaces or parentheses), `statm`, and `status` (`VmRSS`).
+- Implement `internal/source/process`: enumerate `/proc/[pid]`, parse `stat` (find the last `)` to handle `comm` containing spaces or parentheses) and `status` (`VmRSS`).
 - Key rate state by `(pid, starttime)`. On PID reuse, discard the old state and skip the first delta. Treat `ENOENT` during a scan as a normal exit, not an error.
 - Filter matches `comm`, which is truncated to 15 bytes by the kernel; document this and do not pretend it matches the command line. A future `cmdline` filter is a separate option.
 - Top-N is by CPU over RSS, with ties broken by RSS then PID. `top_n` defaults to 20; `0` means all matching processes. This bounds the volume: at 10s and 1,000 processes the tool would write ~17M samples/day; the process source defaults to a 30s interval and top-20, which is ~115k samples/day.
@@ -336,13 +336,13 @@ Dockerfile                     # FROM scratch, static binary, CA bundle
 
 ### Phase 2 — Process Metrics (v0.1)
 
-- [x] Implement `/proc/[pid]/stat` (fields 14, 15, 22), `statm`, and `status` (`VmRSS`) parsers, with fixtures for `comm` containing spaces and parentheses.
-- [ ] Implement PID enumeration and rescan cadence; treat `ENOENT` as normal.
+- [x] Implement `/proc/[pid]/stat` (fields 14, 15, 22) and `status` (`VmRSS`) parsers, with fixtures for `comm` containing spaces and parentheses.
+- [x] Implement PID enumeration and rescan cadence; treat `ENOENT` as normal.
 - [ ] Implement process source: regex filter on `comm`, top-N by CPU/RSS/PID, 30s default interval.
 - [ ] Key rate state by `(pid, starttime)`; reset on PID reuse.
-- [ ] Emit labels `pid`, `comm`, `scope=process`.
-- [ ] Extend `query` label matching for `pid` and `comm` (exact and regex).
-- [ ] Add process config fields and validation.
+- [x] Emit labels `pid`, `comm`, `scope=process`.
+- [x] Extend `query` label matching for `pid` and `comm` (exact and regex).
+- [x] Add process config fields and validation.
 - [ ] Benchmark per-tick cost with ~1,000 processes and document sample/day volume.
 - [ ] Integration test with a CPU burner; assert plausible process CPU and RSS.
 - [ ] Tag `v0.1.0`.
