@@ -24,7 +24,7 @@ The MVP can be delivered in four increments, each of which produces a usable too
 
 **Phase 0 — Foundations (Week 1)**
 
-- Initialize Go module, repository layout, Makefile, and CI (build, vet, tests, race).
+- Initialize Go module, repository layout, Makefile, and CI (build, vet, integration tests, race).
 - Define `model` package: `Sample`, `Query`, `TimeRange`, label helpers.
 - Define `store.Store` interface and the `config` package (YAML or TOML — pick one, validate on load).
 - Wire up `cobra` root command and stub subcommands: `collect`, `query`, `tail`, `stats`, `config`, `version`.
@@ -32,7 +32,7 @@ The MVP can be delivered in four increments, each of which produces a usable too
 
 **Phase 1 — MVP: System Metrics + Disk Backend (Week 2)**
 
-- Implement `internal/source/system`: parsers for `/proc/stat`, `/proc/meminfo`, `/proc/net/dev`, with unit tests using captured fixtures.
+- Implement `internal/source/system`: parsers for `/proc/stat`, `/proc/meminfo`, `/proc/net/dev`, verified end-to-end against the test host's real `/proc`.
 - Implement the collector: single ticker, ring buffer (bounded by time), batch flush, structured logging via `slog`.
 - Implement `internal/store/disk`: chunked JSONL-gzip with atomic write via `.tmp` + `rename(2)`, directory layout `<data>/<scope>/YYYY/MM/DD/HH/<chunk>.jsonl.gz`, per-chunk index file.
 - Implement `query` subcommand: table and JSON output, filters on metric, time range, and labels.
@@ -83,7 +83,7 @@ The MVP can be delivered in four increments, each of which produces a usable too
 
 | Risk                                                | Mitigation                                                                               |
 | --------------------------------------------------- | ---------------------------------------------------------------------------------------- |
-| `/proc` parsing breaks on unusual kernels           | Fixture-based unit tests; fail loud at startup on missing files; CI on Alpine and Debian |
+| `/proc` parsing breaks on unusual kernels           | Integration tests on Alpine and Debian kernels; fail loud at startup on missing files    |
 | S3 cost from many small objects                     | Default 1-minute chunk duration; document size at target retention                       |
 | Docker stats stream per container is heavy at scale | Config knob to switch to one-shot; document scale guidance                               |
 | Clock adjustments produce bogus rates               | Store the delta-time used with each rate; CLI flags anomalies                            |
@@ -91,12 +91,14 @@ The MVP can be delivered in four increments, each of which produces a usable too
 
 ### 5. Testing Strategy
 
-- **Unit tests** for every `/proc` parser against captured fixture files.
-- **Golden-file tests** for the disk chunk format and the S3 object layout.
-- **Integration test** for the S3 backend against `minio` in CI (via `testcontainers-go` or a `docker-compose` service).
-- **Integration test** for the Docker source against a `dind` (Docker-in-Docker) service in CI.
-- **End-to-end smoke test**: run `smob collect` for 10s, then `smob query`, assert non-empty results and correct schema.
-- Run all tests with `-race`.
+All testing is black-box integration testing; there are no unit tests. Every test builds the `smob` binary and drives it as a subprocess against real dependencies.
+
+- **Fast suite** (every change): config validation, `collect` → `query` against the host's real `/proc` and a temporary data directory, output formats, signal handling, and error paths that need no external service.
+- **Extended suite** (CI and `make test-all`): process scope with a CPU burner, MinIO for the S3 backend, a Docker daemon for container scope, retention, `tail`, and `stats`.
+- MinIO and Docker are compose/CI services configured through environment variables. Tests skip with a clear reason when a service is absent; CI runs in strict mode where a skip is a failure.
+- Tests assert schema, labels, ordering, and plausible ranges, not exact live metric values. `/proc`, storage, the clock, and the Docker API are never mocked.
+- Golden files cover only stable output (chunk schema, help text), with an explicit update flag.
+- The race detector is applied to the `smob` binary under test, not only to the Go test process.
 
 ### 6. Repository Layout
 
@@ -125,8 +127,8 @@ Dockerfile                     # FROM scratch, static binary
 
 - [ ] `go mod init github.com/<org>/smob`; choose module path and license.
 - [ ] Create repository layout per the plan.
-- [ ] Add Makefile targets: `build`, `test`, `vet`, `race`, `docker`, `release`.
-- [ ] Set up CI: build on `linux/amd64` and `linux/arm64` with `CGO_ENABLED=0`; run `go vet`, `go test -race`.
+- [ ] Add Makefile targets: `build`, `test`, `test-all`, `test-race`, `test-update`, `vet`, `docker`, `release`.
+- [ ] Set up CI: build on `linux/amd64` and `linux/arm64` with `CGO_ENABLED=0`; run `go vet -tags=integration` and the integration suite with a `-race` binary.
 - [ ] Write `FROM scratch` (or distroless-static) Dockerfile producing an image with the static binary.
 - [ ] Define `model.Sample`, `model.Query`, `model.TimeRange` with doc comments.
 - [ ] Define `store.Store` interface (`Write`, `Query`) and `store.New(cfg)` factory.
@@ -137,15 +139,15 @@ Dockerfile                     # FROM scratch, static binary
 
 ### Phase 1 — MVP: System Metrics + Disk
 
-- [ ] Implement `/proc/stat` parser (per-CPU and aggregate jiffies) with fixture tests.
-- [ ] Implement `/proc/meminfo` parser (focus on `MemTotal`, `MemAvailable`) with fixture tests.
-- [ ] Implement `/proc/net/dev` parser (per-interface counters) with fixture tests.
+- [ ] Implement `/proc/stat` parser (per-CPU and aggregate jiffies), covered by the system integration test.
+- [ ] Implement `/proc/meminfo` parser (focus on `MemTotal`, `MemAvailable`), covered by the system integration test.
+- [ ] Implement `/proc/net/dev` parser (per-interface counters), covered by the system integration test.
 - [ ] Implement `system` source that diffs snapshots to produce CPU %, used memory bytes, and net RX/TX B/s.
 - [ ] Detect counter wrap / reboot and emit marker samples instead of bogus rates.
 - [ ] Implement collector: `time.Ticker` with jitter, bounded ring buffer, batch flush.
 - [ ] Add structured logging via `log/slog`; include a `--log-level` flag.
 - [ ] Implement `disk` store: chunked JSONL-gzip, atomic write (`.tmp` + `rename`), per-chunk index file.
-- [ ] Write golden-file tests for the disk chunk format (byte-exact).
+- [ ] Add a golden-file integration test for the disk chunk layout and schema.
 - [ ] Implement `query` subcommand: filters (`--metric`, `--since`, `--until`, `--label`), table output by default.
 - [ ] Add `--format json` and `--format csv` to `query`.
 - [ ] End-to-end smoke test in CI: `collect` for 10s, then `query`, assert results.
@@ -153,8 +155,8 @@ Dockerfile                     # FROM scratch, static binary
 
 ### Phase 2 — Process Metrics
 
-- [ ] Implement `/proc/[pid]/stat` parser (fields 14, 15, 22 = utime, stime, starttime) with fixture tests.
-- [ ] Implement `/proc/[pid]/statm` and `/proc/[pid]/status` (VmRSS) parsers with fixture tests.
+- [ ] Implement `/proc/[pid]/stat` parser (fields 14, 15, 22 = utime, stime, starttime), covered by the process integration test.
+- [ ] Implement `/proc/[pid]/statm` and `/proc/[pid]/status` (VmRSS) parsers, covered by the process integration test.
 - [ ] Implement PID enumeration with configurable re-scan cadence.
 - [ ] Implement process source: filter by regex (`process.filter`), top-N mode (`process.top_n`).
 - [ ] Handle PID reuse by keying on `(pid, starttime)`.
@@ -172,7 +174,7 @@ Dockerfile                     # FROM scratch, static binary
 - [ ] Implement `LIST`-prefix query path derived from the time range.
 - [ ] Implement concurrent `GET` with a bounded worker pool in the query path.
 - [ ] Add `minio` service to CI; run S3 integration tests.
-- [ ] Verify: results from `disk` and `s3` backends match on identical input (byte-for-byte decompressed).
+- [ ] Verify: `disk` and `s3` backends produce the same key layout and parse to equivalent samples on identical input.
 - [ ] Document S3 IAM permissions (`s3:PutObject`, `s3:GetObject`, `s3:ListBucket`, `s3:DeleteObject` if retention is used).
 
 ### Phase 4 — Docker Container Metrics
@@ -203,7 +205,7 @@ Dockerfile                     # FROM scratch, static binary
 
 ### Cross-Cutting (run throughout)
 
-- [ ] Every parser and store backend has unit tests; CI runs with `-race`.
+- [ ] Every parser and store backend is covered by an integration test; CI builds the binary under test with `-race`.
 - [ ] Every CLI subcommand has a `--format` option and a smoke test.
 - [ ] Every config field is validated with a clear error message.
 - [ ] Every external failure mode (disk full, S3 auth error, missing socket, `/proc` unreadable) is exercised by a test or explicitly documented.

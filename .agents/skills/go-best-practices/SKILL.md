@@ -1,6 +1,6 @@
 ---
 name: go-best-practices
-description: Use when writing, reviewing, refactoring, or debugging Go code in smob. Enforces lean, idiomatic Go — stdlib-first, small interfaces, explicit errors, testable /proc parsers — and bans premature abstraction.
+description: Use when writing, reviewing, refactoring, or debugging Go code in smob. Enforces lean, idiomatic Go — stdlib-first, small interfaces, explicit errors, CLI-testable behavior — and bans premature abstraction.
 ---
 
 # Go Best Practices for smob
@@ -21,10 +21,10 @@ description: Use when writing, reviewing, refactoring, or debugging Go code in s
 Every change must pass:
 
 ```sh
-gofmt -l .            # must print nothing
-go vet ./...
-staticcheck ./...
-go test -race ./...
+gofmt -l .                              # must print nothing
+go vet -tags=integration ./...
+staticcheck -tags=integration ./...
+go test -tags=integration -count=1 ./test/integration/...
 go mod tidy
 ```
 
@@ -94,8 +94,7 @@ go mod tidy
 
 - `/proc` parsers are pure functions over a reader:
   `func parseStat(r io.Reader) (Snapshot, error)`. No global paths, no
-  `os.ReadFile` inside the parser, no hidden state. Test them from fixtures in
-  `testdata/`.
+  `os.ReadFile` inside the parser, no hidden state.
 - Rate math is a pure function of `(prev, cur, elapsed)`. Do not call
   `time.Now()` inside it; the collector supplies the clock.
 - Sources produce snapshots. The collector owns the ticker, jitter, buffering,
@@ -122,31 +121,34 @@ go mod tidy
 - Functional options before a constructor has four or more optional parameters.
 - `util`, `common`, `helpers`, or `types` packages. Name the package after what
   it does.
-- Mocking frameworks or generated mocks. Write a small fake against a small
-  interface.
+- Mocking frameworks, generated mocks, or hand-written fakes and stubs. Tests
+  exercise real dependencies.
 - Reflection, plugin registries, event buses, or generic `Manager` types.
 - Premature generics. Use them when they remove real, existing duplication.
-- `time.Sleep` in tests. Inject a clock or call the pure function directly.
+- `time.Sleep` as synchronization. Wait on observable state with a bounded
+  deadline.
 - Wrappers whose only job is to call another function unchanged.
 
 ## Testing
 
-- Table-driven tests for parsers and rate math. One case per behavior, including
-  malformed input and counter resets.
-- Use `t.TempDir()` for filesystem tests and `testdata/` for fixtures. Do not
-  depend on the host's `/proc`.
-- Golden files are allowed only with an explicit `-update` flag and a diff on
-  failure. Never rewrite a golden file silently.
-- Test error paths. A parser that only has a happy-path test is untested.
-- Call `t.Parallel()` when the test has no shared state; do not force it.
-- Gate integration tests (MinIO, Docker-in-Docker) behind an environment
-  variable or build tag so `go test ./...` stays fast and offline.
-- Prefer deterministic tests over retries and generous timeouts.
+Testing is integration-only. Load the `integration-testing` skill before writing
+or changing a test.
+
+- Do not add `_test.go` files under `internal/` or `cmd/`, and do not add unit
+  tests, mocks, fakes, or stubs.
+- The public contract is the CLI and the on-disk/S3 formats. Keep behavior
+  reachable from a subcommand so it can be tested as a black box.
+- Tests live under `test/integration` behind the `integration` build tag. The
+  default `go test ./...` stays fast; CI runs the tagged suite explicitly.
+- Do not add production code, flags, or injection points that exist only for
+  tests.
 
 ## Definition of done
 
-- [ ] `gofmt -l .` is empty; `go vet`, `staticcheck`, and `go test -race` pass.
-- [ ] New behavior has a test; parser changes have fixtures.
+- [ ] `gofmt -l .` is empty; `go vet -tags=integration`, `staticcheck
+      -tags=integration`, and the tagged integration suite pass.
+- [ ] New behavior has an integration test through the CLI; observable failure
+      paths are covered.
 - [ ] No new dependency, or its justification is stated.
 - [ ] Errors carry context; nothing logs and returns the same error.
 - [ ] Every goroutine has a shutdown path.
