@@ -1,212 +1,247 @@
 # smob — Simple Monitoring Observability Tool
 
-## Executive Summary
+**smob** is a lightweight observability tool delivered as a single static Go
+binary. It records CPU, memory, and network usage over time on a Linux host and
+stores the data on local disk or in any S3-compatible object store. It supports
+three collection scopes: the whole system, individual processes, and Docker
+containers. Everything is driven from one CLI: `smob collect` runs the
+collector, and the remaining commands query historical data.
 
-**smob** is a lightweight observability tool delivered as a single Go binary, designed to record CPU, memory, and network usage over time on a VPS and store the data either on local disk or on any S3-compatible object storage. It supports three collection scopes: system-wide, individual processes, and Docker containers. Users interact with the tool through a straightforward CLI (`smob`) to collect metrics and query historical data. The tool ships with a Docker image for container-based deployment, while its static binary and minimal dependencies make it equally at home running directly on the host under systemd.
+The design favors simplicity and correctness over feature breadth. Metrics come
+from Linux `/proc` and the Docker Engine API rather than heavy instrumentation
+libraries. Disk and S3 use one time-aligned chunk format, so the backends are
+interchangeable and existing data can be copied between them with
+`aws s3 sync`.
 
-The design favors simplicity and correctness over feature breadth. Metrics are captured by directly parsing Linux `/proc` (for system and process scopes) and by using the Docker Engine API (for container scope), avoiding heavy instrumentation libraries. A pluggable storage interface backed by a compact, human-inspectable on-disk format (JSONL-gzipped chunks) and a matching S3 layout ensures the two backends are interchangeable — the same data can be written to disk today and migrated to S3 tomorrow by changing config. Sampling is driven by a single ticker with in-memory ring buffering and batching, so writes to S3 are efficient and resilient to transient backend failures.
+> **Project status:** smob is pre-v0.1. The repository currently provides the
+> CLI scaffolding, configuration loader, `version`, and `config` commands.
+> `collect`, `query`, `stats`, and `tail` are stubs in the current build. The
+> command and metric reference below describes the v0.1 contract and is the
+> target those commands are being built against. See the
+> [design and implementation plan](docs/IMPLEMENTATION.md) for the roadmap.
 
-The MVP can be delivered in four increments, each of which produces a usable tool: (1) system metrics with a disk backend, (2) process metrics with filtering, (3) an S3 backend, and (4) Docker container metrics. Later increments add retention policies, tailing, and aggregation options. Development is scoped at roughly 4–6 weeks for a single engineer working at a sustainable pace.
+## Features
 
----
+- **One static binary.** Linux amd64 and arm64, built with `CGO_ENABLED=0`, with
+  no runtime dependencies.
+- **Three collection scopes.** System-wide CPU, memory, and network; per-process
+  CPU and RSS with filtering and top-N selection; per-container CPU, memory, and
+  network through the Docker Engine API.
+- **Disk or S3.** Write locally or to AWS S3, MinIO, or any S3-compatible
+  endpoint. Both backends use the same key layout and sample format.
+- **Efficient storage.** Samples are grouped into immutable, UTC-aligned chunks
+  (five minutes by default) and compressed with gzip. A crash loses at most the
+  chunk being assembled; `SIGINT`/`SIGTERM` flushes it before exit.
+- **Streaming queries.** Query by time range, host, scope, metric, and labels;
+  emit a table or stream JSON, JSONL, and CSV.
+- **Explicit units.** Metric names encode their unit, and rates carry the
+  measurement window used to compute them.
 
-## Implementation Plan
+## Requirements
 
-### 1. Guiding Principles
+- Linux (amd64 or arm64).
+- Go 1.27 or newer to build from source.
+- Optional: a reachable Docker socket to collect container metrics.
+- Optional: an S3-compatible bucket for remote storage.
 
-- **One binary, two modes.** `smob collect` runs the daemon; every other subcommand is a short-lived CLI. Shared code, no forking.
-- **Direct `/proc` parsing.** Avoid `gopsutil`. Rates (CPU %, B/s) are computed in the collector and stored as final values, not raw counters.
-- **Pluggable storage.** The `Store` interface is the only thing the collector knows about. Disk and S3 are peer implementations behind it.
-- **Label-based samples.** Every sample carries a metric name, value, timestamp, and labels (scope, PID, container, etc.). The CLI filters on labels, not on hard-coded scopes.
-- **Fail soft, then fail loud.** A missing Docker socket disables the container source with a warning; an unreadable `/proc` fails startup immediately.
+## Install
 
-### 2. Phase Breakdown
+Build the static binary with the provided justfile:
 
-**Phase 0 — Foundations (Week 1)**
-
-- Initialize Go module, repository layout, justfile, and CI (build, vet, integration tests, race).
-- Define `model` package: `Sample`, `Query`, `TimeRange`, label helpers.
-- Define `store.Store` interface and the `config` package (YAML or TOML — pick one, validate on load).
-- Wire up `cobra` root command and stub subcommands: `collect`, `query`, `tail`, `stats`, `config`, `version`.
-- Cross-compile test with `CGO_ENABLED=0` for Linux amd64 and arm64; produce a `FROM scratch` Dockerfile.
-
-**Phase 1 — MVP: System Metrics + Disk Backend (Week 2)**
-
-- Implement `internal/source/system`: parsers for `/proc/stat`, `/proc/meminfo`, `/proc/net/dev`, verified end-to-end against the test host's real `/proc`.
-- Implement the collector: single ticker, ring buffer (bounded by time), batch flush, structured logging via `slog`.
-- Implement `internal/store/disk`: chunked JSONL-gzip with atomic write via `.tmp` + `rename(2)`, directory layout `<data>/<scope>/YYYY/MM/DD/HH/<chunk>.jsonl.gz`, per-chunk index file.
-- Implement `query` subcommand: table and JSON output, filters on metric, time range, and labels.
-- **Exit criterion:** `smob collect` writes real samples to disk for a full day without gaps; `smob query --since 1h` returns correct CPU, memory, and network figures.
-
-**Phase 2 — Process Metrics (Week 3)**
-
-- Implement `internal/source/process`: enumerator over `/proc/[pid]`, parser for `stat` (jiffies, starttime) and `statm`/`status` (RSS), filter by regex, top-N mode.
-- Handle PID reuse (key by `(pid, starttime)`), counter reset detection, and re-scan cadence.
-- Add config fields: `process.filter`, `process.top_n`, `process.enabled`.
-- Extend CLI with `--label pid=...` and `--label comm=...` filtering.
-- **Exit criterion:** given a config filtering `nginx|postgres`, `smob query` shows per-process CPU and RSS at the configured resolution.
-
-**Phase 3 — S3 Backend (Week 4)**
-
-- Implement `internal/store/s3` using `aws-sdk-go-v2` (works against any S3-compatible service; configure endpoint, region, credentials from env or config).
-- Mirror the disk chunk layout in the object key namespace. Batch size derived from a target chunk duration (default 1m) rather than byte count.
-- Add retry with exponential backoff; on sustained failure and if disk is also configured, fall back to disk.
-- CLI queries: `LIST` with a prefix derived from the time range, then concurrent `GET` with a worker pool.
-- Add `--dry-run` on `collect` for validation.
-- **Exit criterion:** collect to MinIO (dev) and to a real S3 bucket; query results match the disk backend byte-for-byte after decompression.
-
-**Phase 4 — Docker Container Metrics (Week 5)**
-
-- Implement `internal/source/docker` using the Docker Engine client over `/var/run/docker.sock`. Prefer persistent `ContainerStats` streams with fan-in for many containers; fall back to short-lived `ContainerStatsOneShot` calls for small deployments.
-- Label samples with `container=<name>` and `image=<image>`.
-- Graceful disable if the socket is absent; reconnect on Docker restarts.
-- Config: `docker.socket`, `docker.enabled`, `docker.exclude` regex.
-- Extend the Dockerfile to make `smob` runnable in a container with `/var/run/docker.sock` and `/proc` mounted. Document the `--pid=host` caveat for host-level process visibility.
-- **Exit criterion:** inside a Docker container, `smob collect` records per-container CPU and network; `smob query --label container=web` returns correct values.
-
-**Phase 5 — Polish & Release (Week 6)**
-
-- Add retention: `retention.disk` (bytes / days) enforced during write; `retention.s3` delegated to bucket lifecycle policy with a documented recommendation.
-- Add `smob tail` (follow last N samples) and `smob stats` (quick summary over a range).
-- Aggregation options in `query`: `--agg avg|min|max|sum` with `--group-by metric,label`.
-- Documentation: README, `smob config --validate`, sample systemd unit, sample compose file, migration note (disk → S3 by changing config and re-running with a fresh `--data-dir` and bucket).
-- Release: GitHub releases with `smob` binaries and the Docker image; tag `v0.1.0`.
-
-### 3. Non-Goals (v0.1)
-
-- No alerting, dashboards, or Prometheus exposition.
-- No Windows or macOS support — Linux only.
-- No multi-host aggregation or remote query API.
-- No distributed collection or sharding.
-
-### 4. Risks and Mitigations
-
-| Risk                                                | Mitigation                                                                               |
-| --------------------------------------------------- | ---------------------------------------------------------------------------------------- |
-| `/proc` parsing breaks on unusual kernels           | Integration tests on Alpine and Debian kernels; fail loud at startup on missing files    |
-| S3 cost from many small objects                     | Default 1-minute chunk duration; document size at target retention                       |
-| Docker stats stream per container is heavy at scale | Config knob to switch to one-shot; document scale guidance                               |
-| Clock adjustments produce bogus rates               | Store the delta-time used with each rate; CLI flags anomalies                            |
-| Disk fills up                                       | Retention enforcement at write time; explicit exit code + log on disk-full               |
-
-### 5. Testing Strategy
-
-All testing is black-box integration testing; there are no unit tests. Every test builds the `smob` binary and drives it as a subprocess against real dependencies.
-
-- **Fast suite** (every change): config validation, `collect` → `query` against the host's real `/proc` and a temporary data directory, output formats, signal handling, and error paths that need no external service.
-- **Extended suite** (CI and `just test-all`): process scope with a CPU burner, MinIO for the S3 backend, a Docker daemon for container scope, retention, `tail`, and `stats`.
-- MinIO and Docker are compose/CI services configured through environment variables. Tests skip with a clear reason when a service is absent; CI runs in strict mode where a skip is a failure.
-- Tests assert schema, labels, ordering, and plausible ranges, not exact live metric values. `/proc`, storage, the clock, and the Docker API are never mocked.
-- Golden files cover only stable output (chunk schema, help text), with an explicit update flag.
-- The race detector is applied to the `smob` binary under test, not only to the Go test process.
-
-### 6. Repository Layout
-
-```
-cmd/smob/main.go               # cobra root, subcommand wiring
-internal/model/                # Sample, Query, TimeRange
-internal/config/               # config parsing + validation
-internal/collector/            # ticker, ring buffer, batching, source registry
-internal/source/system/        # /proc/stat, meminfo, net/dev
-internal/source/process/       # /proc/[pid]/...
-internal/source/docker/        # docker client wrapper
-internal/store/                # Store interface, factory
-internal/store/disk/           # local fs implementation
-internal/store/s3/             # S3 implementation
-internal/query/                # filtering, aggregation
-internal/cli/                  # shared CLI helpers (table output, exit codes)
-docs/                          # README, examples, systemd unit, compose file
-Dockerfile                     # FROM scratch, static binary
+```sh
+just build
+./smob version
 ```
 
----
+Without `just`, the equivalent command is:
 
-## TODO List
+```sh
+CGO_ENABLED=0 go build -trimpath -o smob ./cmd/smob
+```
 
-### Phase 0 — Foundations
+Cross-compiled release binaries can be produced with `just release`. A minimal
+container image (`FROM scratch`, non-root user, CA bundle) can be built with
+`just docker`.
 
-- [ ] `go mod init github.com/<org>/smob`; choose module path and license.
-- [ ] Create repository layout per the plan.
-- [ ] Add justfile recipes: `build`, `test`, `test-all`, `test-race`, `test-update`, `vet`, `docker`, `release`.
-- [ ] Set up CI: build on `linux/amd64` and `linux/arm64` with `CGO_ENABLED=0`; run `go vet -tags=integration` and the integration suite with a `-race` binary.
-- [ ] Write `FROM scratch` (or distroless-static) Dockerfile producing an image with the static binary.
-- [ ] Define `model.Sample`, `model.Query`, `model.TimeRange` with doc comments.
-- [ ] Define `store.Store` interface (`Write`, `Query`) and `store.New(cfg)` factory.
-- [ ] Define config schema (YAML): `interval`, `data_dir`, `sources.{system,process,docker}`, `storage.{disk,s3}`, `retention`.
-- [ ] Implement config loading with strict unknown-field rejection and `smob config --validate`.
-- [ ] Wire `cobra` root and stub subcommands: `collect`, `query`, `tail`, `stats`, `config`, `version`.
-- [ ] Write `version` subcommand printing version, commit, build date (via `-ldflags`).
+## Quick start
 
-### Phase 1 — MVP: System Metrics + Disk
+Create a minimal configuration file, for example `smob.yaml`:
 
-- [ ] Implement `/proc/stat` parser (per-CPU and aggregate jiffies), covered by the system integration test.
-- [ ] Implement `/proc/meminfo` parser (focus on `MemTotal`, `MemAvailable`), covered by the system integration test.
-- [ ] Implement `/proc/net/dev` parser (per-interface counters), covered by the system integration test.
-- [ ] Implement `system` source that diffs snapshots to produce CPU %, used memory bytes, and net RX/TX B/s.
-- [ ] Detect counter wrap / reboot and emit marker samples instead of bogus rates.
-- [ ] Implement collector: `time.Ticker` with jitter, bounded ring buffer, batch flush.
-- [ ] Add structured logging via `log/slog`; include a `--log-level` flag.
-- [ ] Implement `disk` store: chunked JSONL-gzip, atomic write (`.tmp` + `rename`), per-chunk index file.
-- [ ] Add a golden-file integration test for the disk chunk layout and schema.
-- [ ] Implement `query` subcommand: filters (`--metric`, `--since`, `--until`, `--label`), table output by default.
-- [ ] Add `--format json` and `--format csv` to `query`.
-- [ ] End-to-end smoke test in CI: `collect` for 10s, then `query`, assert results.
-- [ ] Manual soak test: run `collect` for 24h, verify no gaps and reasonable memory usage.
+```yaml
+data_dir: ./data
+log_level: info
+sources:
+  system:
+    enabled: true
+storage:
+  primary: disk
+```
 
-### Phase 2 — Process Metrics
+Validate it and inspect the effective configuration:
 
-- [ ] Implement `/proc/[pid]/stat` parser (fields 14, 15, 22 = utime, stime, starttime), covered by the process integration test.
-- [ ] Implement `/proc/[pid]/statm` and `/proc/[pid]/status` (VmRSS) parsers, covered by the process integration test.
-- [ ] Implement PID enumeration with configurable re-scan cadence.
-- [ ] Implement process source: filter by regex (`process.filter`), top-N mode (`process.top_n`).
-- [ ] Handle PID reuse by keying on `(pid, starttime)`.
-- [ ] Emit per-process labels: `pid`, `comm`, `scope=process`.
-- [ ] Extend `query` to support `--label pid=` and `--label comm=` with regex match.
-- [ ] Add process source config fields and validation.
-- [ ] Benchmark: measure per-tick cost on a host with ~1000 processes; document.
+```sh
+./smob config --config ./smob.yaml --validate
+./smob config --config ./smob.yaml
+```
 
-### Phase 3 — S3 Backend
+Once collection lands in the current build, the target workflow is:
 
-- [ ] Add `aws-sdk-go-v2` dependency; implement config (endpoint, region, bucket, prefix, credentials).
-- [ ] Implement `s3` store with the same chunk layout as disk; final-key PUT (no rename needed).
-- [ ] Implement retry with exponential backoff and jitter.
-- [ ] Implement fallback-to-disk when configured and S3 is failing after retry budget.
-- [ ] Implement `LIST`-prefix query path derived from the time range.
-- [ ] Implement concurrent `GET` with a bounded worker pool in the query path.
-- [ ] Add `minio` service to CI; run S3 integration tests.
-- [ ] Verify: `disk` and `s3` backends produce the same key layout and parse to equivalent samples on identical input.
-- [ ] Document S3 IAM permissions (`s3:PutObject`, `s3:GetObject`, `s3:ListBucket`, `s3:DeleteObject` if retention is used).
+```sh
+# Run the collector in the foreground.
+./smob collect --config ./smob.yaml
 
-### Phase 4 — Docker Container Metrics
+# In another shell, query the last hour of samples.
+./smob query --config ./smob.yaml --since 1h
 
-- [ ] Add Docker Engine client dependency; connect over `docker.socket` config.
-- [ ] Implement `ContainerStats` stream fan-in for persistent collection.
-- [ ] Implement `ContainerStatsOneShot` path as an alternative for small deployments.
-- [ ] Compute per-container CPU % and net B/s correctly (using `precpu_stats`).
-- [ ] Emit labels: `container`, `image`, `scope=container`.
-- [ ] Implement graceful disable when socket is absent; log at info level.
-- [ ] Implement reconnect on Docker daemon restart.
-- [ ] Add `docker.exclude` regex config.
-- [ ] Update Dockerfile and docs: mount `/var/run/docker.sock`; document `--pid=host` caveat.
-- [ ] Integration test in CI using a `dind` service; run a container and assert metrics appear.
+# Query a specific metric and label.
+./smob query --config ./smob.yaml --since 24h \
+  --metric process.cpu.percent --label 'comm~nginx|postgres'
+```
 
-### Phase 5 — Polish & Release
+By default the configuration is read from `/etc/smob/smob.yaml`; use
+`--config` to point at another file. Query commands read the same backend the
+collector writes to.
 
-- [ ] Implement disk retention: delete oldest chunks when size or age exceeds config.
-- [ ] Document S3 retention via bucket lifecycle policy (recommendation, not code).
-- [ ] Implement `smob tail`: follow the last N samples, streaming output.
-- [ ] Implement `smob stats`: summary over a range (count, min/max/mean per metric).
-- [ ] Add `--agg avg|min|max|sum` and `--group-by` to `query`.
-- [ ] Write README: quickstart, config reference, disk↔S3 migration note.
-- [ ] Provide sample `systemd` unit and `docker-compose.yml`.
-- [ ] Add `--version` output test; add `--help` snapshot tests for each subcommand.
-- [ ] Tag `v0.1.0`; build release artifacts (binaries for amd64/arm64, Docker image).
-- [ ] Post-release: collect user feedback, prioritize `v0.2.0` backlog (alerting, Prometheus endpoint, non-Linux targets are candidates to explicitly reject or accept).
+## Metrics reference
 
-### Cross-Cutting (run throughout)
+Every sample carries a `host` label and a `scope` label (`system`, `process`, or
+`container`), plus the series labels listed below. Metric names and units never
+change meaning between versions.
 
-- [ ] Every parser and store backend is covered by an integration test; CI builds the binary under test with `-race`.
-- [ ] Every CLI subcommand has a `--format` option and a smoke test.
-- [ ] Every config field is validated with a clear error message.
-- [ ] Every external failure mode (disk full, S3 auth error, missing socket, `/proc` unreadable) is exercised by a test or explicitly documented.
-- [ ] Keep the binary lean: audit dependencies at each phase; remove unused ones.
+| Metric | Type | Unit | Labels | Notes |
+| --- | --- | --- | --- | --- |
+| `system.cpu.percent` | rate | percent | `cpu=all` or `cpu=N` | 0–100 per logical CPU; `all` is the aggregate |
+| `system.memory.total_bytes` | gauge | bytes | — | `MemTotal` |
+| `system.memory.available_bytes` | gauge | bytes | — | `MemAvailable` |
+| `system.memory.used_bytes` | gauge | bytes | — | `total − available` |
+| `system.network.rx_bytes_per_second` | rate | B/s | `interface` | Per interface |
+| `system.network.tx_bytes_per_second` | rate | B/s | `interface` | Per interface |
+| `process.cpu.percent` | rate | percent | `pid`, `comm` | 0–100 per core; two busy cores report 200 |
+| `process.memory.rss_bytes` | gauge | bytes | `pid`, `comm` | `VmRSS` |
+| `container.cpu.percent` | rate | percent | `container`, `image` | 0–100 per core, using `precpu_stats` |
+| `container.memory.used_bytes` | gauge | bytes | `container`, `image` | `usage − inactive_file`, floored at zero |
+| `container.network.rx_bytes_per_second` | rate | B/s | `container`, `image`, `interface` | Per interface |
+| `container.network.tx_bytes_per_second` | rate | B/s | `container`, `image`, `interface` | Per interface |
+
+### Reading the metrics
+
+- Timestamps are UTC. Gauge samples are instantaneous; rate samples record the
+  measurement window in `interval_ms`.
+- CPU percentages are per core. `100` means one core fully busy, so a
+  multi-threaded process or container can exceed `100`. System CPU also reports
+  an aggregate series with `cpu=all` alongside per-logical-CPU series.
+- System CPU busy time is `total − (idle + iowait)`, following `/proc/stat`
+  semantics. The aggregate `cpu=all` series comes from the kernel's aggregate
+  line, not from summing individual CPUs.
+- A counter reset — for example after a reboot or when an interface is
+  recreated — drops that tick rather than reporting a bogus rate. A short gap in
+  the series is expected.
+- Process labels use `comm`, which the kernel truncates to 15 bytes. Matching
+  the full command line is not supported.
+
+## CLI reference
+
+Global flags:
+
+| Flag | Description |
+| --- | --- |
+| `--config PATH` | Configuration file. Defaults to `/etc/smob/smob.yaml`. |
+| `--log-level LEVEL` | Override the configured level: `debug`, `info`, `warn`, `error`. |
+| `--log-format FORMAT` | Override the configured format: `text` or `json`. |
+
+Commands:
+
+| Command | Purpose |
+| --- | --- |
+| `smob collect` | Run the collector and write samples to the configured backend. |
+| `smob query` | Query recorded samples. |
+| `smob stats` | Summarize matching samples (planned for v0.2). |
+| `smob tail` | Live tail (deferred; currently a stub). |
+| `smob config` | Print the effective configuration; `--validate` checks it and exits. |
+| `smob version` | Print version, commit, and build date. |
+
+### `collect`
+
+- `--dry-run` validates configuration, source inputs, and store access without
+  writing anything.
+- `--once` collects one snapshot from every enabled source, writes one partial
+  chunk per scope, and exits. This is intended for testing and automation.
+- `--data-dir DIR` overrides `data_dir` from the configuration.
+
+The collector runs until interrupted. A store failure after retries stops
+collection rather than silently dropping data.
+
+### `query`
+
+Query defaults to the last hour when `--since` is omitted. `--until` defaults to
+now; `--until` without `--since` means the hour before `--until`.
+
+| Flag | Description |
+| --- | --- |
+| `--since TIME` | Duration (`1h`, `24h`) or an RFC3339 timestamp. |
+| `--until TIME` | RFC3339 timestamp. Defaults to now. |
+| `--host NAME` | Restrict to one host. Omitting it merges hosts. |
+| `--scope SCOPE` | Restrict to `system`, `process`, or `container`. |
+| `--metric NAME` | Exact metric name. |
+| `--label MATCH` | Repeatable and ANDed. `name=value` is exact; `name~regex` is a regular expression. Quote shell metacharacters, for example `--label 'comm~nginx|postgres'`. |
+| `--limit N` | Maximum samples returned. Defaults to 10,000; `0` means unlimited. |
+| `--format FORMAT` | `table` (default), `json`, `jsonl`, or `csv`. |
+| `--data-dir DIR` | Override `data_dir` from the configuration. |
+
+Output is UTC everywhere. Table columns are `TIME`, `METRIC`, `VALUE`, `UNIT`,
+and `LABELS`; units come from the metric suffix. JSON is one array; JSONL
+streams one object per line for large ranges; CSV includes a header row.
+Results are sorted by timestamp, then metric, then canonical labels. `--limit`
+is applied after filtering and sorting.
+
+Data goes to stdout; status and errors go to stderr.
+
+### Exit codes
+
+| Code | Meaning |
+| --- | --- |
+| `0` | Success |
+| `1` | Runtime failure |
+| `2` | Usage or configuration error |
+| `3` | Persistent store failure (including `ENOSPC`) |
+
+## Storage
+
+Set `storage.primary` to `disk` or `s3`. Exactly one backend is active; there is
+no mirroring or dual-write.
+
+- **Disk** writes under `data_dir` and is the default. Retention by age
+  (`retention.disk.max_age`) or total size (`retention.disk.max_bytes`) is
+  planned for v0.2.
+- **S3** writes to an AWS or S3-compatible bucket using the standard AWS
+  credential chain (environment, shared config, or instance role). Credentials
+  are never stored in `smob.yaml`.
+
+Both backends use the same keys and sample format, so migrating from disk to S3
+is a copy followed by a configuration change:
+
+```sh
+aws s3 sync ./data/ s3://<bucket>/<prefix>/
+# then set storage.primary: s3
+```
+
+Completed chunks are immutable. A collector crash loses at most the chunk
+currently being assembled, and `SIGINT`/`SIGTERM` flushes that chunk before
+exit. Concurrent collectors must not write the same host and prefix. Multiple
+hosts may share a bucket; every sample is labelled with its host.
+
+## Development
+
+The [design and implementation plan](docs/IMPLEMENTATION.md) covers architecture,
+the storage layout, delivery phases, testing strategy, and the TODO list.
+
+```sh
+just test       # fast suite
+just test-all   # extended suite; requires MinIO and Docker for full coverage
+just lint
+just release
+```
+
+## License
+
+MIT. See [LICENSE](LICENSE).

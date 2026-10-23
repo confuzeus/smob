@@ -26,8 +26,12 @@ vet:
 lint:
     go run honnef.co/go/tools/cmd/staticcheck@{{staticcheck_version}} -tags=integration ./...
 
+# Run pure-function tests (no build tag).
+test-unit:
+    go test -count=1 ./...
+
 # Run the fast integration suite.
-test:
+test: test-unit
     go test -tags=integration -count=1 ./test/integration/...
 
 # Run the extended integration suite in strict mode.

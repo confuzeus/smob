@@ -24,6 +24,7 @@ Every change must pass:
 gofmt -l .                              # must print nothing
 go vet -tags=integration ./...
 staticcheck -tags=integration ./...
+go test ./...
 go test -tags=integration -count=1 ./test/integration/...
 go mod tidy
 ```
@@ -109,9 +110,9 @@ go mod tidy
   output stays testable.
 - Logging is `log/slog` with structured key/value pairs. No `fmt.Printf` outside
   the CLI's user-facing output.
-- When a required input is missing (unreadable `/proc`), fail at startup. When
-  an optional one is missing (Docker socket), disable that source with a
-  warning — do not fail the process.
+- When an enabled input is missing (unreadable `/proc`, absent Docker socket),
+  fail at startup with a clear error. Disabling the source in config is the
+  supported way to run without it; there is no silent degradation.
 
 ## Do not build
 
@@ -131,15 +132,20 @@ go mod tidy
 
 ## Testing
 
-Testing is integration-only. Load the `integration-testing` skill before writing
-or changing a test.
+Integration tests are the contract. Load the `integration-testing` skill before
+writing or changing a test.
 
-- Do not add `_test.go` files under `internal/` or `cmd/`, and do not add unit
-  tests, mocks, fakes, or stubs.
 - The public contract is the CLI and the on-disk/S3 formats. Keep behavior
   reachable from a subcommand so it can be tested as a black box.
-- Tests live under `test/integration` behind the `integration` build tag. The
-  default `go test ./...` stays fast; CI runs the tagged suite explicitly.
+- Integration tests live under `test/integration` behind the `integration` build
+  tag. CI runs the tagged suite explicitly.
+- A narrow exception allows table-driven `_test.go` files beside pure functions
+  whose edge cases cannot be reached through the CLI: `/proc` parsers over
+  `io.Reader` fixtures, rate/reset math, and chunk key derivation. They use
+  fixtures or plain values, never mocks, fakes, stubs, or test-only production
+  code.
+- Do not unit-test CLI wiring, config, stores, or anything observable through a
+  subcommand.
 - Do not add production code, flags, or injection points that exist only for
   tests.
 
@@ -148,7 +154,8 @@ or changing a test.
 - [ ] `gofmt -l .` is empty; `go vet -tags=integration`, `staticcheck
       -tags=integration`, and the tagged integration suite pass.
 - [ ] New behavior has an integration test through the CLI; observable failure
-      paths are covered.
+      paths are covered. Any pure-function tests are table-driven fixture tests,
+      not substitutes for the CLI contract.
 - [ ] No new dependency, or its justification is stated.
 - [ ] Errors carry context; nothing logs and returns the same error.
 - [ ] Every goroutine has a shutdown path.

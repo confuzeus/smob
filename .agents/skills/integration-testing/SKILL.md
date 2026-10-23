@@ -1,20 +1,25 @@
 ---
 name: integration-testing
-description: Use when writing, running, reviewing, or debugging tests in smob. smob has no unit tests; every test builds the smob binary and drives it as a black box against real /proc, a temporary data directory, and optional MinIO or Docker services.
+description: Use when writing, running, reviewing, or debugging tests in smob. Integration tests are the contract: every observable behavior builds the smob binary and drives it as a black box against real /proc, a temporary data directory, and optional MinIO or Docker services. Narrow table-driven tests are allowed for pure functions that the CLI cannot reach.
 ---
 
 # Integration Testing for smob
 
 ## Stance
 
-- Every test is an integration test. Build the `smob` binary and run it as a
-  subprocess. Assert on the exit code, stdout, stderr, files in the data
-  directory, and objects in S3. Nothing else.
-- There are no unit tests. Do not create `_test.go` files under `internal/` or
-  `cmd/`, and do not call unexported functions from a test.
+- Integration tests are the default and the public contract. Build the `smob`
+  binary and run it as a subprocess. Assert on the exit code, stdout, stderr,
+  files in the data directory, and objects in S3.
+- A narrow exception exists for pure functions whose edge cases cannot be
+  reached through the CLI: `/proc` parsers over `io.Reader` fixtures, rate and
+  reset math, and chunk key derivation. Those tests live beside the code in
+  table-driven `_test.go` files and use fixture bytes or plain values only.
+- Do not unit-test CLI wiring, config decoding, storage, or anything that is
+  observable through a subcommand. Those belong in the integration suite.
 - Do not mock, fake, or stub `/proc`, the filesystem, the clock, `store.Store`,
   the Docker API, or the S3 API. If a behavior cannot be exercised through the
-  binary against real dependencies, the design is wrong, not the test.
+  binary against real dependencies, the design is wrong, not the test. A parser
+  fixture is input data, not a fake system.
 - Do not add production code that exists only for tests: no hidden `--test-*`
   flags, no injectable clock, no exported internals.
 - Linux only. A test that cannot run on the current platform skips with a
@@ -24,14 +29,18 @@ description: Use when writing, running, reviewing, or debugging tests in smob. s
 
 ## What counts
 
-| Covered by an integration test              | Not covered here                        |
-| ------------------------------------------- | --------------------------------------- |
-| CLI behavior: flags, exit codes, formats    | Unexported helpers                      |
-| Config decoding and validation via the CLI  | Individual parser functions             |
-| `/proc` collection on the real host         | Malformed `/proc` fixtures              |
-| Disk chunk layout and JSONL schema          | Byte-exact snapshots of internals       |
-| S3/MinIO and Docker sources and stores      | Third-party library behavior            |
-| Shutdown, signals, retries, and fallbacks   | Timing internals that are unobservable  |
+| Covered by an integration test              | Covered by a table-driven test             |
+| ------------------------------------------- | ------------------------------------------ |
+| CLI behavior: flags, exit codes, formats    | `/proc` parsers over byte fixtures         |
+| Config decoding and validation via the CLI  | Rate, counter-reset, and reboot math       |
+| `/proc` collection on the real host         | Chunk key derivation across UTC boundaries |
+| Disk chunk layout and JSONL schema          | Malformed input handling                   |
+| S3/MinIO and Docker sources and stores      |                                            |
+| Shutdown, signals, retries, and fallbacks   |                                            |
+
+Neither category includes third-party library behavior or byte-exact snapshots
+of internals. When a pure test and an integration test disagree, the
+integration test is right.
 
 The CLI and the on-disk/S3 formats are the contract. Do not import `internal/...`
 or `cmd/...` from the test package; mirror the documented wire types locally.
@@ -59,6 +68,11 @@ test/integration/
 Every Go file in this package starts with `//go:build integration` and declares
 `package integration`. The package uses the standard library only; no assertion
 library, no testcontainers, no mock framework.
+
+Pure-function tests live beside the code they test (for example
+`internal/source/system/parse_test.go`) and carry no build tag, so
+`go test ./...` runs them quickly. They may not import the integration harness or
+start the binary.
 
 ## Harness
 
@@ -270,14 +284,13 @@ func TestSystemCollectThenQuery(t *testing.T) {
 	dataDir := filepath.Join(dir, "data")
 	cfg := writeConfig(t, dir, fmt.Sprintf(`
 interval: 200ms
-flush_interval: 200ms
 data_dir: %s
 sources:
   system:
     enabled: true
 storage:
-  disk:
-    enabled: true
+  chunk_interval: 200ms
+  primary: disk
 `, dataDir))
 
 	ctx, cancel := context.WithTimeout(context.Background(), 60*time.Second)
@@ -324,20 +337,22 @@ func assertWellFormed(t *testing.T, samples []sample)
 ## Assertions that survive real data
 
 - Never assert exact CPU %, RSS, or B/s. Assert finite, non-negative, and inside
-  a broad bound (CPU at most `100 * runtime.NumCPU()` for system scope, memory at
-  most `MemTotal`).
+  a broad bound (system CPU at most 100 per CPU line; process and container CPU
+  at most `100 * runtime.NumCPU()`; memory at most `MemTotal`).
 - Assert relationships, not magnitudes: loopback traffic raises RX/TX; a CPU
   burner raises that process's CPU above zero; a stopped container produces no
   new samples.
 - Timestamps are UTC and non-decreasing per series. Sample spacing is roughly
   the configured interval; allow for scheduling delay and jitter.
-- Assert labels exactly: `scope`, `pid`, `comm`, `container`, `image` where
-  documented. An unexpected label is a failure.
+- Assert labels exactly: `host`, `scope`, `cpu`, `interface`, `pid`, `comm`,
+  `container`, `image` where documented. An unexpected label is a failure.
 - Assert counts as ranges (`>= 2` samples), not exact counts.
 - For disk/S3 parity, compare key layout, metric names, label sets, and
   ordering. Do not compare live values.
-- Golden files only for deterministic output: `--help`, table headers, chunk
-  schema. Update them with an explicit `-update` flag and review the diff.
+- Golden files only for deterministic output: `--help`, table headers, config
+  dumps, and parser output from fixtures. Live `/proc` samples are checked
+  structurally, never against a golden value. Update goldens with an explicit
+  flag and review the diff.
 
 ## Failure paths
 
@@ -349,10 +364,12 @@ Cover these through the CLI wherever they are observable:
   `os.Geteuid() == 0`; root bypasses permissions.
 - Bad S3 endpoint or credentials → clear error or the documented fallback;
   assert exit code and structured log fields.
-- S3 outage mid-collect with disk fallback configured → collection continues and
-  chunks land on disk.
-- Missing Docker socket → only the Docker source is disabled with a warning;
-  system collection still works.
+- S3 outage mid-collect with a spool configured → collection continues, chunks
+  land in the spool, and a restored endpoint drains them. Query merges spooled
+  chunks before they are uploaded.
+- Missing Docker socket with `sources.docker.enabled: true` → startup fails with
+  a clear error. With the source disabled (the default), system collection runs
+  and no container series appear.
 - Docker daemon restart → reconnect, or a documented gap; never a crash.
 - `SIGINT` and `SIGTERM` → final flush and exit 0.
 - Disk full, unreadable `/proc`, and clock jumps: document them as manual or
@@ -379,6 +396,7 @@ Cover these through the CLI wherever they are observable:
 ```sh
 go vet -tags=integration ./...
 staticcheck -tags=integration ./...
+go test ./...                       # pure-function tests only
 go test -tags=integration -count=1 ./test/integration/...
 
 # Race coverage for the binary under test, not just the test process.
@@ -389,23 +407,25 @@ SMOB_TEST_STRICT=1 SMOB_TEST_S3_ENDPOINT=http://127.0.0.1:9000 \
   go test -tags=integration -count=1 -timeout=10m ./test/integration/...
 ```
 
-Required Make targets (Phase 0):
+Required justfile recipes (Phase 0):
 
-| Target        | Behavior                                              |
+| Recipe        | Behavior                                              |
 | ------------- | ----------------------------------------------------- |
-| `test`        | Fast suite; service tests skip with a reason          |
+| `test-unit`   | `go test ./...`; pure functions only                  |
+| `test`        | Fast integration suite; service tests skip with reason |
 | `test-all`    | Compose services up, strict mode, full suite          |
 | `test-race`   | Suite with `SMOB_TEST_RACE=1`                         |
 | `test-update` | Suite with the golden update flag                     |
 
-CI runs `test-all` and `test-race` on Linux, and the fast suite on both Debian
-and Alpine kernels. `go test -race` by itself only instruments the test binary;
-`SMOB_TEST_RACE=1` is what makes `TestMain` build `smob` with the race detector.
-The race build needs `CGO_ENABLED=1`, so run it on the Debian runner and keep
-release builds `CGO_ENABLED=0`.
+CI runs the fast and race suites on Debian and the fast suite on Alpine today;
+the extended suite joins once MinIO and Docker services are wired in Phases 3–4.
+`go test -race` by itself only instruments the test binary; `SMOB_TEST_RACE=1` is
+what makes `TestMain` build `smob` with the race detector. The race build needs
+`CGO_ENABLED=1`, so run it on the Debian runner and keep release builds
+`CGO_ENABLED=0`.
 
-Do not gate on coverage percentages. The phase exit criteria in the README are
-the gate.
+Do not gate on coverage percentages. The phase exit criteria in
+`docs/IMPLEMENTATION.md` are the gate.
 
 ## Scenario map
 
@@ -418,10 +438,10 @@ the gate.
 
 **Phase 1 — system and disk**
 
-- Collect for a few intervals, stop cleanly, then query CPU, memory, and network
-  for the host.
-- Chunk paths match `<data>/<scope>/YYYY/MM/DD/HH/...jsonl.gz`; every line
-  decodes into the documented schema.
+- Run `collect --once`, then query CPU, memory, and network for the host; also
+  collect for a few intervals and stop cleanly.
+- Chunk paths match `<data>/<host>/<scope>/YYYY/MM/DD/HH/...jsonl.gz`; every line
+  decodes into the documented schema and `interval_ms` is present on rates.
 - Rates are finite and sane, timestamps are monotonic, and no gap exceeds the
   interval tolerance.
 - Table, JSON, and CSV output all parse and carry the same samples.
@@ -432,36 +452,39 @@ the gate.
 - A CPU-burning helper appears under `comm`/`pid` labels with CPU above zero.
 - The regex filter includes matching processes and excludes others; top-N
   returns at most N series.
-- Restarting the helper produces a new series keyed by start time instead of a
-  corrupted rate.
+- Restarting the helper resets its rate state instead of producing a corrupted
+  delta; the new process appears with its own `pid`/`comm` series.
 
 **Phase 3 — S3**
 
 - MinIO round-trip: collect, query, and get the same metric names and labels as
   the disk backend.
-- Object keys mirror the disk layout.
-- Bad credentials fail clearly; an outage with disk fallback configured keeps
-  collecting.
+- Object keys mirror the disk layout, including the host component.
+- Bad credentials fail clearly; an outage with a spool configured keeps
+  collecting, and a restored endpoint drains the spool.
 - A bounded time range reads only the expected key prefixes.
 
 **Phase 4 — Docker**
 
-- A labeled test container produces `scope=container`, `container`, and `image`
-  samples.
+- A labeled test container produces `scope=container`, `container`, `image`, and
+  memory samples.
 - `docker.exclude` removes matching containers.
-- A missing socket disables only the Docker source.
+- A missing socket fails startup when the Docker source is enabled; leaving it
+  disabled lets system collection run.
 - A Docker restart either reconnects or records a documented gap.
 
 **Phase 5 — polish**
 
-- Retention deletes chunks beyond age or size and keeps fresh ones.
-- `tail` streams new samples until interrupted.
+- Retention deletes closed chunks beyond age or size and keeps fresh ones.
 - `stats` and `query --agg/--group-by` return expected aggregates over seeded
-  data.
+  data, with rates weighted by `interval_ms`.
 
 ## Anti-patterns
 
-- A `_test.go` file under `internal/` "just for this parser".
+- A `_test.go` file under `internal/` that tests CLI behavior, config, a store,
+  or anything reachable through a subcommand.
+- A parser test that stands up a fake `/proc` tree instead of feeding bytes to
+  the parser.
 - A `fakeStore`, `fakeClock`, `fakeProc`, or `httptest` server standing in for
   MinIO.
 - Asserting `cpu == 12.5` or `rx == 4096`.
@@ -481,6 +504,8 @@ the gate.
 - [ ] The test waits on observable state; no fixed sleeps or retries.
 - [ ] Temp dirs, buckets, containers, and processes are cleaned up.
 - [ ] `just test` passes; `just test-all` passes when services are available.
+- [ ] `just test-unit` passes; any pure-function tests are table-driven and use
+      fixtures or plain values only.
 - [ ] `SMOB_TEST_RACE=1` passes for collector or concurrency changes.
 - [ ] Golden changes were reviewed, not auto-accepted.
 - [ ] No production code was added solely to make testing easier.
