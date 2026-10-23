@@ -336,7 +336,7 @@ Dockerfile                     # FROM scratch, static binary, CA bundle
 
 ### Phase 2 — Process Metrics (v0.1)
 
-- [ ] Implement `/proc/[pid]/stat` (fields 14, 15, 22), `statm`, and `status` (`VmRSS`) parsers, with fixtures for `comm` containing spaces and parentheses.
+- [x] Implement `/proc/[pid]/stat` (fields 14, 15, 22), `statm`, and `status` (`VmRSS`) parsers, with fixtures for `comm` containing spaces and parentheses.
 - [ ] Implement PID enumeration and rescan cadence; treat `ENOENT` as normal.
 - [ ] Implement process source: regex filter on `comm`, top-N by CPU/RSS/PID, 30s default interval.
 - [ ] Key rate state by `(pid, starttime)`; reset on PID reuse.
