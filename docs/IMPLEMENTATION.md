@@ -305,7 +305,7 @@ Dockerfile                     # FROM scratch, static binary, CA bundle
 
 ### Phase 1 — System Metrics, Disk, Query (v0.1)
 
-- [ ] Implement `/proc/stat`, `/proc/meminfo`, and `/proc/net/dev` parsers as pure `io.Reader` functions, with fixture-based table tests for edge cases.
+- [x] Implement `/proc/stat`, `/proc/meminfo`, and `/proc/net/dev` parsers as pure `io.Reader` functions, with fixture-based table tests for edge cases.
 - [ ] Implement the system source: CPU %, memory bytes, per-interface RX/TX B/s; `boot_id` reset detection; interface add/remove handling.
 - [ ] Implement the scheduler: per-source ticker with jitter, per-tick timeout, clean shutdown.
 - [ ] Implement the chunk assembler: UTC-aligned 5-minute windows, per `(host, scope)`, sorted samples, partial flush.
