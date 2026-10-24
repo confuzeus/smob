@@ -219,7 +219,7 @@ a dedicated query mode can relax it later if it causes friction.
 
 **Phase 4 — Docker Container Metrics (Week 6) → v0.2**
 
-- Implement `internal/source/docker` using the official Docker Engine client (already an approved dependency). If its transitive weight proves unacceptable, the stats endpoints are simple enough to call directly over the Unix socket; decide once, with a binary-size measurement.
+- Implement `internal/source/docker` using the official Docker Engine client (already an approved dependency). If its transitive weight proves unacceptable, the stats endpoints are simple enough to call directly over the Unix socket; decide once, with a binary-size measurement. Measured on 2026-10-24 with `CGO_ENABLED=0 go build -trimpath -ldflags '-s -w'`: `github.com/docker/docker v28.5.2+incompatible` grows the binary from 11,808,928 to 12,034,208 bytes (+225,280, +1.9%) and the module count from 27 to 87. The newer `github.com/moby/moby/client v0.6.2` costs 442,368 bytes (+3.7%) and 46 modules; the v28 client is the smaller, stable official client, so it is kept. The client pins Engine API 1.41 (Docker 20.10, the first version with one-shot stats) and probes the daemon with a versioned `/info` call; API negotiation stays disabled so daemon upgrades cannot change response shapes.
 - Default to `ContainerStatsOneShot` polling on the source interval (`sources.docker.interval`, default 10s). Persistent streams are opt-in via `sources.docker.stream_stats` for deployments that need sub-interval resolution; document that one stream per container is expensive at scale.
 - Discover containers with `/containers/json` and a `rescan_interval` (default 30s); optionally subscribe to `/events` later. Reconnect with backoff after a daemon restart, and skip the first CPU sample per container because `precpu_stats` is empty.
 - Compute CPU % as `(cpu_delta / system_delta) × online_cpus × 100`. Read network counters per interface and diff each one. For memory, use `usage − inactive_file` (cgroup v1 `total_inactive_file`, v2 `inactive_file`) and floor at zero.
@@ -278,7 +278,7 @@ a dedicated query mode can relax it later if it causes friction.
 
 Integration tests are the public contract. Every behavior a user can observe is exercised by building the `smob` binary and driving it as a subprocess against real `/proc`, a temporary data directory, and optional MinIO or Docker services. The default `go test ./...` stays fast; the tagged integration suite runs explicitly.
 
-A narrow exception is allowed for pure functions whose edge cases cannot be reached through the CLI: `/proc` parsers over byte fixtures, rate/reset math, and chunk key derivation. Those tests live beside the code, use table-driven inputs (`io.Reader` and snapshot values), and never mock a service, clock, filesystem, or store. They are a complement to the contract, not a replacement. Store parity is the second exception: `internal/store/equivalence_integration_test.go` feeds one fixed chunk through the real disk and S3 stores because the CLI cannot reproduce identical `/proc` input; it runs in the extended suite and compares decoded samples, not compressed bytes. No test-only production flags or exported internals.
+A narrow exception is allowed for pure functions whose edge cases cannot be reached through the CLI: `/proc` parsers over byte fixtures, rate/reset math, and chunk key derivation. Those tests live beside the code, use table-driven inputs (`io.Reader` and snapshot values), and never mock a service, clock, filesystem, or store. They are a complement to the contract, not a replacement. Store parity is the second exception: `internal/store/equivalence_integration_test.go` feeds one fixed chunk through the real disk and S3 stores because the CLI cannot reproduce identical `/proc` input; it runs in the extended suite and compares decoded samples, not compressed bytes. The Docker client probe is the third: `internal/source/docker/client_integration_test.go` connects to the real daemon while the source itself is not yet registered, and moves behind the CLI once it is. No test-only production flags or exported internals.
 
 - **Fast suite** (every change): config validation, `collect --once` → `query`, output formats, help/version snapshots, signal handling, `--dry-run`, and error paths that need no external service. Net rate tests generate loopback traffic rather than assuming a busy interface.
 - **Extended suite** (CI and `just test-all`): process scope with a CPU burner,
@@ -386,7 +386,7 @@ Dockerfile                     # FROM scratch, static binary, CA bundle
 
 ### Phase 4 — Docker Container Metrics (v0.2)
 
-- [ ] Add the Docker Engine client and connect over `docker.socket`.
+- [x] Add the Docker Engine client and connect over `docker.socket`.
 - [ ] Implement one-shot stats polling by default; opt-in stream fan-in.
 - [ ] Implement container discovery/rescan and reconnect with backoff.
 - [ ] Compute CPU % with `precpu_stats`, memory used excluding `inactive_file`, and per-interface network rates.
