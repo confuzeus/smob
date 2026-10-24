@@ -119,7 +119,7 @@ change meaning between versions.
 | `system.network.tx_bytes_per_second` | rate | B/s | `interface` | Per interface |
 | `process.cpu.percent` | rate | percent | `pid`, `comm` | 0–100 per core; two busy cores report 200 |
 | `process.memory.rss_bytes` | gauge | bytes | `pid`, `comm` | `VmRSS` |
-| `container.cpu.percent` | rate | percent | `container`, `image` | 0–100 per core, using `precpu_stats` |
+| `container.cpu.percent` | rate | percent | `container`, `image` | 0–100 per core, from consecutive observations |
 | `container.memory.used_bytes` | gauge | bytes | `container`, `image` | `usage − inactive_file`, floored at zero |
 | `container.network.rx_bytes_per_second` | rate | B/s | `container`, `image`, `interface` | Per interface |
 | `container.network.tx_bytes_per_second` | rate | B/s | `container`, `image`, `interface` | Per interface |
@@ -137,6 +137,14 @@ change meaning between versions.
 - A counter reset — for example after a reboot or when an interface is
   recreated — drops that tick rather than reporting a bogus rate. A short gap in
   the series is expected.
+- Container CPU is the difference between smob's own consecutive observations,
+  so the first payload per container has no CPU sample. The CPU ratio and
+  `interval_ms` cover the same measurement window in both one-shot and stream
+  modes.
+- Container memory subtracts `inactive_file` from `usage` and floors at zero. If
+  the daemon reports neither `inactive_file` nor cgroup v1's
+  `total_inactive_file`, smob reports `usage` unchanged; that estimate may
+  include reclaimable page cache.
 - Process labels use `comm`, which the kernel truncates to 15 bytes. Matching
   the full command line is not supported.
 - Process series are selected each tick: the top `N` by CPU, then RSS, then PID.
