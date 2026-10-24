@@ -250,6 +250,10 @@ Sample construction lives in `internal/source/docker/source.go`. `New` owns the 
 
 ## 5. Deferred to v0.3
 
+The candidates below are scoped — without priority, order, or schedule — in the
+[v0.3 scoping draft](v0.3.md), which records the open questions and the evidence
+that would justify each one.
+
 - **Live tail.** `smob tail` is not a store-polling command in v0.2: with five-minute chunks, a poller would be up to five minutes behind, which is not a tail. A real tail needs a live spool or a local IPC endpoint from the collector, and that design is deferred rather than guessed. The subcommand stays stubbed until then.
 - **Chunk index/compaction.** Add a sidecar index (metric set, min/max timestamp, counts) only if measured query latency requires it. Compaction of small chunks is likewise deferred.
 - **Multi-host aggregation and remote query.** The `host` label and path make shared buckets safe. Queries can filter or merge hosts, but v0.2 has no cross-host series aggregation and no server.
@@ -421,7 +425,9 @@ Dockerfile                     # FROM scratch, static binary, CA bundle
 - [ ] Tag `v0.2.0`; publish binaries and the Docker image.
 
   **Blocked on a remote and publication credentials.** The annotated `v0.2.0`
-  tag exists locally on the commit that contains this note. The ignored `dist/`
+  tag exists locally on commit `85ff05e`, the release-preparation commit. The
+  documentation-only commit that added the v0.3 scoping draft is later than the
+  tag and is not part of `v0.2.0`. The ignored `dist/`
   directory holds `smob-linux-amd64` and `smob-linux-arm64`, and the local
   `smob:v0.2.0` image was built and verified. This checkout has no `origin`
   remote, no `gh`, and no registry login, so no tag, asset, or image has been
@@ -444,6 +450,17 @@ Dockerfile                     # FROM scratch, static binary, CA bundle
   [`docs/releases/v0.2.0.md`](releases/v0.2.0.md).
 
 - [ ] Post-release: collect feedback and scope v0.3 (live tail, chunk index, multi-host query).
+
+  **Blocked on release publication and real feedback.** This item is
+  post-release by definition. `v0.2.0` is tagged locally but has not been
+  published (see the item above), so there are no users and no feedback channel
+  in this checkout, and the feedback half cannot be completed here. The scoping
+  half is drafted in [`docs/v0.3.md`](v0.3.md): it lists the three candidates
+  deferred from v0.2, the questions each must answer, and the evidence that
+  would justify building it. It assigns no priority, order, or dates. The item
+  stays open until a maintainer publishes the release, provides a feedback
+  channel, and records observed usage or requests here; publishing alone does
+  not complete it. No v0.3 implementation starts from the draft.
 
 ### Cross-Cutting (run throughout)
 

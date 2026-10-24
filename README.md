@@ -20,10 +20,11 @@ interchangeable and existing data can be copied between them with
 > Operator documentation — the [quickstart](docs/quickstart.md), [configuration
 > reference](docs/configuration.md), [S3/MinIO guide](docs/s3.md), [container
 > deployment guide](docs/docker.md), systemd unit, and Compose file — is
-> implemented alongside the code. `tail` remains planned, along with the v0.3
-> live-tail, chunk-index, and multi-host aggregation work. The command and
-> metric reference below describes the current contract. See the [design and
-> implementation plan](docs/IMPLEMENTATION.md) for the roadmap.
+> implemented alongside the code. `tail` remains a stub; live tail, a chunk
+> index, and multi-host aggregation are unscheduled v0.3 candidates. The
+> command and metric reference below describes the current contract. See the
+> [design and implementation plan](docs/IMPLEMENTATION.md) for architecture,
+> phases, and the TODO list.
 
 ## Features
 
