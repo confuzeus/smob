@@ -339,6 +339,15 @@ Dockerfile                     # FROM scratch, static binary, CA bundle
 - [x] Fast suite: `collect --once`, query, formats, signals, dry-run, and error paths against real `/proc`.
 - [ ] Manual soak: 24h collection, verify no gaps, flat memory, and realistic chunk counts.
 
+  **Why this is unchecked:** it is a wall-clock acceptance check, not code. It
+  needs a real host running `smob collect` for 24 hours against a durable
+  `data_dir`, then a human comparing chunk counts, contiguous windows, and
+  resident memory. An agent session or CI job cannot hold a process for 24 hours
+  or vouch for the resulting data, so the item stays open until an operator runs
+  the soak and records the outcome here. It does not block Phase 3. The
+  automated substitutes already in place are `collect --once` → `query` in the
+  fast suite and the signal-handling tests.
+
 ### Phase 2 — Process Metrics (v0.1)
 
 - [x] Implement `/proc/[pid]/stat` (fields 14, 15, 22) and `status` (`VmRSS`) parsers, with fixtures for `comm` containing spaces and parentheses.
