@@ -8,6 +8,7 @@ import (
 	"log/slog"
 	"path/filepath"
 	"syscall"
+	"time"
 
 	"github.com/confuzeus/smob/internal/cli"
 	"github.com/confuzeus/smob/internal/collector"
@@ -18,8 +19,13 @@ import (
 	"github.com/spf13/cobra"
 )
 
-// lowDiskBytes is the free-space threshold for the startup warning.
-const lowDiskBytes = 1 << 30
+const (
+	// lowDiskBytes is the free-space threshold for the startup warning.
+	lowDiskBytes = 1 << 30
+	// sweepInterval is the retention cadence after the startup pass. The tick
+	// invokes the same store.Sweeper.Sweep as startup; only the schedule differs.
+	sweepInterval = time.Hour
+)
 
 func (a *app) collectCommand() *cobra.Command {
 	var dryRun, once bool
@@ -73,6 +79,24 @@ func (a *app) runCollect(ctx context.Context, dryRun, once bool) (err error) {
 		}
 	}
 
+	// Retention runs after Check has made the root usable and before the
+	// free-space warning, so the warning reflects space reclaimed at startup.
+	// A zero limit disables retention and avoids a needless tree scan. Dry-run
+	// must not delete anything.
+	retention := store.Retention{
+		MaxAge:   a.cfg.Retention.Disk.MaxAge.Std(),
+		MaxBytes: a.cfg.Retention.Disk.MaxBytes,
+	}
+	var sweeper store.Sweeper
+	if !dryRun && (retention.MaxAge > 0 || retention.MaxBytes > 0) {
+		if s, ok := st.(store.Sweeper); ok {
+			sweeper = s
+		}
+	}
+	if sweeper != nil {
+		sweeper.Sweep(ctx, retention)
+	}
+
 	scopes := make([]string, 0, len(sources))
 	for _, src := range sources {
 		scopes = append(scopes, src.Scope())
@@ -97,6 +121,32 @@ func (a *app) runCollect(ctx context.Context, dryRun, once bool) (err error) {
 	c := collector.New(a.cfg, sources, st, a.logger)
 	if once {
 		return c.RunOnce(ctx)
+	}
+
+	// Sweep hourly while collection runs. The startup pass above already ran;
+	// this loop only handles later ticks. Canceling and joining it on every
+	// return path keeps the goroutine and ticker from leaking and stops a pass
+	// promptly when the process is interrupted.
+	if sweeper != nil {
+		sweepCtx, stopSweep := context.WithCancel(ctx)
+		done := make(chan struct{})
+		go func() {
+			defer close(done)
+			ticker := time.NewTicker(sweepInterval)
+			defer ticker.Stop()
+			for {
+				select {
+				case <-sweepCtx.Done():
+					return
+				case <-ticker.C:
+					sweeper.Sweep(sweepCtx, retention)
+				}
+			}
+		}()
+		defer func() {
+			stopSweep()
+			<-done
+		}()
 	}
 
 	// Drain anything staged by a previous failed upload while collection runs.

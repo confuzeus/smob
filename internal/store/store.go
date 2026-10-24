@@ -39,6 +39,20 @@ type Replayer interface {
 	Replay(ctx context.Context)
 }
 
+// Retention bounds the closed chunks a Sweeper may delete. A zero MaxAge or
+// MaxBytes disables that limit; when both are zero nothing is eligible.
+type Retention struct {
+	MaxAge   time.Duration
+	MaxBytes int64
+}
+
+// Sweeper is implemented by stores that can delete closed chunks outside a
+// retention policy. Sweep performs one pass and logs its own failures; collect
+// owns the schedule and never fails because of retention.
+type Sweeper interface {
+	Sweep(ctx context.Context, r Retention)
+}
+
 // Store persists chunks and reads samples back.
 //
 // Write stores a complete chunk. The collector owns chunk assembly, so a store

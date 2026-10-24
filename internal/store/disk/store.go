@@ -14,6 +14,7 @@ import (
 	"errors"
 	"fmt"
 	"io/fs"
+	"log/slog"
 	"os"
 	"path/filepath"
 	"strings"
@@ -32,16 +33,20 @@ const (
 
 // Store reads and writes chunks below one root directory.
 type Store struct {
-	root string
+	root   string
+	logger *slog.Logger
 }
 
 // New returns a disk store rooted at root. It creates nothing: querying a fresh
 // install is not an error, and Write creates directories as needed.
-func New(root string) (*Store, error) {
+func New(root string, logger *slog.Logger) (*Store, error) {
 	if strings.TrimSpace(root) == "" {
 		return nil, errors.New("disk: data directory is empty")
 	}
-	return &Store{root: filepath.Clean(root)}, nil
+	if logger == nil {
+		logger = slog.New(slog.DiscardHandler)
+	}
+	return &Store{root: filepath.Clean(root), logger: logger}, nil
 }
 
 // Write persists one completed chunk. Every filesystem failure is wrapped in

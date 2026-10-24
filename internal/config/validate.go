@@ -113,10 +113,10 @@ func (c Config) Validate() error {
 	}
 
 	if c.Retention.Disk.MaxAge < 0 {
-		errs = append(errs, errors.New("retention.disk.max_age: must not be negative"))
+		errs = append(errs, errors.New("retention.disk.max_age: must not be negative; zero disables the limit"))
 	}
 	if c.Retention.Disk.MaxBytes < 0 {
-		errs = append(errs, errors.New("retention.disk.max_bytes: must not be negative"))
+		errs = append(errs, errors.New("retention.disk.max_bytes: must not be negative; zero disables the limit"))
 	}
 
 	return errors.Join(errs...)

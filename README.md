@@ -17,10 +17,10 @@ interchangeable and existing data can be copied between them with
 > and S3 backends (including local spool replay), `collect`, and `query` are
 > implemented. The Docker source is disabled by default and is enabled with
 > `sources.docker.enabled: true`. S3 IAM and MinIO deployment guidance is in
-> [docs/s3.md](docs/s3.md). Retention, aggregation, `stats`, and `tail` remain
-> planned. The command and metric reference below describes the current
-> contract. See the [design and implementation plan](docs/IMPLEMENTATION.md) for
-> the roadmap.
+> [docs/s3.md](docs/s3.md). Disk retention is implemented; aggregation, `stats`,
+> and `tail` remain planned. The command and metric reference below describes
+> the current contract. See the [design and implementation
+> plan](docs/IMPLEMENTATION.md) for the roadmap.
 
 ## Features
 
@@ -34,6 +34,9 @@ interchangeable and existing data can be copied between them with
 - **Efficient storage.** Samples are grouped into immutable, UTC-aligned chunks
   (five minutes by default) and compressed with gzip. A crash loses at most the
   chunk being assembled; `SIGINT`/`SIGTERM` flushes it before exit.
+- **Bounded disk usage.** A startup and hourly sweep deletes closed disk chunks
+  by age or total size, oldest first, without touching the chunk being
+  assembled or any non-chunk file.
 - **Streaming queries.** Query by time range, host, scope, metric, and labels;
   emit a table or stream JSON, JSONL, and CSV.
 - **Explicit units.** Metric names encode their unit, and rates carry the
@@ -259,9 +262,21 @@ Data goes to stdout; status and errors go to stderr.
 Set `storage.primary` to `disk` or `s3`. Exactly one backend is active; there is
 no mirroring or dual-write.
 
-- **Disk** writes under `data_dir` and is the default. Retention by age
-  (`retention.disk.max_age`) or total size (`retention.disk.max_bytes`) is
-  planned for v0.2.
+- **Disk** writes under `data_dir` and is the default. A retention sweep runs
+  at startup and then hourly. It deletes closed chunks older than
+  `retention.disk.max_age` or beyond `retention.disk.max_bytes`; `0` disables
+  either limit, and both may be set. Age is measured from the chunk's end
+  timestamp, the moment the window is complete, so it is wall-clock based: a
+  backward clock step delays deletion and a forward step can delete chunks
+  early. Age is applied before size, and size is the total on-disk size of
+  chunk files. Only files in the documented chunk layout are eligible, so
+  `.tmp` files, a `spool` directory, and stray files are never touched. The
+  hourly tick calls the same sweep as the startup pass. Deletions are logged at
+  `info`; sweep failures are logged at `warn` and never stop collection. The
+  startup pass runs before the free-space warning. When the size cap is smaller
+  than a single chunk, every deletable chunk is removed, including one just
+  written, until nothing eligible remains; the S3 spool is never part of this
+  accounting.
 - **S3** writes to an AWS or S3-compatible bucket using the standard AWS
   credential chain (environment, shared config, or instance role). Credentials
   are never stored in `smob.yaml`. Transient failures are retried with

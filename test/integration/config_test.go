@@ -88,6 +88,23 @@ func TestConfigValidate(t *testing.T) {
 			exit: 0,
 		},
 		{
+			name:  "negative retention age",
+			body:  base + "retention:\n  disk:\n    max_age: -1s\n",
+			exit:  2,
+			wants: []string{"retention.disk.max_age", "zero disables the limit"},
+		},
+		{
+			name:  "negative retention size",
+			body:  base + "retention:\n  disk:\n    max_bytes: -1\n",
+			exit:  2,
+			wants: []string{"retention.disk.max_bytes", "zero disables the limit"},
+		},
+		{
+			name: "zero retention limits disable both policies",
+			body: base + "retention:\n  disk:\n    max_age: 0s\n    max_bytes: 0\n",
+			exit: 0,
+		},
+		{
 			name:  "host is not a path component",
 			body:  base + "host: bad/host\n",
 			exit:  2,

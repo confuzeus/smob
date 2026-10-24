@@ -110,7 +110,7 @@ func TestDiskS3ChunkEquivalence(t *testing.T) {
 	want := flattenChunks(chunks)
 
 	dataDir := filepath.Join(t.TempDir(), "data")
-	diskStore, err := disk.New(dataDir)
+	diskStore, err := disk.New(dataDir, slog.New(slog.DiscardHandler))
 	if err != nil {
 		t.Fatalf("new disk store: %v", err)
 	}

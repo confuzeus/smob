@@ -16,7 +16,7 @@ import (
 func newStore(ctx context.Context, cfg config.Config, logger *slog.Logger) (store.Store, error) {
 	switch cfg.Storage.Primary {
 	case "disk":
-		return disk.New(cfg.DataDir)
+		return disk.New(cfg.DataDir, logger)
 	case "s3":
 		return s3.New(ctx, cfg.Storage.S3, logger)
 	default:

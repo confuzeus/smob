@@ -98,7 +98,7 @@ Write semantics:
 - A crash loses the chunk currently being assembled, at most `storage.chunk_interval`.
 - `SIGINT`/`SIGTERM` closes the active chunk with its actual end time, writes it once, and exits 0. A second signal exits 1 without waiting.
 - No per-chunk index is written in v0.1 or v0.2. Queries prune by host, scope, and hour, then scan the chunks in the range. A sidecar index (min/max timestamp, metric set, counts) is a v0.3 optimization if real query latency demands it; adding it later does not change the chunk format.
-- Retention deletes only closed chunks. It never deletes the chunk being assembled.
+- Retention deletes only closed chunks. It never deletes the chunk being assembled. The disk implementation is a metadata-only `Sweep` pass: age from the chunk end first, then total size, oldest first, considering only files in the documented seven-component chunk layout. `.tmp` files, the S3 spool, and stray files are ignored. `collect` runs one pass after the store check and before the free-space warning, then starts an hourly ticker that calls the same `Sweep`; `--once` runs the startup pass, `--dry-run` runs none, and shutdown cancels and joins the ticker. A chunk ending after the sweep start is spared by the size pass so a concurrently flushed shutdown chunk is not deleted in the same instant. The startup pass is covered by the CLI integration suite; the hourly tick reuses the same function and is not independently integration-tested, because waiting an hour or adding a test-only interval would violate the no-test-only-flags rule.
 - Readers tolerate a chunk disappearing between listing and opening (`ENOENT`) and check the context between chunks.
 
 Store contract:
@@ -405,7 +405,7 @@ Dockerfile                     # FROM scratch, static binary, CA bundle
 
 ### Phase 5 — Polish and Release (v0.2.0)
 
-- [ ] Implement the disk retention sweeper (age and size), closed chunks only, tolerant of reader races.
+- [x] Implement the disk retention sweeper (age and size), closed chunks only, tolerant of reader races.
 - [ ] Implement `smob stats`.
 - [ ] Add `--agg` and `--group-by`, weighting rates by `interval_ms`.
 - [ ] Write the quickstart, config reference, systemd unit, compose file, and IAM policy.
