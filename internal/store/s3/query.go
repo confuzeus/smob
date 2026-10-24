@@ -15,6 +15,7 @@ import (
 	"slices"
 	"sort"
 	"strings"
+	"sync"
 	"time"
 
 	"github.com/aws/aws-sdk-go-v2/aws"
@@ -29,35 +30,61 @@ import (
 // cancellation.
 const ctxCheckInterval = 1024
 
+// queryGetWorkers bounds concurrent bucket GETs within one hour group. Query
+// merges one UTC hour at a time, so this is also the in-flight limit for the
+// whole query. Eight lets a typical hour of five-minute chunks finish in a
+// couple of rounds over a slow link without bursting a small endpoint.
+const queryGetWorkers = 8
+
 // Query yields matching samples in timestamp, metric, then canonical label
-// order. It processes one UTC hour at a time and merges that hour's chunks, so
-// memory is bounded by the compressed objects in one hour rather than the whole
-// range.
+// order. It processes one UTC hour at a time: it lists that hour's prefixes,
+// downloads its bucket chunks with a bounded worker pool, reads its spool
+// chunks locally, and merges the result. Memory is therefore bounded by one
+// hour rather than the whole range, and Limit stops before any later hour is
+// listed or fetched.
 //
-// Listing and GETs are sequential. Wider prefix pruning and concurrent
-// downloads with a bounded worker pool are a separate follow-up; this
-// implementation only lists the hour prefixes and targets it needs.
+// A zero range boundary means unbounded. That fallback discovers the full key
+// set once and groups it by hour, because a host and scope path has to be known
+// before an hour prefix can exist.
 func (s *Store) Query(ctx context.Context, q model.Query, yield func(model.Sample) error) error {
 	filter, err := store.NewFilter(q)
 	if err != nil {
 		return err
 	}
-	groups, err := s.hourGroups(ctx, q)
+
+	if q.Range.Start.IsZero() || q.Range.End.IsZero() {
+		groups, err := s.walkHourGroups(ctx, q)
+		if err != nil {
+			return err
+		}
+		return s.mergeGroups(ctx, q, filter, groups, yield)
+	}
+
+	targets, err := s.targets(ctx, q)
 	if err != nil {
 		return err
 	}
+	if len(targets) == 0 {
+		return nil
+	}
 
 	emitted := 0
-	for _, group := range groups {
+	start := q.Range.Start.UTC().Truncate(time.Hour)
+	last := q.Range.End.UTC().Add(-time.Nanosecond).Truncate(time.Hour)
+	for h := start; !h.After(last); h = h.Add(time.Hour) {
 		if err := ctx.Err(); err != nil {
 			return err
 		}
 
-		limit := 0
-		if q.Limit > 0 {
-			limit = q.Limit - emitted
+		refs, err := s.hourRefs(ctx, targets, h, q.Range)
+		if err != nil {
+			return err
 		}
-		n, err := s.merge(ctx, group.refs, filter, limit, yield)
+		if len(refs) == 0 {
+			continue
+		}
+
+		n, err := s.merge(ctx, refs, filter, remainingLimit(q.Limit, emitted), yield)
 		emitted += n
 		if err != nil {
 			return err
@@ -67,6 +94,37 @@ func (s *Store) Query(ctx context.Context, q model.Query, yield func(model.Sampl
 		}
 	}
 	return nil
+}
+
+// mergeGroups merges pre-grouped hours in order. It serves the unbounded range
+// fallback, where the whole key set must be discovered before the first hour
+// can be merged.
+func (s *Store) mergeGroups(ctx context.Context, q model.Query, filter *store.Filter, groups []hourGroup, yield func(model.Sample) error) error {
+	emitted := 0
+	for _, group := range groups {
+		if err := ctx.Err(); err != nil {
+			return err
+		}
+
+		n, err := s.merge(ctx, group.refs, filter, remainingLimit(q.Limit, emitted), yield)
+		emitted += n
+		if err != nil {
+			return err
+		}
+		if q.Limit > 0 && emitted >= q.Limit {
+			return nil
+		}
+	}
+	return nil
+}
+
+// remainingLimit returns how many samples the next hour may still emit, or 0
+// when the query is unlimited.
+func remainingLimit(limit, emitted int) int {
+	if limit <= 0 {
+		return 0
+	}
+	return limit - emitted
 }
 
 // hourGroup is the set of chunks that may contain samples for one UTC hour.
@@ -125,52 +183,25 @@ type target struct {
 	scope string
 }
 
-// hourGroups resolves the hour prefixes to scan. A bounded range is walked hour
-// by hour; an unbounded range lists the configured root and groups keys by their
-// chunk start, because the model treats a zero range boundary as unbounded.
-func (s *Store) hourGroups(ctx context.Context, q model.Query) ([]hourGroup, error) {
-	if q.Range.Start.IsZero() || q.Range.End.IsZero() {
-		return s.walkHourGroups(ctx, q)
-	}
-
-	targets, err := s.targets(ctx, q)
-	if err != nil {
-		return nil, err
-	}
-	if len(targets) == 0 {
-		return nil, nil
-	}
-
-	start := q.Range.Start.UTC().Truncate(time.Hour)
-	last := q.Range.End.UTC().Add(-time.Nanosecond).Truncate(time.Hour)
-
-	var groups []hourGroup
-	for h := start; !h.After(last); h = h.Add(time.Hour) {
-		if err := ctx.Err(); err != nil {
+// hourRefs lists the bucket and spool chunks that may contain samples for one
+// UTC hour. It lists only that hour's prefixes for the resolved targets, so no
+// listing reaches outside the hour being merged. The result is sorted by key.
+func (s *Store) hourRefs(ctx context.Context, targets []target, hour time.Time, r model.TimeRange) ([]chunkRef, error) {
+	var remote, local []string
+	for _, t := range targets {
+		found, err := s.listHour(ctx, t.host, t.scope, hour, r)
+		if err != nil {
 			return nil, err
 		}
+		remote = append(remote, found...)
 
-		var remote, local []string
-		for _, t := range targets {
-			found, err := s.listHour(ctx, t.host, t.scope, h, q.Range)
-			if err != nil {
-				return nil, err
-			}
-			remote = append(remote, found...)
-
-			found, err = s.spool.listHour(t.host, t.scope, h, q.Range)
-			if err != nil {
-				return nil, fmt.Errorf("list spool %s: %w", s.spool.dir, err)
-			}
-			local = append(local, found...)
+		found, err = s.spool.listHour(t.host, t.scope, hour, r)
+		if err != nil {
+			return nil, fmt.Errorf("list spool %s: %w", s.spool.dir, err)
 		}
-		refs := unionRefs(remote, local)
-		if len(refs) == 0 {
-			continue
-		}
-		groups = append(groups, hourGroup{refs: refs})
+		local = append(local, found...)
 	}
-	return groups, nil
+	return unionRefs(remote, local), nil
 }
 
 // walkHourGroups discovers chunks at any depth and groups them by UTC hour. It
@@ -501,24 +532,109 @@ func (s *Store) readRef(ctx context.Context, ref chunkRef) ([]byte, error) {
 	return data, nil
 }
 
-// merge reads refs from the bucket or spool and yields their matching samples
-// as one sorted stream. A chunk that disappeared between listing and opening is
-// skipped.
-func (s *Store) merge(ctx context.Context, refs []chunkRef, filter *store.Filter, limit int, yield func(model.Sample) error) (int, error) {
-	active := make([]*objectStream, 0, len(refs))
-	for _, ref := range refs {
+// fetchChunks returns the bytes for every ref, indexed by ref position. Bucket
+// chunks are downloaded concurrently; spool chunks are read sequentially on the
+// calling goroutine. A nil entry means the chunk disappeared between listing and
+// reading, which the merge skips.
+//
+// Downloads may finish out of order, but each result is stored at its ref
+// position, so the caller merges a length-stable, key-ordered slice. At most
+// queryGetWorkers GETs are in flight. The first error cancels the siblings and
+// is returned once every worker has been joined. A cancellation that leaves
+// refs unfetched is reported as an error, never mistaken for absence.
+func (s *Store) fetchChunks(ctx context.Context, refs []chunkRef) ([][]byte, error) {
+	bodies := make([][]byte, len(refs))
+	remote := make([]int, 0, len(refs))
+	for i, ref := range refs {
+		if !ref.local {
+			remote = append(remote, i)
+			continue
+		}
 		if err := ctx.Err(); err != nil {
-			return 0, err
+			return nil, err
 		}
 		data, err := s.readRef(ctx, ref)
 		if err != nil {
+			return nil, err
+		}
+		bodies[i] = data
+	}
+	if len(remote) == 0 {
+		return bodies, nil
+	}
+
+	// Sibling GETs are cancelled on the first error. On the success path, the
+	// deferred cancel releases the child context before returning.
+	ctx, cancel := context.WithCancel(ctx)
+	defer cancel()
+
+	jobs := make(chan int)
+	var (
+		wg       sync.WaitGroup
+		errOnce  sync.Once
+		firstErr error
+	)
+	workers := min(queryGetWorkers, len(remote))
+	for i := 0; i < workers; i++ {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			for idx := range jobs {
+				data, err := s.readRef(ctx, refs[idx])
+				if err != nil {
+					errOnce.Do(func() {
+						firstErr = err
+						cancel()
+					})
+					return
+				}
+				bodies[idx] = data
+			}
+		}()
+	}
+
+feed:
+	for _, idx := range remote {
+		select {
+		case jobs <- idx:
+		case <-ctx.Done():
+			break feed
+		}
+	}
+	close(jobs)
+	wg.Wait()
+
+	if firstErr != nil {
+		return nil, firstErr
+	}
+	// The producer can stop on cancellation before dispatching every ref, and a
+	// worker can exit without recording an error. Without this check, the
+	// unfetched refs would look like missing chunks and be skipped silently.
+	if err := ctx.Err(); err != nil {
+		return nil, err
+	}
+	return bodies, nil
+}
+
+// merge downloads one hour's refs and yields their matching samples as one
+// sorted stream. A chunk that disappeared between listing and opening is
+// skipped.
+func (s *Store) merge(ctx context.Context, refs []chunkRef, filter *store.Filter, limit int, yield func(model.Sample) error) (int, error) {
+	bodies, err := s.fetchChunks(ctx, refs)
+	if err != nil {
+		return 0, err
+	}
+
+	active := make([]*objectStream, 0, len(refs))
+	for i, ref := range refs {
+		if err := ctx.Err(); err != nil {
 			return 0, err
 		}
-		if data == nil {
+		if bodies[i] == nil {
 			continue
 		}
 
-		st, err := openObjectStream(ref.key, data)
+		st, err := openObjectStream(ref.key, bodies[i])
 		if err != nil {
 			return 0, err
 		}

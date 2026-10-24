@@ -373,12 +373,7 @@ Dockerfile                     # FROM scratch, static binary, CA bundle
 - [x] Implement the S3 store with the same chunk keys and a single `PUT` per chunk.
 - [x] Implement retry with exponential backoff and jitter.
 - [x] Implement the local spool and background replay; cap the spool; merge spooled chunks in queries.
-- [ ] Implement `LIST` prefix pruning and concurrent `GET` with a bounded worker pool.
-
-  The S3 store already lists only the hour prefixes implied by a bounded range
-  and discovers hosts and scopes with delimiter listings; downloads and merges
-  are still sequential. This item remains open for wider pruning and the
-  bounded concurrent worker pool.
+- [x] Implement `LIST` prefix pruning and concurrent `GET` with a bounded worker pool.
 - [ ] Verify disk/S3 equivalent samples for identical input, not byte-identical gzip.
 - [ ] Add MinIO to CI; test network interruption and spool drain.
 - [ ] Document IAM permissions and MinIO path-style configuration.
