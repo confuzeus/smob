@@ -232,7 +232,7 @@ a dedicated query mode can relax it later if it causes friction.
 - Document the Docker socket permission problem: `/var/run/docker.sock` is usually `root:docker` with mode `0660`, so the image's non-root UID cannot read it without `--group-add` (and a matching GID) or running as root. The data directory must also be writable by the container UID.
 - **Exit criterion:** inside a container, `smob collect` records per-container CPU, memory, and network; `smob query --label container=web` returns plausible values; removing and recreating a container produces a new series, not a corrupted rate.
 
-Stats acquisition lives in `internal/source/docker/stats.go`. One-shot mode requests one `ContainerStatsOneShot` sample per container per collector tick, with at most eight requests in flight; per-container failures are logged and omitted rather than failing the tick. Stream mode is opt-in through `sources.docker.stream_stats`: it opens one stats stream per container and fans decoded payloads into a bounded channel (one pending payload per container; new payloads are dropped when the consumer lags), and a reader stops when its stream ends or errors. It does not reconnect; discovery and reconnect arrive with the next Phase 4 item. Both modes return raw payloads only, and the source is not registered with the collector until that work lands.
+Stats acquisition lives in `internal/source/docker/stats.go`. One-shot mode requests one `ContainerStatsOneShot` sample per container per collector tick, with at most eight requests in flight; per-container failures are logged and omitted rather than failing the tick. Stream mode is opt-in through `sources.docker.stream_stats`: it opens one stats stream per container and fans decoded payloads into a bounded channel (one pending payload per container; new payloads are dropped when the consumer lags), and a reader stops when its stream ends or errors. The supervisor in `internal/source/docker/supervisor.go` owns discovery and reconnect: its constructor connects, probes the daemon, and lists running containers; `Run` rescans at `sources.docker.rescan_interval`, starts and stops streams as containers appear and disappear without touching unchanged streams, and reopens a stream that ends with exponential backoff and equal jitter (500ms base, 30s cap, reset after a payload). A failed discovery keeps the previous container set and is retried on the next rescan. `sources.docker.exclude` is an unanchored regular expression matched against the container name without its leading slash; IDs are not matched because a short pattern would accidentally match hex IDs. Stopped containers are not discovered because they have no live stats. Both modes return raw payloads only, and the source is not registered with the collector until that work lands.
 
 **Phase 5 — Polish and Release (Week 7) → v0.2.0**
 
@@ -280,7 +280,7 @@ Stats acquisition lives in `internal/source/docker/stats.go`. One-shot mode requ
 
 Integration tests are the public contract. Every behavior a user can observe is exercised by building the `smob` binary and driving it as a subprocess against real `/proc`, a temporary data directory, and optional MinIO or Docker services. The default `go test ./...` stays fast; the tagged integration suite runs explicitly.
 
-A narrow exception is allowed for pure functions whose edge cases cannot be reached through the CLI: `/proc` parsers over byte fixtures, rate/reset math, and chunk key derivation. Those tests live beside the code, use table-driven inputs (`io.Reader` and snapshot values), and never mock a service, clock, filesystem, or store. They are a complement to the contract, not a replacement. Store parity is the second exception: `internal/store/equivalence_integration_test.go` feeds one fixed chunk through the real disk and S3 stores because the CLI cannot reproduce identical `/proc` input; it runs in the extended suite and compares decoded samples, not compressed bytes. The Docker client probe is the third: `internal/source/docker/client_integration_test.go` connects to the real daemon while the source itself is not yet registered, and moves behind the CLI once it is. No test-only production flags or exported internals.
+A narrow exception is allowed for pure functions whose edge cases cannot be reached through the CLI: `/proc` parsers over byte fixtures, rate/reset math, and chunk key derivation. Those tests live beside the code, use table-driven inputs (`io.Reader` and snapshot values), and never mock a service, clock, filesystem, or store. They are a complement to the contract, not a replacement. Store parity is the second exception: `internal/store/equivalence_integration_test.go` feeds one fixed chunk through the real disk and S3 stores because the CLI cannot reproduce identical `/proc` input; it runs in the extended suite and compares decoded samples, not compressed bytes. The Docker client and supervisor suite is the third: `internal/source/docker/*_integration_test.go` connects to and drives the real daemon while the source itself is not yet registered, and moves behind the CLI once it is. No test-only production flags or exported internals.
 
 - **Fast suite** (every change): config validation, `collect --once` → `query`, output formats, help/version snapshots, signal handling, `--dry-run`, and error paths that need no external service. Net rate tests generate loopback traffic rather than assuming a busy interface.
 - **Extended suite** (CI and `just test-all`): process scope with a CPU burner,
@@ -304,7 +304,7 @@ internal/config/               # config parsing + validation
 internal/collector/            # scheduler, chunk assembler, source registry
 internal/source/system/        # /proc/stat, meminfo, net/dev
 internal/source/process/       # /proc/[pid]/...
-internal/source/docker/        # Docker Engine client wrapper
+internal/source/docker/        # Engine client, discovery supervisor, stats acquisition
 internal/store/                # Store interface, Chunk, factory
 internal/store/chunk/          # shared chunk keys and deterministic JSONL-gzip encoding
 internal/store/disk/           # local fs implementation
@@ -390,11 +390,11 @@ Dockerfile                     # FROM scratch, static binary, CA bundle
 
 - [x] Add the Docker Engine client and connect over `docker.socket`.
 - [x] Implement one-shot stats polling by default; opt-in stream fan-in.
-- [ ] Implement container discovery/rescan and reconnect with backoff.
+- [x] Implement container discovery/rescan and reconnect with backoff.
 - [ ] Compute CPU % with `precpu_stats`, memory used excluding `inactive_file`, and per-interface network rates.
 - [ ] Emit labels `container`, `image`, `scope=container`.
 - [ ] Keep the source off by default; fail startup when it is enabled and the socket is unreachable.
-- [ ] Add `docker.rescan_interval`; audit the existing `docker.interval`, `docker.exclude`, and `docker.stream_stats` (added with Phase 4 item 2).
+- [ ] Audit the existing `sources.docker.interval`, `sources.docker.exclude`, and `sources.docker.stream_stats`; confirm `sources.docker.rescan_interval` (default 30s).
 - [ ] Add `proc_path`, `/host/proc`, `--pid=host`, and `--network=host` documentation.
 - [ ] Document socket permissions, `--group-add`, and data-dir ownership in the container deployment.
 - [ ] Integration test with Docker; create, remove, and recreate a container and assert series behavior.

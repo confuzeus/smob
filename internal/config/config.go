@@ -88,6 +88,9 @@ type DockerSource struct {
 	Socket   string   `yaml:"socket"`
 	Exclude  string   `yaml:"exclude"`
 	Interval Duration `yaml:"interval"`
+	// RescanInterval is how often the running container set is enumerated for
+	// new and removed containers.
+	RescanInterval Duration `yaml:"rescan_interval"`
 	// StreamStats keeps one persistent stats stream per container instead of
 	// polling one-shot stats on each interval. It is opt-in because each stream
 	// costs a goroutine and an HTTP connection for the life of the container.
@@ -144,9 +147,10 @@ func Default() Config {
 				RescanInterval: Duration(30 * time.Second),
 			},
 			Docker: DockerSource{
-				Socket:      "/var/run/docker.sock",
-				Interval:    Duration(10 * time.Second),
-				StreamStats: false,
+				Socket:         "/var/run/docker.sock",
+				Interval:       Duration(10 * time.Second),
+				RescanInterval: Duration(30 * time.Second),
+				StreamStats:    false,
 			},
 		},
 		Storage: Storage{

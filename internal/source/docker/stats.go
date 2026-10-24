@@ -30,10 +30,10 @@ type rawStats struct {
 // statsAcquirer fetches raw container stats from one Docker client. The caller
 // owns the client; the acquirer never closes it.
 //
-// One-shot is the default mode: the collector calls oneShot on each tick.
-// stream is the opt-in mode for sub-interval resolution. The acquirer is not
-// safe for concurrent use; like the system and process sources, it is driven
-// from the collector's single source goroutine.
+// One-shot is the default mode: the collector calls oneShot on each tick. Its
+// failure memo is mutable, so one-shot calls must be driven from one goroutine.
+// stream is the opt-in mode for sub-interval resolution. Calls to stream may run
+// concurrently: they only read the client and logger and keep no shared state.
 type statsAcquirer struct {
 	client *client.Client
 	logger *slog.Logger
@@ -135,9 +135,11 @@ func (a *statsAcquirer) oneShotContainer(ctx context.Context, id string) (rawSta
 //
 // Streaming is deliberately expensive: it uses one goroutine and one HTTP
 // connection per container, which is why it is opt-in. A stream that ends or
-// fails is logged at warn and only that reader stops; other streams continue.
-// There is no retry or reconnect yet, so a closed stream stays closed until the
-// caller starts a new stream.
+// fails closes only that reader; other streams continue. The caller owns the
+// reconnect policy: it watches the channel close, backs off, and opens a new
+// stream. Open and read failures are logged at debug here because the caller
+// decides when to warn; a lagging consumer is still logged at warn once per
+// connection.
 //
 // The channel holds one pending payload per container. A consumer that falls
 // behind drops new payloads instead of growing a queue; the first drop per
@@ -161,12 +163,13 @@ func (a *statsAcquirer) stream(ctx context.Context, ids []string) <-chan rawStat
 }
 
 // streamContainer reads one container's stats stream until the stream ends or
-// ctx is canceled.
+// ctx is canceled. It is the only place that decodes a streaming stats payload
+// and the only place that applies the one-pending-payload drop policy.
 func (a *statsAcquirer) streamContainer(ctx context.Context, id string, out chan<- rawStats) {
 	reader, err := a.client.ContainerStats(ctx, id, true)
 	if err != nil {
 		if ctx.Err() == nil {
-			a.logger.Warn("open container stats stream failed; not reconnecting", "container", id, "error", err)
+			a.logger.Debug("open container stats stream failed", "container", id, "error", err)
 		}
 		return
 	}
@@ -181,9 +184,9 @@ func (a *statsAcquirer) streamContainer(ctx context.Context, id string, out chan
 			case ctx.Err() != nil:
 				// Cancellation tears down the HTTP body; this is a clean stop.
 			case errors.Is(err, io.EOF):
-				a.logger.Warn("container stats stream ended; not reconnecting", "container", id)
+				a.logger.Debug("container stats stream ended", "container", id)
 			default:
-				a.logger.Warn("read container stats stream failed; not reconnecting", "container", id, "error", err)
+				a.logger.Debug("read container stats stream failed", "container", id, "error", err)
 			}
 			return
 		}

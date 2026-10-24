@@ -73,8 +73,9 @@ func TestStatsStreamClosesOnOpenError(t *testing.T) {
 	c, ctx := connectDocker(t)
 
 	acq := newTestStatsAcquirer(c)
-	// A failed stream must stop its reader and close the fan-in channel. If
-	// reconnect support existed, the channel would stay open instead.
+	// The streaming primitive stops its reader and closes the fan-in channel on
+	// an open error. Reconnect is the supervisor's job; this pins the primitive
+	// contract the supervisor relies on.
 	stream := acq.stream(ctx, []string{"smob-no-such-container"})
 	waitForStreamClose(t, stream, 15*time.Second)
 }
@@ -84,7 +85,7 @@ func TestStatsStreamClosesOnOpenError(t *testing.T) {
 func connectDocker(t *testing.T) (*client.Client, context.Context) {
 	t.Helper()
 	socket := requireDocker(t)
-	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Minute)
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Minute)
 	t.Cleanup(cancel)
 
 	c, err := Connect(ctx, socket)
@@ -96,13 +97,20 @@ func connectDocker(t *testing.T) (*client.Client, context.Context) {
 }
 
 // startSleepContainer starts a uniquely named busybox container and removes it
-// when the test ends. The image is pulled only when it is absent; a pull
-// failure is a test failure, never a skip.
+// when the test ends.
 func startSleepContainer(t *testing.T, ctx context.Context, c *client.Client) string {
+	t.Helper()
+	name := fmt.Sprintf("smob-stats-%d-%d", os.Getpid(), time.Now().UnixNano())
+	return startNamedContainer(t, ctx, c, name)
+}
+
+// startNamedContainer starts a busybox sleep container under name and removes
+// it when the test ends. The image is pulled only when it is absent; a pull
+// failure is a test failure, never a skip.
+func startNamedContainer(t *testing.T, ctx context.Context, c *client.Client, name string) string {
 	t.Helper()
 	ensureImage(t, ctx, c, testImage)
 
-	name := fmt.Sprintf("smob-stats-%d-%d", os.Getpid(), time.Now().UnixNano())
 	created, err := c.ContainerCreate(ctx,
 		&container.Config{
 			Image: testImage,
@@ -114,7 +122,7 @@ func startSleepContainer(t *testing.T, ctx context.Context, c *client.Client) st
 		name,
 	)
 	if err != nil {
-		t.Fatalf("create container: %v", err)
+		t.Fatalf("create container %s: %v", name, err)
 	}
 	t.Cleanup(func() {
 		removeCtx, cancel := context.WithTimeout(context.Background(), 20*time.Second)

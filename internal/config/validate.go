@@ -102,6 +102,9 @@ func (c Config) Validate() error {
 		if c.Sources.Docker.Interval <= 0 {
 			errs = append(errs, errors.New("sources.docker.interval: must be greater than zero"))
 		}
+		if c.Sources.Docker.RescanInterval <= 0 {
+			errs = append(errs, errors.New("sources.docker.rescan_interval: must be greater than zero"))
+		}
 		if c.Sources.Docker.Exclude != "" {
 			if _, err := regexp.Compile(c.Sources.Docker.Exclude); err != nil {
 				errs = append(errs, fmt.Errorf("sources.docker.exclude: %w", err))

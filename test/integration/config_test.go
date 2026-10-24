@@ -178,6 +178,15 @@ func TestConfigValidate(t *testing.T) {
 			wants: []string{"sources.docker.stream_stats"},
 		},
 		{
+			name: "zero docker rescan interval",
+			body: base + "sources:\n  docker:\n    enabled: true\n    rescan_interval: 0s\n",
+			exit: 2,
+			wants: []string{
+				"sources.docker.rescan_interval",
+				"sources.docker: not implemented in this build",
+			},
+		},
+		{
 			name:  "log level override is invalid",
 			body:  base,
 			args:  []string{"--log-level", "verbose"},
@@ -248,6 +257,26 @@ func TestConfigDump(t *testing.T) {
 	validated := runSmob(t, ctx, "config", "--validate", "--config", roundTrip)
 	if validated.ExitCode != 0 {
 		t.Fatalf("round-tripped dump does not validate: exit %d\nstderr:\n%s", validated.ExitCode, validated.Stderr)
+	}
+
+	// The Docker rescan cadence is printed even while the source is disabled,
+	// so a dump round-trip proves the field is wired into the schema.
+	dockerPath := writeConfig(t, fmt.Sprintf(`data_dir: %s
+sources:
+  docker:
+    rescan_interval: 45s
+`, dataDir))
+	dockerRes := runSmob(t, ctx, "config", "--config", dockerPath)
+	if dockerRes.ExitCode != 0 {
+		t.Fatalf("docker config dump exit = %d\nstderr:\n%s", dockerRes.ExitCode, dockerRes.Stderr)
+	}
+	if !hasLine(dockerRes.Stdout, "rescan_interval: 45s") {
+		t.Errorf("config dump is missing docker rescan_interval: 45s\noutput:\n%s", dockerRes.Stdout)
+	}
+	dockerRoundTrip := writeConfig(t, dockerRes.Stdout)
+	validated = runSmob(t, ctx, "config", "--validate", "--config", dockerRoundTrip)
+	if validated.ExitCode != 0 {
+		t.Fatalf("round-tripped docker dump does not validate: exit %d\nstderr:\n%s", validated.ExitCode, validated.Stderr)
 	}
 }
 
