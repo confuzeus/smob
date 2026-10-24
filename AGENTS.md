@@ -42,7 +42,7 @@ the operator entry points.
 | Vet and static analysis | `just vet`, `just lint` |
 | Pure-function tests | `just test-unit` |
 | Fast integration suite | `just test` |
-| Extended suite (MinIO/Docker) | `just test-all` |
+| Extended suite (MinIO and Docker, strict mode) | `just test-all` |
 | Race-enabled integration suite | `just test-race` (requires cgo) |
 | Build the container image | `just docker` |
 | Cross-compile release binaries | `just release` |
@@ -92,7 +92,9 @@ See `docs/IMPLEMENTATION.md` for the full repository layout.
 ## Definition of done
 
 - [ ] `gofmt -l .` is empty; `just vet`, `just lint`, and `just test` pass.
-- [ ] `just test-all` passes when MinIO/Docker services are available.
+- [ ] `just test-all` passes with MinIO and Docker available. It runs in strict
+      mode, so a missing service fails rather than skips; CI's `extended` job
+      enforces both.
 - [ ] New observable behavior has an integration test through the CLI.
 - [ ] New configuration fields are validated with field-named errors.
 - [ ] `README.md` and `docs/IMPLEMENTATION.md` reflect the change, including

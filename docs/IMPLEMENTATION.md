@@ -293,11 +293,13 @@ A narrow exception is allowed for pure functions whose edge cases cannot be reac
   aggregation. Services are configured through environment variables
   (`SMOB_TEST_S3_ENDPOINT`, `SMOB_TEST_S3_BUCKET`, `SMOB_TEST_DOCKER_SOCKET`, …).
   Tests skip with a clear reason when a service is absent; `SMOB_TEST_STRICT=1`
-  turns every skip into a failure.
+  turns every skip into a failure. CI's `extended` job sets both the MinIO and
+  Docker configuration with strict mode, so a missing MinIO or Docker daemon
+  fails the job instead of skipping to a pass.
 - **Assertions** cover schema, labels, ordering, chunk boundaries, and plausible ranges — not exact live values. Use wide tolerances for rates and never require nonzero traffic on an idle runner.
 - **Golden files** cover stable output: help text, config dumps, and parser output from fixtures. Live `/proc` samples are validated structurally, not compared byte-for-byte.
 - **Race detector** applies to the `smob` binary under test (`SMOB_TEST_RACE=1`), not only to the Go test process. The race binary requires cgo/gcc and is a CI artifact only; release binaries remain `CGO_ENABLED=0`.
-- **CI**: lint, fast suite, race suite, and cross-builds on linux/amd64 and linux/arm64. The Alpine job runs the fast suite on a musl kernel. The `extended` job runs the S3 suite against MinIO in strict mode, including the network-partition spool drain and disk/S3 equivalence; it is structured so Phase 4 can add the runner's Docker daemon. Arm64 is build-only; integration runs on amd64.
+- **CI**: lint, fast suite, race suite, and cross-builds on linux/amd64 and linux/arm64. The Alpine job runs the fast suite on a musl kernel. The `extended` job starts pinned MinIO, asserts the runner's Docker daemon and pre-pulls the `busybox:1.36` fixture image, then runs the whole extended suite with `SMOB_TEST_STRICT=1`, `SMOB_TEST_S3_*`, and `SMOB_TEST_DOCKER_SOCKET` set. It covers the S3 suite including the network-partition spool drain and disk/S3 equivalence, plus the Docker CLI and package suites. A missing or unreachable MinIO or Docker service fails the job rather than skipping; failure and cancellation dump container logs and remove leftover `smob-*` containers. The fast and race jobs set the same Docker socket but stay non-strict, so Docker-gated tests run when the runner daemon is reachable and skip with a reason when it is not. Arm64 is build-only; integration runs on amd64.
 
 ## 9. Repository Layout
 
@@ -415,7 +417,7 @@ Dockerfile                     # FROM scratch, static binary, CA bundle
 - [x] Write the quickstart, config reference, systemd unit, compose file, and IAM policy.
 - [x] Write the disk → S3 migration note using `aws s3 sync`.
 - [x] Add `--version` and `--help` snapshot tests.
-- [ ] Run the extended suite in CI with MinIO and Docker; keep strict mode.
+- [x] Run the extended suite in CI with MinIO and Docker; keep strict mode.
 - [ ] Tag `v0.2.0`; publish binaries and the Docker image.
 - [ ] Post-release: collect feedback and scope v0.3 (live tail, chunk index, multi-host query).
 

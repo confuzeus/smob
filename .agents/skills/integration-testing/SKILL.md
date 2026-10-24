@@ -409,8 +409,9 @@ go test -tags=integration -count=1 ./test/integration/...
 # Race coverage for the binary under test, not just the test process.
 SMOB_TEST_RACE=1 go test -tags=integration -count=1 ./test/integration/...
 
-# Full suite with compose services already running.
+# Full suite with MinIO and Docker already running.
 SMOB_TEST_STRICT=1 SMOB_TEST_S3_ENDPOINT=http://127.0.0.1:9000 \
+  SMOB_TEST_DOCKER_SOCKET=/var/run/docker.sock \
   go test -tags=integration -count=1 -timeout=10m ./test/integration/...
 ```
 
@@ -420,12 +421,17 @@ Required justfile recipes (Phase 0):
 | ------------- | ----------------------------------------------------- |
 | `test-unit`   | `go test ./...`; pure functions only                  |
 | `test`        | Fast integration suite; service tests skip with reason |
-| `test-all`    | Compose services up, strict mode, full suite          |
+| `test-all`    | MinIO and Docker running, strict mode, full suite     |
 | `test-race`   | Suite with `SMOB_TEST_RACE=1`                         |
 | `test-update` | Suite with the golden update flag                     |
 
-CI runs the fast and race suites on Debian and the fast suite on Alpine today;
-the extended suite joins once MinIO and Docker services are wired in Phases 3–4.
+CI runs the fast and race suites on Debian and the fast suite on Alpine. The
+`extended` job starts pinned MinIO, checks the runner's Docker daemon, pre-pulls
+the `busybox:1.36` fixture image, and runs `just test-all` in strict mode with
+both `SMOB_TEST_S3_*` and `SMOB_TEST_DOCKER_SOCKET` set. A missing MinIO or
+Docker service fails that job; it never skips to a pass. The fast and race jobs
+set the same Docker socket but are not strict, so Docker-gated tests run when
+the daemon is reachable and skip with a reason when it is not.
 `go test -race` by itself only instruments the test binary; `SMOB_TEST_RACE=1` is
 what makes `TestMain` build `smob` with the race detector. The race build needs
 `CGO_ENABLED=1`, so run it on the Debian runner and keep release builds

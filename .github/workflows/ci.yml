@@ -27,6 +27,11 @@ jobs:
 
   test:
     runs-on: ubuntu-latest
+    env:
+      # Docker-gated tests run when the runner daemon is reachable and skip
+      # with a reason when it is not: this lane is not strict. The extended
+      # job owns the hard Docker contract.
+      SMOB_TEST_DOCKER_SOCKET: /var/run/docker.sock
     steps:
       - uses: actions/checkout@v4
       - uses: actions/setup-go@v5
@@ -39,6 +44,9 @@ jobs:
 
   extended:
     runs-on: ubuntu-latest
+    # The Go suite has a 10m timeout; setup, image pulls, and runner variance
+    # need the remaining headroom. Keep one job: splitting adds coordination
+    # without improving reliability.
     timeout-minutes: 20
     env:
       # Ephemeral credentials for this job's local MinIO only.
@@ -48,6 +56,7 @@ jobs:
       AWS_SECRET_ACCESS_KEY: minioadmin
       AWS_EC2_METADATA_DISABLED: "true"
       SMOB_TEST_STRICT: "1"
+      SMOB_TEST_DOCKER_SOCKET: /var/run/docker.sock
     steps:
       - uses: actions/checkout@v4
       - uses: actions/setup-go@v5
@@ -55,6 +64,49 @@ jobs:
           go-version: "1.27.x"
           cache: true
       - uses: extractions/setup-just@v2
+      - name: check Docker daemon
+        run: |
+          if ! command -v docker >/dev/null 2>&1; then
+            echo "::error::docker CLI is not installed; the extended suite requires a Docker daemon at $SMOB_TEST_DOCKER_SOCKET" >&2
+            exit 1
+          fi
+          if ! info=$(timeout 30 docker info --format 'Docker server {{.ServerVersion}} ({{.OperatingSystem}})' 2>&1); then
+            printf '%s\n' "$info" >&2
+            case "$info" in
+              *"permission denied"*)
+                echo "::error::Docker daemon is running but $SMOB_TEST_DOCKER_SOCKET is not accessible to this user (permission denied); add the runner user to the docker group" >&2
+                ;;
+              *"Cannot connect to the Docker daemon"*|*"no such file or directory"*|*"connection refused"*)
+                echo "::error::Docker daemon is unavailable at $SMOB_TEST_DOCKER_SOCKET; the extended suite requires the runner's Docker daemon" >&2
+                ;;
+              *)
+                echo "::error::docker info failed for an unexpected reason; the extended suite requires Docker at $SMOB_TEST_DOCKER_SOCKET" >&2
+                ;;
+            esac
+            exit 1
+          fi
+          printf '%s\n' "$info"
+          if ! timeout 30 docker version --format 'Docker client {{.Client.Version}}, server {{.Server.Version}}'; then
+            echo "::error::docker version failed after a successful docker info; the extended suite requires a working Docker daemon at $SMOB_TEST_DOCKER_SOCKET" >&2
+            exit 1
+          fi
+      - name: pre-pull Docker test image
+        run: |
+          if docker image inspect busybox:1.36 >/dev/null 2>&1; then
+            echo "busybox:1.36 is already cached"
+            exit 0
+          fi
+          for attempt in 1 2; do
+            if docker pull busybox:1.36; then
+              exit 0
+            fi
+            echo "pull attempt $attempt failed" >&2
+            if [ "$attempt" -eq 1 ]; then
+              sleep 5
+            fi
+          done
+          echo "::error::could not pull busybox:1.36 after two attempts; the Docker CLI tests require the pre-pulled fixture image" >&2
+          exit 1
       - name: start MinIO
         run: |
           # pgsty/minio:RELEASE.2026-08-04T00-00-00Z. The official MinIO image
@@ -81,6 +133,32 @@ jobs:
           docker logs smob-minio >&2 || true
           exit 1
       - run: just test-all
+      - name: Docker diagnostics
+        if: failure() || cancelled()
+        run: |
+          set +e
+          if ! command -v docker >/dev/null 2>&1; then
+            echo "docker CLI is unavailable; skipping container diagnostics"
+            exit 0
+          fi
+          if ! docker info >/dev/null 2>&1; then
+            echo "Docker daemon is unavailable; skipping container diagnostics"
+            exit 0
+          fi
+          echo "::group::docker ps -a"
+          docker ps -a
+          echo "::endgroup::"
+          ids=$(docker ps -aq --filter 'name=smob-')
+          while IFS= read -r id; do
+            [ -n "$id" ] || continue
+            echo "::group::docker logs $id"
+            docker logs "$id" 2>&1
+            echo "::endgroup::"
+          done <<< "$ids"
+          if [ -n "$ids" ]; then
+            printf '%s\n' "$ids" | xargs -r docker rm -f || true
+          fi
+          exit 0
       - name: stop MinIO
         if: always()
         run: docker rm -f smob-minio || true
