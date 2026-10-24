@@ -18,9 +18,9 @@ interchangeable and existing data can be copied between them with
 > `stats` are implemented. The Docker source is disabled by default and is
 > enabled with `sources.docker.enabled: true`. S3 IAM and MinIO deployment
 > guidance is in [docs/s3.md](docs/s3.md). Disk retention is implemented;
-> aggregation and `tail` remain planned. The command and metric reference below
-> describes the current contract. See the [design and implementation
-> plan](docs/IMPLEMENTATION.md) for the roadmap.
+> aggregation is implemented and `tail` remains planned. The command and metric
+> reference below describes the current contract. See the [design and
+> implementation plan](docs/IMPLEMENTATION.md) for the roadmap.
 
 ## Features
 
@@ -37,9 +37,9 @@ interchangeable and existing data can be copied between them with
 - **Bounded disk usage.** A startup and hourly sweep deletes closed disk chunks
   by age or total size, oldest first, without touching the chunk being
   assembled or any non-chunk file.
-- **Streaming queries and summaries.** Query samples or summarize count, min,
-  max, and mean per metric over a time range, with the same filters and output
-  formats.
+- **Streaming queries and summaries.** Query samples, aggregate them by metric
+  and label, or summarize count, min, max, and mean per metric over a time
+  range, with the same filters and output formats.
 - **Explicit units.** Metric names encode their unit, and rates carry the
   measurement window used to compute them.
 
@@ -238,6 +238,8 @@ given to `--since` is measured back from `--until`.
 | `--label MATCH` | Repeatable and ANDed. `name=value` is exact; `name~regex` is a regular expression. Quote shell metacharacters, for example `--label 'comm~nginx|postgres'`. |
 | `--limit N` | Maximum samples returned. Defaults to 10,000; `0` means unlimited. |
 | `--format FORMAT` | `table` (default), `json`, `jsonl`, or `csv`. |
+| `--agg OP` | Aggregate matching samples instead of listing them: `avg`, `min`, `max`, or `sum`. |
+| `--group-by LABELS` | Comma-separated label names to group by. The metric is always included. Requires `--agg`. |
 | `--data-dir DIR` | Override `data_dir` from the configuration. |
 
 Output is UTC everywhere. Table columns are `TIME`, `METRIC`, `VALUE`, `UNIT`,
@@ -246,6 +248,52 @@ streams one object per line for large ranges; CSV has the columns `timestamp`,
 `metric`, `value`, `interval_ms`, and `labels`.
 Results are sorted by timestamp, then metric, then canonical labels. `--limit`
 is applied after filtering and sorting.
+
+#### Aggregation
+
+`--agg` replaces the sample stream with one row per group. `--group-by` lists
+additional label names; the metric is always part of the group key and may be
+listed explicitly or omitted. Without `--group-by`, there is one group per
+metric. `--group-by` requires `--agg` and is a usage error on its own. Samples
+that differ only in labels not listed in `--group-by` merge into one group, and
+a grouped label that is absent from a sample has the empty string as its value.
+Groups are ordered by metric, then by the grouped values in alphabetical label
+name order.
+
+`COUNT` is the number of matching samples in the group. Each sample's `avg`
+weight is its `interval_ms` when that is positive and `1` otherwise:
+
+| Aggregation | Rate (`interval_ms > 0`) | Gauge (`interval_ms == 0`) |
+| --- | --- | --- |
+| `avg` | `Σ(value × interval_ms) / Σinterval_ms` | `Σvalue / count` (unweighted) |
+| `min` | raw minimum | raw minimum |
+| `max` | raw maximum | raw maximum |
+| `sum` | `Σvalue` (unweighted) | `Σvalue` (unweighted) |
+
+Weighting changes only `avg`; `min`, `max`, and `sum` always use raw sample
+values. A metric is normally entirely a rate or entirely a gauge. If malformed
+data mixes both in one group, the same per-sample weight rule applies.
+
+`sum` is the arithmetic total of the recorded sample values in the group over
+the scanned range. It is not interval-weighted, not a time integral, and not
+CPU-seconds. For CPU percentages it sums across series, and because the range
+scan visits every timestamp it also accumulates one contribution per sample
+over time. A range-wide `sum` is therefore count-sensitive and is not a
+per-timestamp cross-series total; use a one-timestamp range or plain `query`
+when that instantaneous total is what you need.
+
+Aggregated table columns are `METRIC`, `COUNT`, `VALUE`, `UNIT`, and `LABELS`;
+`LABELS` shows only the grouped labels in canonical order and is blank when
+there are none. JSON and JSONL objects have `metric`, `labels` (always an
+object, `{}` when empty), `count`, and `value`. CSV columns are `metric`,
+`labels`, `count`, and `value`.
+
+`--limit` applies to the store scan before aggregation, so a limited run
+aggregates only the first N matching samples. Aggregation keeps one small
+accumulator per group instead of the samples, so memory grows with the number
+of distinct metric/grouped-label combinations in the range, not with the number
+of samples. Grouping by a high-cardinality label such as `pid` can approach the
+number of series; `--limit` bounds scanned samples, not the number of groups.
 
 Data goes to stdout; status and errors go to stderr.
 
@@ -270,6 +318,8 @@ the header (or `[]` for JSON).
 
 Use the `query` flags above (`--since`, `--until`, `--host`, `--scope`,
 `--metric`, `--label`, `--limit`, `--format`, and `--data-dir`) with `stats`.
+`stats` does not accept `--agg` or `--group-by`; use `query` for grouped
+aggregation.
 
 ### Exit codes
 

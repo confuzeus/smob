@@ -242,7 +242,7 @@ Sample construction lives in `internal/source/docker/source.go`. `New` owns the 
 
 - Disk retention: a startup + hourly sweeper (not a write-path scan) deletes closed chunks by age (`max_age`) or total size (`max_bytes`). It skips the active chunk, tolerates `ENOENT`, logs every deletion at `info`, and never fails collection. A preflight free-space warning is logged at startup.
 - `smob stats`: count, min, max, mean per metric over a range, using the same range defaults and filters as `query` and the same streaming path.
-- `query --agg avg|min|max|sum --group-by metric,label...`: rate metrics are weighted by `interval_ms`; gauges are treated as instantaneous samples. `sum` over CPU percentages is documented as summing across series, not across time.
+- `query --agg avg|min|max|sum --group-by metric,label...`: rate metrics are weighted by `interval_ms`; gauges are treated as instantaneous samples. `sum` is the arithmetic total of sample values in the group over the scanned range: it is not interval-weighted, not a time integral, not CPU-seconds, and not a per-timestamp cross-series total. For CPU percentages it sums across series and also accumulates each scanned sample over time, so a range-wide sum is count-sensitive.
 - Documentation: quickstart, full config reference, systemd unit, compose file, IAM policy, and a disk → S3 migration note. Migration is `aws s3 sync <data_dir>/ s3://<bucket>/<prefix>/` followed by a config change — not "change the config and lose the old data."
 - Add `--version` output and `--help` snapshot tests for each subcommand.
 - Tag `v0.1.0` after Phase 2 and `v0.2.0` after this phase; publish binaries for amd64/arm64 and the Docker image.
@@ -407,7 +407,7 @@ Dockerfile                     # FROM scratch, static binary, CA bundle
 
 - [x] Implement the disk retention sweeper (age and size), closed chunks only, tolerant of reader races.
 - [x] Implement `smob stats`.
-- [ ] Add `--agg` and `--group-by`, weighting rates by `interval_ms`.
+- [x] Add `--agg` and `--group-by`, weighting rates by `interval_ms`.
 - [ ] Write the quickstart, config reference, systemd unit, compose file, and IAM policy.
 - [ ] Write the disk → S3 migration note using `aws s3 sync`.
 - [ ] Add `--version` and `--help` snapshot tests.

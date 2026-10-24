@@ -4,8 +4,10 @@ Usage:
   smob query [flags]
 
 Flags:
+      --agg string          aggregate matching samples: avg, min, max, or sum
       --data-dir string     override data_dir from the configuration
       --format string       output format: table, json, jsonl, or csv (default "table")
+      --group-by string     comma-separated label names to group by; metric is always included
   -h, --help                help for query
       --host string         restrict to one host
       --label stringArray   label matcher: name=value or name~regex (repeatable)

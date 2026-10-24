@@ -48,18 +48,25 @@ func (s *Summarizer) Summaries() []Summary {
 	return summaries
 }
 
-// accumulator folds sample values into a count, sum, minimum, and maximum. It
-// takes the whole sample rather than just the value so interval weighting can
-// be added for query --agg without changing the fold's call sites.
+// accumulator folds sample values into a count, unweighted sum, minimum,
+// maximum, and interval-weighted totals. It backs both stats' unweighted
+// Summary and query --agg, which reads the weighted totals directly.
 type accumulator struct {
-	count int64
-	sum   float64
-	min   float64
-	max   float64
+	count       int64
+	sum         float64
+	weightedSum float64
+	weightSum   float64
+	min         float64
+	max         float64
 }
 
 func (a *accumulator) add(sample model.Sample) {
 	value := sample.Value
+	weight := 1.0
+	if sample.IntervalMS > 0 {
+		weight = float64(sample.IntervalMS)
+	}
+
 	if a.count == 0 {
 		a.min, a.max = value, value
 	} else {
@@ -68,6 +75,28 @@ func (a *accumulator) add(sample model.Sample) {
 	}
 	a.count++
 	a.sum += value
+	a.weightedSum += value * weight
+	a.weightSum += weight
+}
+
+// mean is the unweighted arithmetic mean used by stats.
+func (a *accumulator) mean() float64 {
+	return a.sum / float64(a.count)
+}
+
+// value returns the selected aggregation for query --agg. Weighting applies
+// only to avg; min, max, and sum use the raw sample values.
+func (a *accumulator) value(op Aggregation) float64 {
+	switch op {
+	case AggAvg:
+		return a.weightedSum / a.weightSum
+	case AggMin:
+		return a.min
+	case AggMax:
+		return a.max
+	default:
+		return a.sum
+	}
 }
 
 func (a *accumulator) summary(metric string) Summary {
@@ -76,6 +105,6 @@ func (a *accumulator) summary(metric string) Summary {
 		Count:  a.count,
 		Min:    a.min,
 		Max:    a.max,
-		Mean:   a.sum / float64(a.count),
+		Mean:   a.mean(),
 	}
 }

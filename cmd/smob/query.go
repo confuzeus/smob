@@ -30,6 +30,7 @@ type queryOptions struct {
 
 func (a *app) queryCommand() *cobra.Command {
 	var opts queryOptions
+	var aggValue, groupBy string
 
 	cmd := &cobra.Command{
 		Use:   "query",
@@ -43,11 +44,17 @@ func (a *app) queryCommand() *cobra.Command {
 			if err != nil {
 				return cli.UsageErrorf("%v", err)
 			}
-			return a.runQuery(cmd, q, opts.format)
+			agg, groupKeys, err := parseAggregationFlags(cmd, aggValue, groupBy)
+			if err != nil {
+				return cli.UsageErrorf("%v", err)
+			}
+			return a.runQuery(cmd, q, opts.format, agg, groupKeys)
 		},
 	}
 
 	addQueryFlags(cmd, &opts, &a.dataDir)
+	cmd.Flags().StringVar(&aggValue, "agg", "", "aggregate matching samples: avg, min, max, or sum")
+	cmd.Flags().StringVar(&groupBy, "group-by", "", "comma-separated label names to group by; metric is always included")
 	return cmd
 }
 
@@ -64,6 +71,50 @@ func addQueryFlags(cmd *cobra.Command, opts *queryOptions, dataDir *string) {
 	cmd.Flags().IntVar(&opts.limit, "limit", 10_000, "maximum samples; 0 means unlimited")
 	cmd.Flags().StringVar(&opts.format, "format", "table", "output format: table, json, jsonl, or csv")
 	cmd.Flags().StringVar(dataDir, "data-dir", "", "override data_dir from the configuration")
+}
+
+// parseAggregationFlags validates --agg and --group-by. A nil aggregation means
+// --agg was absent and the normal sample output applies. Grouping without an
+// aggregation has no output shape, so it is rejected rather than implying one.
+func parseAggregationFlags(cmd *cobra.Command, aggValue, groupBy string) (*query.Aggregation, []string, error) {
+	if aggValue == "" {
+		if cmd.Flags().Changed("agg") {
+			return nil, nil, errors.New(`agg: must be one of avg, min, max, sum; got ""`)
+		}
+		if cmd.Flags().Changed("group-by") {
+			return nil, nil, errors.New("group-by: requires --agg")
+		}
+		return nil, nil, nil
+	}
+
+	agg, err := query.ParseAggregation(aggValue)
+	if err != nil {
+		return nil, nil, err
+	}
+	keys, err := parseGroupBy(groupBy)
+	if err != nil {
+		return nil, nil, err
+	}
+	return &agg, keys, nil
+}
+
+// parseGroupBy splits comma-separated label names and trims surrounding spaces.
+// An empty string means metric-only grouping; an empty list element is a usage
+// error.
+func parseGroupBy(raw string) ([]string, error) {
+	if raw == "" {
+		return nil, nil
+	}
+
+	keys := make([]string, 0, strings.Count(raw, ",")+1)
+	for _, part := range strings.Split(raw, ",") {
+		key := strings.TrimSpace(part)
+		if key == "" {
+			return nil, fmt.Errorf("group-by: label names must not be empty; got %q", raw)
+		}
+		keys = append(keys, key)
+	}
+	return keys, nil
 }
 
 // query validates the flags and resolves them into a model.Query. The until
@@ -167,12 +218,48 @@ func validComponent(value string) bool {
 	return value != "" && value != "." && value != ".." && !strings.ContainsRune(value, '/')
 }
 
-func (a *app) runQuery(cmd *cobra.Command, q model.Query, format string) error {
+func (a *app) runQuery(cmd *cobra.Command, q model.Query, format string, agg *query.Aggregation, groupBy []string) error {
 	st, err := newStore(cmd.Context(), a.cfg, a.logger)
 	if err != nil {
 		return err
 	}
 	defer func() { _ = st.Close() }()
+
+	if agg != nil {
+		out, err := query.NewAggregateWriter(cmd.OutOrStdout(), format)
+		if err != nil {
+			if errors.Is(err, syscall.EPIPE) {
+				return nil
+			}
+			return err
+		}
+
+		aggregator := query.NewAggregator(*agg, groupBy)
+		if err := st.Query(cmd.Context(), q, func(sample model.Sample) error {
+			aggregator.Add(sample)
+			return nil
+		}); err != nil {
+			if errors.Is(err, context.Canceled) || errors.Is(err, syscall.EPIPE) {
+				return nil
+			}
+			return err
+		}
+		for _, aggregate := range aggregator.Aggregates() {
+			if err := out.Write(aggregate); err != nil {
+				if errors.Is(err, syscall.EPIPE) {
+					return nil
+				}
+				return err
+			}
+		}
+		if err := out.Close(); err != nil {
+			if errors.Is(err, syscall.EPIPE) {
+				return nil
+			}
+			return err
+		}
+		return nil
+	}
 
 	out, err := query.NewWriter(cmd.OutOrStdout(), format)
 	if err != nil {
