@@ -92,6 +92,9 @@ func (c Config) Validate() error {
 			}
 		}
 	}
+	if c.Sources.Docker.StreamStats && !c.Sources.Docker.Enabled {
+		errs = append(errs, errors.New("sources.docker.stream_stats: requires sources.docker.enabled"))
+	}
 	if c.Sources.Docker.Enabled {
 		if c.Sources.Docker.Socket == "" {
 			errs = append(errs, errors.New("sources.docker.socket: required when the docker source is enabled"))

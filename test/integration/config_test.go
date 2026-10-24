@@ -172,6 +172,12 @@ func TestConfigValidate(t *testing.T) {
 			},
 		},
 		{
+			name:  "docker stream stats without enabled source",
+			body:  base + "sources:\n  docker:\n    stream_stats: true\n",
+			exit:  2,
+			wants: []string{"sources.docker.stream_stats"},
+		},
+		{
 			name:  "log level override is invalid",
 			body:  base,
 			args:  []string{"--log-level", "verbose"},
@@ -330,6 +336,7 @@ func TestConfigDefaults(t *testing.T) {
 		"proc_path: /proc",
 		"host: " + host,
 		"socket: /var/run/docker.sock",
+		"stream_stats: false",
 		"chunk_interval: 5m0s",
 		"top_n: 20",
 		"interval: 10s",

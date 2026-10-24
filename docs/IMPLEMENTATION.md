@@ -232,6 +232,8 @@ a dedicated query mode can relax it later if it causes friction.
 - Document the Docker socket permission problem: `/var/run/docker.sock` is usually `root:docker` with mode `0660`, so the image's non-root UID cannot read it without `--group-add` (and a matching GID) or running as root. The data directory must also be writable by the container UID.
 - **Exit criterion:** inside a container, `smob collect` records per-container CPU, memory, and network; `smob query --label container=web` returns plausible values; removing and recreating a container produces a new series, not a corrupted rate.
 
+Stats acquisition lives in `internal/source/docker/stats.go`. One-shot mode requests one `ContainerStatsOneShot` sample per container per collector tick, with at most eight requests in flight; per-container failures are logged and omitted rather than failing the tick. Stream mode is opt-in through `sources.docker.stream_stats`: it opens one stats stream per container and fans decoded payloads into a bounded channel (one pending payload per container; new payloads are dropped when the consumer lags), and a reader stops when its stream ends or errors. It does not reconnect; discovery and reconnect arrive with the next Phase 4 item. Both modes return raw payloads only, and the source is not registered with the collector until that work lands.
+
 **Phase 5 — Polish and Release (Week 7) → v0.2.0**
 
 - Disk retention: a startup + hourly sweeper (not a write-path scan) deletes closed chunks by age (`max_age`) or total size (`max_bytes`). It skips the active chunk, tolerates `ENOENT`, logs every deletion at `info`, and never fails collection. A preflight free-space warning is logged at startup.
@@ -387,12 +389,12 @@ Dockerfile                     # FROM scratch, static binary, CA bundle
 ### Phase 4 — Docker Container Metrics (v0.2)
 
 - [x] Add the Docker Engine client and connect over `docker.socket`.
-- [ ] Implement one-shot stats polling by default; opt-in stream fan-in.
+- [x] Implement one-shot stats polling by default; opt-in stream fan-in.
 - [ ] Implement container discovery/rescan and reconnect with backoff.
 - [ ] Compute CPU % with `precpu_stats`, memory used excluding `inactive_file`, and per-interface network rates.
 - [ ] Emit labels `container`, `image`, `scope=container`.
 - [ ] Keep the source off by default; fail startup when it is enabled and the socket is unreachable.
-- [ ] Add `docker.interval`, `docker.rescan_interval`, `docker.stream_stats`, and `docker.exclude`.
+- [ ] Add `docker.rescan_interval`; audit the existing `docker.interval`, `docker.exclude`, and `docker.stream_stats` (added with Phase 4 item 2).
 - [ ] Add `proc_path`, `/host/proc`, `--pid=host`, and `--network=host` documentation.
 - [ ] Document socket permissions, `--group-add`, and data-dir ownership in the container deployment.
 - [ ] Integration test with Docker; create, remove, and recreate a container and assert series behavior.
