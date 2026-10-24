@@ -39,5 +39,9 @@ func NewClient(ctx context.Context, cfg config.S3Storage) (*awss3.Client, error)
 			o.BaseEndpoint = aws.String(cfg.Endpoint)
 		}
 		o.UsePathStyle = cfg.PathStyle != nil && *cfg.PathStyle
+		// smob owns retries so it can treat an ambiguous PutObject specially
+		// and bound the budget exactly. The SDK retryer would multiply attempts
+		// invisibly.
+		o.Retryer = aws.NopRetryer{}
 	}), nil
 }

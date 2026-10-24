@@ -144,7 +144,7 @@ func (s *Store) walkHourGroups(ctx context.Context, q model.Query) ([]hourGroup,
 		Prefix: aws.String(prefix),
 	})
 	for paginator.HasMorePages() {
-		page, err := paginator.NextPage(ctx)
+		page, err := nextListPage(ctx, paginator)
 		if err != nil {
 			if ctx.Err() != nil {
 				return nil, ctx.Err()
@@ -236,7 +236,7 @@ func (s *Store) listComponents(ctx context.Context, prefix string) ([]string, er
 		Delimiter: aws.String("/"),
 	})
 	for paginator.HasMorePages() {
-		page, err := paginator.NextPage(ctx)
+		page, err := nextListPage(ctx, paginator)
 		if err != nil {
 			if ctx.Err() != nil {
 				return nil, ctx.Err()
@@ -265,7 +265,7 @@ func (s *Store) listHour(ctx context.Context, host, scope string, hour time.Time
 		Prefix: aws.String(prefix),
 	})
 	for paginator.HasMorePages() {
-		page, err := paginator.NextPage(ctx)
+		page, err := nextListPage(ctx, paginator)
 		if err != nil {
 			if ctx.Err() != nil {
 				return nil, ctx.Err()
@@ -289,6 +289,19 @@ func (s *Store) listHour(ctx context.Context, host, scope string, hour time.Time
 		}
 	}
 	return keys, nil
+}
+
+// nextListPage fetches one listing page, retrying transient failures. The
+// paginator advances its continuation token only after a successful page, so a
+// retry cannot skip or duplicate results.
+func nextListPage(ctx context.Context, paginator *awss3.ListObjectsV2Paginator) (*awss3.ListObjectsV2Output, error) {
+	var page *awss3.ListObjectsV2Output
+	err := retry(ctx, func(ctx context.Context) error {
+		var err error
+		page, err = paginator.NextPage(ctx)
+		return err
+	})
+	return page, err
 }
 
 // hourPrefix returns the object prefix for one host/scope/hour, with a trailing
@@ -427,27 +440,43 @@ func (s *Store) merge(ctx context.Context, keys []string, filter *store.Filter, 
 	return emitted, nil
 }
 
-// getObject downloads one chunk. A missing key is reported as ok == false so
-// the caller can skip it without failing the query.
+// getObject downloads one chunk, retrying transient failures. A missing key is
+// reported as ok == false so the caller can skip it without failing the query.
 func (s *Store) getObject(ctx context.Context, key string) ([]byte, bool, error) {
-	out, err := s.client.GetObject(ctx, &awss3.GetObjectInput{
-		Bucket: aws.String(s.bucket),
-		Key:    aws.String(key),
+	var (
+		data     []byte
+		notFound bool
+	)
+	err := retry(ctx, func(ctx context.Context) error {
+		data, notFound = nil, false
+
+		out, err := s.client.GetObject(ctx, &awss3.GetObjectInput{
+			Bucket: aws.String(s.bucket),
+			Key:    aws.String(key),
+		})
+		if err != nil {
+			if isNotFound(err) {
+				notFound = true
+				return nil
+			}
+			return err
+		}
+		defer out.Body.Close()
+
+		data, err = io.ReadAll(out.Body)
+		if err != nil {
+			return fmt.Errorf("read %s: %w", key, err)
+		}
+		return nil
 	})
 	if err != nil {
-		if isNotFound(err) {
-			return nil, false, nil
-		}
 		if ctx.Err() != nil {
 			return nil, false, ctx.Err()
 		}
 		return nil, false, fmt.Errorf("get %s: %w", key, err)
 	}
-	defer out.Body.Close()
-
-	data, err := io.ReadAll(out.Body)
-	if err != nil {
-		return nil, false, fmt.Errorf("read %s: %w", key, err)
+	if notFound {
+		return nil, false, nil
 	}
 	return data, true, nil
 }

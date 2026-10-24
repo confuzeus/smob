@@ -90,6 +90,7 @@ Key layout:
 Write semantics:
 
 - A completed chunk is immutable. On disk it is written to `<key>.tmp`, fsynced, and renamed into place. On S3 it is one conditional `PUT` (`If-None-Match: *`) to the final key; a `412` or `409` means that window already exists, so the writer retries the same body under the next `-1`, `-2`, … suffix. This matches the disk collision guard on endpoints that implement conditional writes (AWS S3 and current MinIO); a service that ignores the condition can still overwrite.
+- The S3 store retries transient failures — network errors and timeouts, `408`, `429`, and `5xx` — on `PUT`, `HEAD`, `LIST`, and `GET` with exponential backoff and jitter: six attempts, a 250ms base, a 4s cap, and equal jitter, so at most roughly 7.75s of delay. Terminal errors (`400`, `401`, `403`, and `404` where absence is not tolerated) fail immediately. The chunk is encoded once and every attempt sends the same bytes. A `PUT` that times out or returns a transient error may still have landed; if a later attempt gets `412`/`409`, the writer downloads that key and compares it byte for byte with its body. Equal bytes mean the chunk is already stored; different bytes mean another writer owns the window, so the next suffix is tried. Only a conflict on a key with no ambiguous attempt, or a byte mismatch, suffixes, so an ambiguous retry cannot create a duplicate chunk. When the retry budget is exhausted, `Write` returns a persistent store failure (exit 3); the spool fallback is the next Phase 3 item.
 - A crash loses the chunk currently being assembled, at most `storage.chunk_interval`.
 - `SIGINT`/`SIGTERM` closes the active chunk with its actual end time, writes it once, and exits 0. A second signal exits 1 without waiting.
 - No per-chunk index is written in v0.1 or v0.2. Queries prune by host, scope, and hour, then scan the chunks in the range. A sidecar index (min/max timestamp, metric set, counts) is a v0.3 optimization if real query latency demands it; adding it later does not change the chunk format.
@@ -366,7 +367,7 @@ Dockerfile                     # FROM scratch, static binary, CA bundle
 
 - [x] Add `aws-sdk-go-v2`; config endpoint, region, bucket, prefix, `path_style`, `spool_dir`, `spool_max_bytes`; standard credential chain.
 - [x] Implement the S3 store with the same chunk keys and a single `PUT` per chunk.
-- [ ] Implement retry with exponential backoff and jitter.
+- [x] Implement retry with exponential backoff and jitter.
 - [ ] Implement the local spool and background replay; cap the spool; merge spooled chunks in queries.
 - [ ] Implement `LIST` prefix pruning and concurrent `GET` with a bounded worker pool.
 

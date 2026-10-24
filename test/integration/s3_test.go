@@ -86,6 +86,13 @@ func requireS3(t *testing.T) s3TestEnv {
 }
 
 func TestS3Unreachable(t *testing.T) {
+	// Resolve credentials locally so the request reaches the closed port.
+	// Without them the SDK fails on instance metadata before the network path
+	// this test is meant to exercise.
+	t.Setenv("AWS_ACCESS_KEY_ID", "test")
+	t.Setenv("AWS_SECRET_ACCESS_KEY", "test")
+	t.Setenv("AWS_EC2_METADATA_DISABLED", "true")
+
 	listener, err := net.Listen("tcp", "127.0.0.1:0")
 	if err != nil {
 		t.Fatalf("reserve a closed port: %v", err)

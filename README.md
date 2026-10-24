@@ -14,7 +14,7 @@ interchangeable and existing data can be copied between them with
 `aws s3 sync`.
 
 > **Project status:** smob is v0.1. System and process metrics, the disk and S3
-> backends, `collect`, and `query` are implemented. S3 retry, spooling, and IAM
+> backends, `collect`, and `query` are implemented. S3 spooling and IAM
 > guidance are still pending, as are Docker, retention, and aggregation. `stats`
 > and `tail` remain stubs. The command and metric reference below describes the
 > v0.1 contract. See the
@@ -219,7 +219,9 @@ no mirroring or dual-write.
   planned for v0.2.
 - **S3** writes to an AWS or S3-compatible bucket using the standard AWS
   credential chain (environment, shared config, or instance role). Credentials
-  are never stored in `smob.yaml`.
+  are never stored in `smob.yaml`. Transient failures are retried with
+  exponential backoff and jitter; a write that still cannot be persisted is a
+  persistent store failure (exit code 3).
 
 Both backends use the same keys and sample format, so migrating from disk to S3
 is a copy followed by a configuration change:
