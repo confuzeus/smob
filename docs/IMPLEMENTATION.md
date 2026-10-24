@@ -406,7 +406,7 @@ Dockerfile                     # FROM scratch, static binary, CA bundle
 ### Phase 5 — Polish and Release (v0.2.0)
 
 - [x] Implement the disk retention sweeper (age and size), closed chunks only, tolerant of reader races.
-- [ ] Implement `smob stats`.
+- [x] Implement `smob stats`.
 - [ ] Add `--agg` and `--group-by`, weighting rates by `interval_ms`.
 - [ ] Write the quickstart, config reference, systemd unit, compose file, and IAM policy.
 - [ ] Write the disk → S3 migration note using `aws s3 sync`.

@@ -14,12 +14,12 @@ interchangeable and existing data can be copied between them with
 `aws s3 sync`.
 
 > **Project status:** System, process, and Docker container metrics, the disk
-> and S3 backends (including local spool replay), `collect`, and `query` are
-> implemented. The Docker source is disabled by default and is enabled with
-> `sources.docker.enabled: true`. S3 IAM and MinIO deployment guidance is in
-> [docs/s3.md](docs/s3.md). Disk retention is implemented; aggregation, `stats`,
-> and `tail` remain planned. The command and metric reference below describes
-> the current contract. See the [design and implementation
+> and S3 backends (including local spool replay), `collect`, `query`, and
+> `stats` are implemented. The Docker source is disabled by default and is
+> enabled with `sources.docker.enabled: true`. S3 IAM and MinIO deployment
+> guidance is in [docs/s3.md](docs/s3.md). Disk retention is implemented;
+> aggregation and `tail` remain planned. The command and metric reference below
+> describes the current contract. See the [design and implementation
 > plan](docs/IMPLEMENTATION.md) for the roadmap.
 
 ## Features
@@ -37,8 +37,9 @@ interchangeable and existing data can be copied between them with
 - **Bounded disk usage.** A startup and hourly sweep deletes closed disk chunks
   by age or total size, oldest first, without touching the chunk being
   assembled or any non-chunk file.
-- **Streaming queries.** Query by time range, host, scope, metric, and labels;
-  emit a table or stream JSON, JSONL, and CSV.
+- **Streaming queries and summaries.** Query samples or summarize count, min,
+  max, and mean per metric over a time range, with the same filters and output
+  formats.
 - **Explicit units.** Metric names encode their unit, and rates carry the
   measurement window used to compute them.
 
@@ -170,7 +171,7 @@ Commands:
 | --- | --- |
 | `smob collect` | Run the collector and write samples to the configured backend. |
 | `smob query` | Query recorded samples. |
-| `smob stats` | Summarize matching samples (planned for v0.2). |
+| `smob stats` | Summarize matching samples per metric (count, min, max, mean). |
 | `smob tail` | Live tail (deferred; currently a stub). |
 | `smob config` | Print the effective configuration; `--validate` checks it and exits. |
 | `smob version` | Print version, commit, and build date. |
@@ -247,6 +248,28 @@ Results are sorted by timestamp, then metric, then canonical labels. `--limit`
 is applied after filtering and sorting.
 
 Data goes to stdout; status and errors go to stderr.
+
+### `stats`
+
+`stats` accepts the same time-range defaults, filters, and `--data-dir` override
+as `query`, and reads the store through the same streaming path. It reports one
+row per metric, aggregating every matching series and host into that metric
+unless a filter narrows the set. Metrics are sorted alphabetically.
+
+Table columns are `METRIC`, `COUNT`, `MIN`, `MAX`, `MEAN`, and `UNIT`. JSON is
+one array of flat objects with `metric`, `count`, `min`, `max`, and `mean`;
+JSONL emits one object per line; CSV has the columns `metric`, `count`, `min`,
+`max`, and `mean`. `COUNT` is the number of matching samples. `MEAN` is the
+unweighted arithmetic mean of their values: `interval_ms` does not change a
+sample's weight.
+
+`--limit` behaves as in `query`: it stops the scan after the first N matching
+samples (default 10,000; `0` means unlimited). A limited run therefore reports
+partial statistics for those samples. An empty result exits 0 and prints only
+the header (or `[]` for JSON).
+
+Use the `query` flags above (`--since`, `--until`, `--host`, `--scope`,
+`--metric`, `--label`, `--limit`, `--format`, and `--data-dir`) with `stats`.
 
 ### Exit codes
 

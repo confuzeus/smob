@@ -15,7 +15,8 @@ import (
 	"github.com/spf13/cobra"
 )
 
-// queryOptions holds the raw query flags before they are validated.
+// queryOptions holds the raw range, filter, and output flags shared by query
+// and stats before they are validated.
 type queryOptions struct {
 	since  string
 	until  string
@@ -46,6 +47,14 @@ func (a *app) queryCommand() *cobra.Command {
 		},
 	}
 
+	addQueryFlags(cmd, &opts, &a.dataDir)
+	return cmd
+}
+
+// addQueryFlags registers the flags shared by query and stats. Both commands
+// resolve them through queryOptions.query, so defaults and validation cannot
+// drift between them.
+func addQueryFlags(cmd *cobra.Command, opts *queryOptions, dataDir *string) {
 	cmd.Flags().StringVar(&opts.since, "since", "", "start time: a duration such as 1h, or an RFC3339 timestamp (default: last hour)")
 	cmd.Flags().StringVar(&opts.until, "until", "", "end time as an RFC3339 timestamp (default: now)")
 	cmd.Flags().StringVar(&opts.host, "host", "", "restrict to one host")
@@ -54,8 +63,7 @@ func (a *app) queryCommand() *cobra.Command {
 	cmd.Flags().StringArrayVar(&opts.labels, "label", nil, "label matcher: name=value or name~regex (repeatable)")
 	cmd.Flags().IntVar(&opts.limit, "limit", 10_000, "maximum samples; 0 means unlimited")
 	cmd.Flags().StringVar(&opts.format, "format", "table", "output format: table, json, jsonl, or csv")
-	cmd.Flags().StringVar(&a.dataDir, "data-dir", "", "override data_dir from the configuration")
-	return cmd
+	cmd.Flags().StringVar(dataDir, "data-dir", "", "override data_dir from the configuration")
 }
 
 // query validates the flags and resolves them into a model.Query. The until
