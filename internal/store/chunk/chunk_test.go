@@ -1,12 +1,19 @@
-package disk
+package chunk
 
 import (
-	"path/filepath"
+	"bytes"
+	"compress/gzip"
+	"encoding/json"
+	"errors"
+	"io"
+	"path"
 	"testing"
 	"time"
+
+	"github.com/confuzeus/smob/internal/model"
 )
 
-func TestChunkKey(t *testing.T) {
+func TestKey(t *testing.T) {
 	cases := []struct {
 		name    string
 		host    string
@@ -132,24 +139,24 @@ func TestChunkKey(t *testing.T) {
 
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
-			got, err := chunkKey(tc.host, tc.scope, tc.start, tc.end)
+			got, err := Key(tc.host, tc.scope, tc.start, tc.end)
 			if tc.wantErr {
 				if err == nil {
-					t.Fatalf("chunkKey() = %q, want an error", got)
+					t.Fatalf("Key() = %q, want an error", got)
 				}
 				return
 			}
 			if err != nil {
-				t.Fatalf("chunkKey() error: %v", err)
+				t.Fatalf("Key() error: %v", err)
 			}
-			if got != filepath.FromSlash(tc.want) {
-				t.Fatalf("chunkKey() = %q, want %q", got, filepath.FromSlash(tc.want))
+			if got != tc.want {
+				t.Fatalf("Key() = %q, want %q", got, tc.want)
 			}
 		})
 	}
 }
 
-func TestParseChunkName(t *testing.T) {
+func TestParseName(t *testing.T) {
 	cases := []struct {
 		name      string
 		file      string
@@ -224,39 +231,39 @@ func TestParseChunkName(t *testing.T) {
 
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
-			start, end, err := parseChunkName(tc.file)
+			start, end, err := ParseName(tc.file)
 			if tc.wantError {
 				if err == nil {
-					t.Fatalf("parseChunkName(%q) = %s, %s, want an error", tc.file, start, end)
+					t.Fatalf("ParseName(%q) = %s, %s, want an error", tc.file, start, end)
 				}
 				return
 			}
 			if err != nil {
-				t.Fatalf("parseChunkName(%q) error: %v", tc.file, err)
+				t.Fatalf("ParseName(%q) error: %v", tc.file, err)
 			}
 			if !start.Equal(tc.start) || !end.Equal(tc.end) {
-				t.Fatalf("parseChunkName(%q) = %s, %s, want %s, %s", tc.file, start, end, tc.start, tc.end)
+				t.Fatalf("ParseName(%q) = %s, %s, want %s, %s", tc.file, start, end, tc.start, tc.end)
 			}
 		})
 	}
 }
 
-func TestChunkKeyParseRoundTrip(t *testing.T) {
+func TestKeyParseRoundTrip(t *testing.T) {
 	start := time.Date(2026, 10, 23, 16, 55, 0, 0, time.UTC)
 	end := time.Date(2026, 10, 23, 17, 0, 0, 0, time.UTC)
 
-	key, err := chunkKey("web-1", "system", start, end)
+	key, err := Key("web-1", "system", start, end)
 	if err != nil {
-		t.Fatalf("chunkKey() error: %v", err)
+		t.Fatalf("Key() error: %v", err)
 	}
 	for n := 0; n < 3; n++ {
 		candidate := key
 		if n > 0 {
-			candidate = collisionKey(key, n)
+			candidate = CollisionKey(key, n)
 		}
-		parsedStart, parsedEnd, err := parseChunkName(filepath.Base(candidate))
+		parsedStart, parsedEnd, err := ParseName(path.Base(candidate))
 		if err != nil {
-			t.Fatalf("parseChunkName(%q) error: %v", candidate, err)
+			t.Fatalf("ParseName(%q) error: %v", candidate, err)
 		}
 		if !parsedStart.Equal(start) || !parsedEnd.Equal(end) {
 			t.Fatalf("round trip %q = %s, %s, want %s, %s", candidate, parsedStart, parsedEnd, start, end)
@@ -297,13 +304,92 @@ func TestParseHourPath(t *testing.T) {
 
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
-			got, ok := parseHourPath(tc.rel)
+			got, ok := ParseHourPath(tc.rel)
 			if ok != tc.ok {
-				t.Fatalf("parseHourPath(%q) ok = %v, want %v", tc.rel, ok, tc.ok)
+				t.Fatalf("ParseHourPath(%q) ok = %v, want %v", tc.rel, ok, tc.ok)
 			}
 			if ok && !got.Equal(tc.want) {
-				t.Fatalf("parseHourPath(%q) = %s, want %s", tc.rel, got, tc.want)
+				t.Fatalf("ParseHourPath(%q) = %s, want %s", tc.rel, got, tc.want)
 			}
 		})
 	}
+}
+
+func TestOverlaps(t *testing.T) {
+	start := time.Date(2026, 10, 23, 16, 0, 0, 0, time.UTC)
+	end := start.Add(5 * time.Minute)
+	cases := []struct {
+		name  string
+		start time.Time
+		end   time.Time
+		want  bool
+	}{
+		{name: "unbounded", want: true},
+		{name: "starts inside", start: start.Add(time.Minute), want: true},
+		{name: "ends inside", end: end.Add(-time.Minute), want: true},
+		{name: "touches start", end: start, want: false},
+		{name: "starts at end", start: end, want: false},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			r := model.TimeRange{Start: tc.start, End: tc.end}
+			if got := Overlaps(start, end, r); got != tc.want {
+				t.Fatalf("Overlaps() = %v, want %v", got, tc.want)
+			}
+		})
+	}
+}
+
+func TestEncodeDeterministic(t *testing.T) {
+	samples := []model.Sample{
+		{
+			Timestamp:  time.Date(2026, 10, 23, 16, 0, 1, 0, time.UTC),
+			Metric:     "system.memory.used_bytes",
+			Value:      1024,
+			IntervalMS: 0,
+			Labels:     map[string]string{"scope": "system", "host": "web-1"},
+		},
+		{
+			Timestamp:  time.Date(2026, 10, 23, 16, 0, 2, 0, time.UTC),
+			Metric:     "system.cpu.percent",
+			Value:      12.5,
+			IntervalMS: 10_000,
+			Labels:     map[string]string{"host": "web-1", "scope": "system", "cpu": "all"},
+		},
+	}
+
+	var first, second bytes.Buffer
+	if err := Encode(&first, samples); err != nil {
+		t.Fatalf("Encode() error: %v", err)
+	}
+	if err := Encode(&second, samples); err != nil {
+		t.Fatalf("Encode() error: %v", err)
+	}
+	if !bytes.Equal(first.Bytes(), second.Bytes()) {
+		t.Fatal("encoding the same samples twice produced different bytes")
+	}
+
+	gz, err := gzip.NewReader(bytes.NewReader(first.Bytes()))
+	if err != nil {
+		t.Fatalf("open encoded chunk: %v", err)
+	}
+	if gz.Name != "" || !gz.ModTime.IsZero() {
+		t.Fatalf("gzip header carries name %q and mtime %s, want neither", gz.Name, gz.ModTime)
+	}
+	dec := json.NewDecoder(gz)
+	for i, want := range samples {
+		var got model.Sample
+		if err := dec.Decode(&got); err != nil {
+			t.Fatalf("decode sample %d: %v", i, err)
+		}
+		if got.Metric != want.Metric || got.Value != want.Value || got.IntervalMS != want.IntervalMS ||
+			!got.Timestamp.Equal(want.Timestamp) || len(got.Labels) != len(want.Labels) {
+			t.Fatalf("sample %d = %+v, want %+v", i, got, want)
+		}
+	}
+	var extra model.Sample
+	if err := dec.Decode(&extra); !errors.Is(err, io.EOF) {
+		t.Fatalf("decode after the last sample = %v, want EOF", err)
+	}
+	_ = gz.Close()
 }

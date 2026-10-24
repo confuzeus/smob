@@ -52,7 +52,7 @@ func (a *app) runCollect(ctx context.Context, dryRun, once bool) error {
 		return err
 	}
 
-	st, err := newStore(a.cfg)
+	st, err := newStore(ctx, a.cfg)
 	if err != nil {
 		return err
 	}

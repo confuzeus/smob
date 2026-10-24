@@ -160,7 +160,7 @@ func validComponent(value string) bool {
 }
 
 func (a *app) runQuery(cmd *cobra.Command, q model.Query, format string) error {
-	st, err := newStore(a.cfg)
+	st, err := newStore(cmd.Context(), a.cfg)
 	if err != nil {
 		return err
 	}

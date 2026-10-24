@@ -10,9 +10,7 @@
 package disk
 
 import (
-	"compress/gzip"
 	"context"
-	"encoding/json"
 	"errors"
 	"fmt"
 	"io/fs"
@@ -22,6 +20,7 @@ import (
 
 	"github.com/confuzeus/smob/internal/model"
 	"github.com/confuzeus/smob/internal/store"
+	"github.com/confuzeus/smob/internal/store/chunk"
 )
 
 const (
@@ -47,15 +46,15 @@ func New(root string) (*Store, error) {
 
 // Write persists one completed chunk. Every filesystem failure is wrapped in
 // store.ErrPersistent so the CLI reports a persistent store failure.
-func (s *Store) Write(ctx context.Context, chunk store.Chunk) error {
+func (s *Store) Write(ctx context.Context, c store.Chunk) error {
 	if err := ctx.Err(); err != nil {
 		return err
 	}
-	key, err := chunkKey(chunk.Host, chunk.Scope, chunk.Start, chunk.End)
+	key, err := chunk.Key(c.Host, c.Scope, c.Start, c.End)
 	if err != nil {
 		return fmt.Errorf("write chunk: %w", err)
 	}
-	if err := s.write(key, chunk.Samples); err != nil {
+	if err := s.write(key, c.Samples); err != nil {
 		return fmt.Errorf("write %s: %w: %w", key, store.ErrPersistent, err)
 	}
 	return nil
@@ -120,7 +119,7 @@ func reserve(key string) (string, error) {
 	for i := 0; i <= maxCollisions; i++ {
 		candidate := key
 		if i > 0 {
-			candidate = collisionKey(key, i)
+			candidate = chunk.CollisionKey(key, i)
 		}
 		_, err := os.Lstat(candidate)
 		switch {
@@ -133,24 +132,14 @@ func reserve(key string) (string, error) {
 	return "", fmt.Errorf("no free name after %d collisions for %s", maxCollisions, key)
 }
 
-// writeSamples writes JSONL through gzip and fsyncs the result. Go's gzip
-// writer emits no filename or modification time, so identical samples produce
-// identical bytes.
+// writeSamples writes JSONL through gzip and fsyncs the result. The encoding is
+// shared with the S3 backend, so identical samples produce identical bytes.
 func writeSamples(path string, samples []model.Sample) error {
 	f, err := os.OpenFile(path, os.O_WRONLY|os.O_CREATE|os.O_TRUNC, filePerm)
 	if err != nil {
 		return err
 	}
-	gz := gzip.NewWriter(f)
-	enc := json.NewEncoder(gz)
-	for _, sample := range samples {
-		if err := enc.Encode(sample); err != nil {
-			_ = gz.Close()
-			_ = f.Close()
-			return err
-		}
-	}
-	if err := gz.Close(); err != nil {
+	if err := chunk.Encode(f, samples); err != nil {
 		_ = f.Close()
 		return err
 	}

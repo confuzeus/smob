@@ -11,12 +11,13 @@ import (
 	"io/fs"
 	"os"
 	"path/filepath"
-	"regexp"
 	"sort"
 	"strings"
 	"time"
 
 	"github.com/confuzeus/smob/internal/model"
+	"github.com/confuzeus/smob/internal/store"
+	"github.com/confuzeus/smob/internal/store/chunk"
 )
 
 // ctxCheckInterval bounds how long a large merge can run without observing
@@ -27,10 +28,7 @@ const ctxCheckInterval = 1024
 // order. It merges one UTC hour at a time, so memory and open file descriptors
 // stay proportional to the chunks in one hour rather than the whole range.
 func (s *Store) Query(ctx context.Context, q model.Query, yield func(model.Sample) error) error {
-	if q.Limit < 0 {
-		return errors.New("query: limit must not be negative")
-	}
-	matchers, err := compileMatchers(q.Labels)
+	filter, err := store.NewFilter(q)
 	if err != nil {
 		return err
 	}
@@ -53,7 +51,7 @@ func (s *Store) Query(ctx context.Context, q model.Query, yield func(model.Sampl
 		if q.Limit > 0 {
 			limit = q.Limit - emitted
 		}
-		n, err := merge(ctx, paths, q, matchers, limit, yield)
+		n, err := merge(ctx, paths, filter, limit, yield)
 		emitted += n
 		if err != nil {
 			return err
@@ -145,7 +143,7 @@ func (s *Store) walkHourGroups(ctx context.Context) ([]hourGroup, error) {
 		if err != nil {
 			return err
 		}
-		hour, ok := parseHourPath(rel)
+		hour, ok := chunk.ParseHourPath(rel)
 		if !ok {
 			return nil
 		}
@@ -178,7 +176,7 @@ func (s *Store) walkHourGroups(ctx context.Context) ([]hourGroup, error) {
 // single component; otherwise every directory under the root is a candidate.
 func (s *Store) hosts(host string) ([]string, error) {
 	if host != "" {
-		if err := validateComponent("host", host); err != nil {
+		if err := chunk.ValidateComponent("host", host); err != nil {
 			return nil, err
 		}
 		return []string{host}, nil
@@ -190,7 +188,7 @@ func (s *Store) hosts(host string) ([]string, error) {
 // validated so it cannot escape the root.
 func (s *Store) scopes(host, scope string) ([]string, error) {
 	if scope != "" {
-		if err := validateComponent("scope", scope); err != nil {
+		if err := chunk.ValidateComponent("scope", scope); err != nil {
 			return nil, err
 		}
 		return []string{scope}, nil
@@ -209,7 +207,7 @@ func readComponents(dir string) ([]string, error) {
 
 	names := make([]string, 0, len(entries))
 	for _, entry := range entries {
-		if entry.IsDir() && isComponent(entry.Name()) {
+		if entry.IsDir() && chunk.IsComponent(entry.Name()) {
 			names = append(names, entry.Name())
 		}
 	}
@@ -234,14 +232,14 @@ func listChunks(dirs []string, r model.TimeRange) ([]string, error) {
 				continue
 			}
 			name := entry.Name()
-			if !strings.HasSuffix(name, chunkFileSuffix) {
+			if !strings.HasSuffix(name, chunk.FileSuffix) {
 				continue
 			}
-			start, end, err := parseChunkName(name)
+			start, end, err := chunk.ParseName(name)
 			if err != nil {
 				return nil, fmt.Errorf("%s: %w", filepath.Join(dir, name), err)
 			}
-			if !overlaps(start, end, r) {
+			if !chunk.Overlaps(start, end, r) {
 				continue
 			}
 			paths = append(paths, filepath.Join(dir, name))
@@ -249,18 +247,6 @@ func listChunks(dirs []string, r model.TimeRange) ([]string, error) {
 	}
 	sort.Strings(paths)
 	return paths, nil
-}
-
-// overlaps reports whether the half-open chunk window intersects the query
-// range. A zero range boundary is unbounded.
-func overlaps(start, end time.Time, r model.TimeRange) bool {
-	if !r.Start.IsZero() && !end.After(r.Start) {
-		return false
-	}
-	if !r.End.IsZero() && !start.Before(r.End) {
-		return false
-	}
-	return true
 }
 
 // stream decodes one chunk file and holds its current sample.
@@ -335,7 +321,7 @@ func (h *streamHeap) Pop() any {
 
 // merge yields matching samples from the sorted chunk files. It stops after
 // limit samples when limit is positive.
-func merge(ctx context.Context, paths []string, q model.Query, matchers []compiledMatcher, limit int, yield func(model.Sample) error) (int, error) {
+func merge(ctx context.Context, paths []string, filter *store.Filter, limit int, yield func(model.Sample) error) (int, error) {
 	var opened []*stream
 	defer func() {
 		for _, st := range opened {
@@ -382,7 +368,7 @@ func merge(ctx context.Context, paths []string, q model.Query, matchers []compil
 
 		st := h.streams[0]
 		sample := st.cur
-		if matches(q, matchers, sample) {
+		if filter.Match(sample) {
 			if err := yield(sample); err != nil {
 				return emitted, err
 			}
@@ -404,68 +390,4 @@ func merge(ctx context.Context, paths []string, q model.Query, matchers []compil
 		heap.Fix(h, 0)
 	}
 	return emitted, nil
-}
-
-// compiledMatcher is a label matcher with its regular expression precompiled.
-type compiledMatcher struct {
-	name  string
-	op    model.LabelOp
-	value string
-	re    *regexp.Regexp
-}
-
-func compileMatchers(labels []model.LabelMatcher) ([]compiledMatcher, error) {
-	matchers := make([]compiledMatcher, 0, len(labels))
-	for _, label := range labels {
-		if label.Name == "" {
-			return nil, errors.New("query: label matcher has an empty name")
-		}
-
-		matcher := compiledMatcher{name: label.Name, op: label.Op, value: label.Value}
-		switch label.Op {
-		case model.LabelEqual:
-		case model.LabelRegex:
-			re, err := regexp.Compile(label.Value)
-			if err != nil {
-				return nil, fmt.Errorf("query: label %s: %w", label.Name, err)
-			}
-			matcher.re = re
-		default:
-			return nil, fmt.Errorf("query: label %s: unknown matcher operation %d", label.Name, label.Op)
-		}
-		matchers = append(matchers, matcher)
-	}
-	return matchers, nil
-}
-
-// matches applies the range, metric, and label filters to one sample. A missing
-// label reads as the empty string, so an exact empty match and a regex such as
-// .* both match an absent label.
-func matches(q model.Query, matchers []compiledMatcher, sample model.Sample) bool {
-	if !q.Range.Contains(sample.Timestamp) {
-		return false
-	}
-	if q.Host != "" && sample.Labels["host"] != q.Host {
-		return false
-	}
-	if q.Scope != "" && sample.Labels["scope"] != q.Scope {
-		return false
-	}
-	if q.Metric != "" && sample.Metric != q.Metric {
-		return false
-	}
-	for _, matcher := range matchers {
-		value := sample.Labels[matcher.name]
-		switch matcher.op {
-		case model.LabelEqual:
-			if value != matcher.value {
-				return false
-			}
-		case model.LabelRegex:
-			if !matcher.re.MatchString(value) {
-				return false
-			}
-		}
-	}
-	return true
 }

@@ -311,28 +311,6 @@ storage:
 	}
 }
 
-func TestS3BackendUnavailable(t *testing.T) {
-	ctx, cancel := context.WithTimeout(context.Background(), time.Minute)
-	defer cancel()
-
-	dataDir := filepath.Join(t.TempDir(), "data")
-	path := writeConfig(t, fmt.Sprintf(`data_dir: %s
-storage:
-  primary: s3
-  s3:
-    bucket: bucket
-    endpoint: http://127.0.0.1:9000
-`, dataDir))
-
-	res := runSmob(t, ctx, "collect", "--dry-run", "--config", path)
-	if res.ExitCode != 1 {
-		t.Fatalf("exit = %d, want 1\nstdout:\n%s\nstderr:\n%s", res.ExitCode, res.Stdout, res.Stderr)
-	}
-	if !strings.Contains(res.Stderr, "not supported in this build") {
-		t.Errorf("stderr does not explain that S3 is unavailable:\n%s", res.Stderr)
-	}
-}
-
 func TestConfigDefaults(t *testing.T) {
 	ctx, cancel := context.WithTimeout(context.Background(), time.Minute)
 	defer cancel()

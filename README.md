@@ -13,10 +13,11 @@ libraries. Disk and S3 use one time-aligned chunk format, so the backends are
 interchangeable and existing data can be copied between them with
 `aws s3 sync`.
 
-> **Project status:** smob is v0.1. System and process metrics, the disk
-> backend, `collect`, and `query` are implemented. `stats` and `tail` remain
-> stubs, and S3, Docker, retention, and aggregation are planned for v0.2. The
-> command and metric reference below describes the v0.1 contract. See the
+> **Project status:** smob is v0.1. System and process metrics, the disk and S3
+> backends, `collect`, and `query` are implemented. S3 retry, spooling, and IAM
+> guidance are still pending, as are Docker, retention, and aggregation. `stats`
+> and `tail` remain stubs. The command and metric reference below describes the
+> v0.1 contract. See the
 > [design and implementation plan](docs/IMPLEMENTATION.md) for the roadmap.
 
 ## Features
@@ -169,8 +170,8 @@ Commands:
   chunk per scope, and exits. This is intended for testing and automation.
 - `--data-dir DIR` overrides `data_dir` from the configuration.
 
-The collector runs until interrupted. A store failure after retries stops
-collection rather than silently dropping data.
+The collector runs until interrupted. A store failure stops collection rather
+than silently dropping data.
 
 ### `query`
 

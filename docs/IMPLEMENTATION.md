@@ -85,11 +85,11 @@ Key layout:
 - Times in the path are UTC; file names use `YYYYMMDDTHHMMSSZ`.
 - Example: `web-1/system/2026/10/23/16/20261023T160000Z-20261023T160500Z.jsonl.gz`.
 - If a window is written twice (clock step or restart), the writer appends `-1`, `-2`, … before the extension instead of overwriting, producing `20261023T160000Z-20261023T160500Z-1.jsonl.gz`.
-- Samples are sorted by timestamp, then metric, then canonical label order, so identical inputs produce identical chunk contents regardless of backend. Map keys are sorted by `encoding/json`; gzip headers carry no file name or modification time.
+- Samples are sorted by timestamp, then metric, then canonical label order, so identical inputs produce identical chunk contents regardless of backend. Map keys are sorted by `encoding/json`; gzip headers carry no file name or modification time. Key derivation and encoding live in `internal/store/chunk` and are shared by both backends.
 
 Write semantics:
 
-- A completed chunk is immutable. On disk it is written to `<key>.tmp`, fsynced, and renamed into place; on S3 it is a single `PUT` to the final key.
+- A completed chunk is immutable. On disk it is written to `<key>.tmp`, fsynced, and renamed into place. On S3 it is one conditional `PUT` (`If-None-Match: *`) to the final key; a `412` or `409` means that window already exists, so the writer retries the same body under the next `-1`, `-2`, … suffix. This matches the disk collision guard on endpoints that implement conditional writes (AWS S3 and current MinIO); a service that ignores the condition can still overwrite.
 - A crash loses the chunk currently being assembled, at most `storage.chunk_interval`.
 - `SIGINT`/`SIGTERM` closes the active chunk with its actual end time, writes it once, and exits 0. A second signal exits 1 without waiting.
 - No per-chunk index is written in v0.1 or v0.2. Queries prune by host, scope, and hour, then scan the chunks in the range. A sidecar index (min/max timestamp, metric set, counts) is a v0.3 optimization if real query latency demands it; adding it later does not change the chunk format.
@@ -293,6 +293,7 @@ internal/source/system/        # /proc/stat, meminfo, net/dev
 internal/source/process/       # /proc/[pid]/...
 internal/source/docker/        # Docker Engine client wrapper
 internal/store/                # Store interface, Chunk, factory
+internal/store/chunk/          # shared chunk keys and deterministic JSONL-gzip encoding
 internal/store/disk/           # local fs implementation
 internal/store/s3/             # S3 implementation + spool replay
 internal/query/                # filtering, aggregation, formatting
@@ -364,10 +365,15 @@ Dockerfile                     # FROM scratch, static binary, CA bundle
 ### Phase 3 — S3 Backend (v0.2)
 
 - [x] Add `aws-sdk-go-v2`; config endpoint, region, bucket, prefix, `path_style`, `spool_dir`, `spool_max_bytes`; standard credential chain.
-- [ ] Implement the S3 store with the same chunk keys and a single `PUT` per chunk.
+- [x] Implement the S3 store with the same chunk keys and a single `PUT` per chunk.
 - [ ] Implement retry with exponential backoff and jitter.
 - [ ] Implement the local spool and background replay; cap the spool; merge spooled chunks in queries.
 - [ ] Implement `LIST` prefix pruning and concurrent `GET` with a bounded worker pool.
+
+  The S3 store already lists only the hour prefixes implied by a bounded range
+  and discovers hosts and scopes with delimiter listings; downloads and merges
+  are still sequential. This item remains open for wider pruning and the
+  bounded concurrent worker pool.
 - [ ] Verify disk/S3 equivalent samples for identical input, not byte-identical gzip.
 - [ ] Add MinIO to CI; test network interruption and spool drain.
 - [ ] Document IAM permissions and MinIO path-style configuration.

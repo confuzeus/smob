@@ -20,7 +20,7 @@ import (
 
 // NewClient returns an S3 client for cfg. The configuration must already be
 // resolved with config.Config.Resolve. NewClient does not contact the endpoint;
-// the store's startup check validates the bucket once the store is implemented.
+// Store.Check validates the bucket at startup.
 func NewClient(ctx context.Context, cfg config.S3Storage) (*awss3.Client, error) {
 	if strings.TrimSpace(cfg.Bucket) == "" {
 		return nil, errors.New("s3: bucket must not be empty")
