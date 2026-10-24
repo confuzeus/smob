@@ -1,0 +1,76 @@
+[Unit]
+Description=smob metrics collector
+Documentation=https://github.com/confuzeus/smob/blob/master/docs/configuration.md
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+ExecStart=/usr/local/bin/smob collect --config /etc/smob/smob.yaml
+Restart=on-failure
+RestartSec=5s
+
+# The first SIGTERM flushes the active chunk and exits 0; the second exits 1
+# without waiting. Give a final S3 upload time to finish.
+KillSignal=SIGTERM
+TimeoutStopSec=30s
+
+# Log to the journal. smob writes structured logs to stderr.
+StandardOutput=journal
+StandardError=journal
+SyslogIdentifier=smob
+
+# systemd reads this file as root before dropping privileges, so 0600 root:root
+# is enough and is the safest mode. For the static User=smob alternative below,
+# 0640 root:smob is also fine; the service manager still reads it as root. The
+# file is intended for AWS credentials or AWS_EC2_METADATA_DISABLED. An
+# instance, task, or service-account role avoids this file and is preferred. Do
+# not store credentials in smob.yaml.
+EnvironmentFile=-/etc/smob/smob.env
+
+# DynamicUser gives smob a transient UID/GID, and StateDirectory=smob creates
+# /var/lib/smob (the default data_dir) writable by that user. Use an absolute
+# data_dir in the service configuration; the unit runs with / as its working
+# directory. For a non-default data_dir, give the directory to the service user
+# and add ReadWritePaths=. Under /home, also relax ProtectHome=.
+DynamicUser=yes
+StateDirectory=smob
+StateDirectoryMode=0750
+
+# Hardening appropriate for reading procfs and writing data_dir. Do not add
+# ProtectProc=invisible: it would hide other users' processes and break the
+# process source.
+NoNewPrivileges=yes
+ProtectSystem=strict
+ProtectHome=yes
+PrivateTmp=yes
+PrivateDevices=yes
+ProtectKernelTunables=yes
+ProtectKernelModules=yes
+ProtectKernelLogs=yes
+ProtectControlGroups=yes
+ProtectClock=yes
+RestrictAddressFamilies=AF_UNIX AF_INET AF_INET6
+RestrictNamespaces=yes
+RestrictRealtime=yes
+RestrictSUIDSGID=yes
+LockPersonality=yes
+RemoveIPC=yes
+CapabilityBoundingSet=
+
+# Optional Docker container metrics. Enable sources.docker in smob.yaml, then
+# uncomment this when the host's docker group may access the socket. The group
+# must exist on the host (normally "docker"); the socket is root-equivalent, so
+# grant it only when container metrics are intended.
+#SupplementaryGroups=docker
+
+# A static service account is the alternative to DynamicUser. Create the user
+# and directory first, then replace DynamicUser=yes with:
+#User=smob
+#Group=smob
+#StateDirectory=smob
+# For a data_dir that is not /var/lib/smob, add:
+#ReadWritePaths=/path/to/data
+
+[Install]
+WantedBy=multi-user.target

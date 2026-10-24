@@ -14,12 +14,15 @@ interchangeable and existing data can be copied between them with
 `aws s3 sync`.
 
 > **Project status:** System, process, and Docker container metrics, the disk
-> and S3 backends (including local spool replay), `collect`, `query`, and
-> `stats` are implemented. The Docker source is disabled by default and is
-> enabled with `sources.docker.enabled: true`. S3 IAM and MinIO deployment
-> guidance is in [docs/s3.md](docs/s3.md). Disk retention is implemented;
-> aggregation is implemented and `tail` remains planned. The command and metric
-> reference below describes the current contract. See the [design and
+> and S3 backends (including local spool replay), `collect`, `query`, `stats`,
+> disk retention, and aggregation are implemented. The Docker source is
+> disabled by default and is enabled with `sources.docker.enabled: true`.
+> Operator documentation — the [quickstart](docs/quickstart.md), [configuration
+> reference](docs/configuration.md), [S3/MinIO guide](docs/s3.md), [container
+> deployment guide](docs/docker.md), systemd unit, and Compose file — is
+> implemented alongside the code. `tail` remains planned, along with the v0.3
+> live-tail, chunk-index, and multi-host aggregation work. The command and
+> metric reference below describes the current contract. See the [design and
 > implementation plan](docs/IMPLEMENTATION.md) for the roadmap.
 
 ## Features
@@ -69,44 +72,20 @@ Cross-compiled release binaries can be produced with `just release`. A minimal
 container image (`FROM scratch`, non-root user, CA bundle) can be built with
 `just docker`.
 
-## Quick start
+## Documentation
 
-Create a minimal configuration file, for example `smob.yaml`:
+| Guide | Contents |
+| --- | --- |
+| [Quickstart](docs/quickstart.md) | Build, minimal config, first `collect --once`/`query`, daemon, service. |
+| [Configuration reference](docs/configuration.md) | Every field with type, default, validation rule, and effect. |
+| [S3 and MinIO](docs/s3.md) | IAM policy, credential chain, MinIO recipe, spool behavior. |
+| [Running in Docker](docs/docker.md) | Host procfs, PID/network namespaces, socket permissions, data ownership. |
+| [systemd unit](contrib/systemd/smob.service) | Hardened service with `SIGTERM` flush and journal logging. |
+| [Compose file](compose.yaml) | Host `/proc`, data volume, host networking, optional Docker socket. |
+| [Design and implementation plan](docs/IMPLEMENTATION.md) | Architecture, storage internals, phases, TODOs. |
 
-```yaml
-data_dir: ./data
-log_level: info
-sources:
-  system:
-    enabled: true
-storage:
-  primary: disk
-```
-
-Validate it and inspect the effective configuration:
-
-```sh
-./smob config --config ./smob.yaml --validate
-./smob config --config ./smob.yaml
-```
-
-The workflow is:
-
-```sh
-# Run the collector in the foreground.
-./smob collect --config ./smob.yaml
-
-# In another shell, query the last hour of samples.
-./smob query --config ./smob.yaml --since 1h
-
-# Query a specific metric and label.
-./smob query --config ./smob.yaml --since 24h \
-  --metric process.cpu.percent --label 'comm~nginx|postgres'
-```
-
-By default the configuration is read from `/etc/smob/smob.yaml`; use
-`--config` to point at another file. Query commands read the same backend the
-collector writes to.
+The default configuration path is `/etc/smob/smob.yaml`; use `--config` to point
+at another file. Query commands read the same backend the collector writes to.
 
 ## Metrics reference
 
@@ -191,6 +170,7 @@ than silently dropping data.
 
 Deploying smob itself in a container — host `/proc`, PID and network namespace
 choices, and the data volume — is covered in [docs/docker.md](docs/docker.md).
+The repository's [compose.yaml](compose.yaml) is the executable Compose example.
 
 Container collection is disabled by default. Enable it when the daemon is
 available:
@@ -199,24 +179,15 @@ available:
 sources:
   docker:
     enabled: true
-    socket: /var/run/docker.sock
-    interval: 10s
-    rescan_interval: 30s
-    exclude: ""
-    stream_stats: false
 ```
+
+Every Docker field, its default, and its validation rule are in
+[docs/configuration.md#docker-source](docs/configuration.md#docker-source).
 
 `collect` connects to and probes the socket at startup. If the source is
 enabled and the socket is missing or unreachable, collection fails with exit
 code 1 before any sample is written. A host without Docker keeps the source
 disabled (the default) and is unaffected.
-
-| Field | Default | Meaning |
-| --- | --- | --- |
-| `interval` | `10s` | One-shot polling cadence, and the cadence at which streamed observations are drained. Any positive duration is accepted, including sub-second values as for the other sources; very small values increase daemon load. |
-| `rescan_interval` | `30s` | How often the running container set is enumerated. It is independent of `interval`: a shorter value just refreshes the set more often. New containers start contributing without restarting smob, and containers that stop disappear from subsequent samples. |
-| `exclude` | empty | An unanchored Go regular expression matched against the container **name** with Docker's leading slash removed. It never matches container IDs. An empty value excludes nothing; anchor with `^` and `$` for an exact name. For example, `exclude: "^smob-.*$"` drops containers whose names start with `smob-`. |
-| `stream_stats` | `false` | Keep one persistent stats stream per container for resolution at the daemon's stream cadence (typically about one second) instead of one-shot polling. This costs a persistent stream and dedicated goroutines per container, so it is opt-in. |
 
 `collect --once` always takes one-shot stats because a single snapshot has no
 stream history; when `stream_stats` is enabled, `--once` logs that it used
@@ -333,7 +304,9 @@ aggregation.
 ## Storage
 
 Set `storage.primary` to `disk` or `s3`. Exactly one backend is active; there is
-no mirroring or dual-write.
+no mirroring or dual-write. The field-by-field reference, including the S3 and
+retention defaults, is in
+[docs/configuration.md#storage](docs/configuration.md#storage).
 
 - **Disk** writes under `data_dir` and is the default. A retention sweep runs
   at startup and then hourly. It deletes closed chunks older than

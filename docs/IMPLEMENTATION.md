@@ -318,7 +318,11 @@ internal/cli/                  # shared CLI helpers (output, exit codes)
 test/integration/              # black-box CLI tests
 test/integration/testdata/     # fixtures and golden files
 docs/IMPLEMENTATION.md         # design, storage internals, phases, TODO
-docs/                          # user guides (quickstart, config reference, systemd, compose)
+docs/quickstart.md             # operator quickstart
+docs/configuration.md          # canonical YAML field reference
+docs/s3.md, docs/docker.md     # S3/MinIO and container deployment guides
+contrib/systemd/smob.service   # systemd unit
+compose.yaml                   # Docker Compose deployment
 Dockerfile                     # FROM scratch, static binary, CA bundle
 ```
 
@@ -408,7 +412,7 @@ Dockerfile                     # FROM scratch, static binary, CA bundle
 - [x] Implement the disk retention sweeper (age and size), closed chunks only, tolerant of reader races.
 - [x] Implement `smob stats`.
 - [x] Add `--agg` and `--group-by`, weighting rates by `interval_ms`.
-- [ ] Write the quickstart, config reference, systemd unit, compose file, and IAM policy.
+- [x] Write the quickstart, config reference, systemd unit, compose file, and IAM policy.
 - [ ] Write the disk → S3 migration note using `aws s3 sync`.
 - [ ] Add `--version` and `--help` snapshot tests.
 - [ ] Run the extended suite in CI with MinIO and Docker; keep strict mode.

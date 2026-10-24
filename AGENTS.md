@@ -8,7 +8,9 @@ apply across the codebase.
 
 | Read | For |
 | --- | --- |
-| [README.md](README.md) | User-facing contract: features, quick start, metric catalogue, CLI reference, and storage behavior. |
+| [README.md](README.md) | User-facing contract: features, metric catalogue, CLI reference, storage behavior, and the documentation index. |
+| [docs/quickstart.md](docs/quickstart.md) | Operator entry point: build, first collection, daemon and service deployment. |
+| [docs/configuration.md](docs/configuration.md) | Canonical YAML field reference: type, default, validation, and effect. |
 | [docs/IMPLEMENTATION.md](docs/IMPLEMENTATION.md) | Internal design: principles, sample schema, chunk/storage layout, delivery phases, risks, testing strategy, repository layout, and TODO list. |
 | [.agents/skills/go-best-practices/SKILL.md](.agents/skills/go-best-practices/SKILL.md) | Go conventions, dependency policy, error handling, concurrency, and the definition of done. |
 | [.agents/skills/integration-testing/SKILL.md](.agents/skills/integration-testing/SKILL.md) | Test contract, harness rules, and what may be tested as a pure function. |
@@ -21,11 +23,13 @@ change affects both.
 ## Project status
 
 System, process, and Docker container metrics, the disk and S3 backends
-(including spool replay), `collect`, and `query` are implemented. The Docker
-source is registered with the collector but disabled by default; enabling it
-fails startup when the socket is unreachable. `stats` and `tail` remain stubs,
-and retention and aggregation remain in Phase 5. The README describes the
-user-facing contract.
+(including spool replay), `collect`, `query`, `stats`, disk retention,
+aggregation, and the operator documentation are implemented. The Docker source
+is registered with the collector but disabled by default; enabling it fails
+startup when the socket is unreachable. `tail` remains a stub; live tail, chunk
+indexing, and multi-host aggregation are v0.3 items. The README describes the
+user-facing contract, and `docs/quickstart.md` and `docs/configuration.md` are
+the operator entry points.
 
 ## Commands
 
@@ -53,14 +57,16 @@ only.
 | `cmd/smob/` | Cobra root and subcommand wiring. |
 | `internal/model/` | Samples, queries, label matchers, and time ranges. |
 | `internal/config/` | Strict YAML configuration and validation. |
-| `internal/store/` | `Store`/`Chunk` contract and backend factory. |
-| `internal/source/` | System, process, and Docker metric sources (planned). |
-| `internal/collector/` | Scheduler and chunk assembler (planned). |
-| `internal/query/` | Filtering, aggregation, and output formatting (planned). |
+| `internal/store/` | `Store`/`Chunk` contract, chunk encoding, and disk/S3 backends. |
+| `internal/source/` | System, process, and Docker metric sources. |
+| `internal/collector/` | Scheduler and chunk assembler. |
+| `internal/query/` | Filtering, aggregation, and output formatting. |
 | `test/integration/` | Black-box CLI tests against real dependencies. |
-| `docs/` | Contributor design docs and future user guides. |
+| `docs/` | Design docs and operator guides (quickstart, configuration, S3, Docker). |
+| `compose.yaml` | Docker Compose deployment example. |
+| `contrib/systemd/smob.service` | systemd unit for a host install. |
 
-See `docs/IMPLEMENTATION.md` for the full planned layout.
+See `docs/IMPLEMENTATION.md` for the full repository layout.
 
 ## Working rules
 

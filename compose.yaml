@@ -1,0 +1,51 @@
+# smob collector for one Linux host.
+#
+# Field reference: docs/configuration.md. Deployment details, including host
+# procfs, namespaces, socket permissions, and data ownership: docs/docker.md.
+#
+# The example config in docs/docker.md uses:
+#   data_dir: /data
+#   proc_path: /host/proc
+# Do not reuse the quickstart's local config unchanged: its proc_path defaults
+# to /proc and its data_dir to ./data, which would collect the container's PID
+# and network namespaces and write outside the mounted volume.
+#
+#   docker compose up -d
+#
+# Build the image first with: VERSION=local just docker
+#
+# The image runs as UID 65532. The default named volume must be initialized
+# once, or set SMOB_DATA to a host directory owned by that UID. See
+# docs/docker.md#data-directory-ownership.
+
+services:
+  smob:
+    image: ${SMOB_IMAGE:-smob:local}
+    restart: unless-stopped
+    stop_grace_period: 30s
+    security_opt:
+      - no-new-privileges:true
+
+    # Host networking makes system.network.* describe the host interfaces.
+    # Remove it to keep the container network isolated; network metrics then
+    # describe the container namespace. See docs/docker.md.
+    network_mode: host
+
+    volumes:
+      - ${SMOB_DATA:-smob-data}:/data
+      - ${SMOB_CONFIG:-./smob.yaml}:/etc/smob/smob.yaml:ro
+      # The host procfs plus proc_path: /host/proc exposes host processes
+      # without sharing the PID namespace. Do not add pid: host.
+      - /proc:/host/proc:ro
+      # Optional container metrics. Enable sources.docker in smob.yaml, then
+      # uncomment this mount and group_add below. The Docker socket is
+      # root-equivalent; mount it only when container metrics are intended.
+      # - /var/run/docker.sock:/var/run/docker.sock:ro
+
+    # Pass the socket's numeric GID, not a group name (the scratch image has
+    # no /etc/group). Uncomment after mounting the socket:
+    # group_add:
+    #   - "${DOCKER_SOCKET_GID}"
+
+volumes:
+  smob-data:

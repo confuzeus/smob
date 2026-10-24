@@ -10,8 +10,10 @@ Socket permissions, `--group-add`, and data-directory ownership are covered in
 [Socket permissions and data ownership](#socket-permissions-and-data-ownership)
 below.
 
-The metric catalogue is in the [README](../README.md#metrics-reference), and
-S3/MinIO deployment is covered in [s3.md](s3.md).
+The metric catalogue is in the [README](../README.md#metrics-reference),
+S3/MinIO deployment is covered in [s3.md](s3.md), the first-run walkthrough is
+in [quickstart.md](quickstart.md), and the full field reference is in
+[configuration.md](configuration.md).
 
 ## What a container's `/proc` shows
 
@@ -45,7 +47,7 @@ Bind-mount the host procfs read-only and point `proc_path` at it:
 -v /proc:/host/proc:ro
 ```
 
-A minimal configuration:
+A minimal configuration for the container:
 
 ```yaml
 data_dir: /data
@@ -61,6 +63,12 @@ sources:
 storage:
   primary: disk
 ```
+
+This is deliberately not the quickstart's local configuration. The local file
+uses the default `proc_path: /proc` and `data_dir: ./data`; copying it here
+would collect the container's PID and network namespaces and write to the wrong
+path. The container configuration above sets `proc_path: /host/proc` and
+`data_dir: /data` to match the mounts.
 
 Set `host` explicitly. It defaults to `os.Hostname()`, which inside a container
 is the container hostname — the short container ID unless `--hostname` is set —
@@ -230,23 +238,9 @@ your primary group, not the socket's group, so use `stat` on the socket path.
 If `sources.docker.socket` points somewhere other than `/var/run/docker.sock`,
 stat that path and mount it at the same path.
 
-Compose takes the same value as a list:
-
-```yaml
-services:
-  smob:
-    image: smob:local
-    group_add:
-      - "${DOCKER_SOCKET_GID}"
-    volumes:
-      - /proc:/host/proc:ro
-      - /var/run/docker.sock:/var/run/docker.sock:ro
-      - smob-data:/data
-      - ./smob.yaml:/etc/smob/smob.yaml:ro
-
-volumes:
-  smob-data:
-```
+The repository's [compose.yaml](../compose.yaml) has the socket mount and
+`group_add` entries commented out. Enable `sources.docker` in `smob.yaml`,
+uncomment both lines, then pass the socket's numeric GID:
 
 ```sh
 DOCKER_SOCKET_GID="$(stat -c '%g' /var/run/docker.sock)" docker compose up -d
@@ -304,6 +298,11 @@ group-writable: owner `65532` with mode `0755` is enough. Docker creates a fresh
 named volume from the image's path when that path exists, but a `scratch` image
 has no `/data`, so a new volume starts as `root:root` and needs this
 initialization once. New files are then created as `65532:65532`.
+
+For the repository [compose.yaml](../compose.yaml), the default volume is
+project-scoped (`smob_smob-data` when the project is `smob`). `docker compose
+config` prints the actual name; initialize that name once, or set `SMOB_DATA`
+to a prepared host directory.
 
 When the directory is not writable, `collect` probes the store before writing
 any sample and exits with code **3**:
