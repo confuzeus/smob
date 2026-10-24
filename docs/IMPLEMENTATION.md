@@ -363,7 +363,7 @@ Dockerfile                     # FROM scratch, static binary, CA bundle
 
 ### Phase 3 — S3 Backend (v0.2)
 
-- [ ] Add `aws-sdk-go-v2`; config endpoint, region, bucket, prefix, `path_style`, `spool_dir`, `spool_max_bytes`; standard credential chain.
+- [x] Add `aws-sdk-go-v2`; config endpoint, region, bucket, prefix, `path_style`, `spool_dir`, `spool_max_bytes`; standard credential chain.
 - [ ] Implement the S3 store with the same chunk keys and a single `PUT` per chunk.
 - [ ] Implement retry with exponential backoff and jitter.
 - [ ] Implement the local spool and background replay; cap the spool; merge spooled chunks in queries.

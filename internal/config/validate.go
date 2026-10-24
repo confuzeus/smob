@@ -3,6 +3,7 @@ package config
 import (
 	"errors"
 	"fmt"
+	"net/url"
 	"regexp"
 	"strings"
 	"time"
@@ -54,10 +55,14 @@ func (c Config) Validate() error {
 		if c.Storage.S3.Region == "" && c.Storage.S3.Endpoint == "" {
 			errs = append(errs, errors.New("storage.s3.region: required unless storage.s3.endpoint is set"))
 		}
+		if c.Storage.S3.Endpoint != "" {
+			if err := validS3Endpoint(c.Storage.S3.Endpoint); err != nil {
+				errs = append(errs, fmt.Errorf("storage.s3.endpoint: %w", err))
+			}
+		}
 		if c.Storage.S3.SpoolDir == "" && c.DataDir == "" {
 			errs = append(errs, errors.New("storage.s3.spool_dir: required when data_dir is empty"))
 		}
-		errs = append(errs, errors.New("storage.s3: not implemented in this build"))
 	default:
 		errs = append(errs, fmt.Errorf("storage.primary: must be disk or s3; got %q", c.Storage.Primary))
 	}
@@ -116,4 +121,20 @@ func (c Config) Validate() error {
 // component in the chunk key layout.
 func validHost(host string) bool {
 	return host != "." && host != ".." && !strings.ContainsRune(host, '/')
+}
+
+// validS3Endpoint requires an absolute http or https URL for a custom S3
+// endpoint.
+func validS3Endpoint(endpoint string) error {
+	u, err := url.Parse(endpoint)
+	if err != nil {
+		return err
+	}
+	if u.Scheme != "http" && u.Scheme != "https" {
+		return fmt.Errorf("must be an http or https URL; got %q", endpoint)
+	}
+	if u.Host == "" {
+		return fmt.Errorf("must include a host; got %q", endpoint)
+	}
+	return nil
 }

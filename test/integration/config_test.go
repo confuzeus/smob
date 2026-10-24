@@ -100,7 +100,6 @@ func TestConfigValidate(t *testing.T) {
 			wants: []string{
 				"storage.s3.bucket",
 				"storage.s3.region",
-				"storage.s3: not implemented in this build",
 			},
 		},
 		{
@@ -110,11 +109,21 @@ func TestConfigValidate(t *testing.T) {
 			wants: []string{"storage.s3.spool_dir"},
 		},
 		{
+			name: "s3 with region",
+			body: base + "storage:\n  primary: s3\n  s3:\n    bucket: bucket\n    region: us-east-1\n",
+			exit: 0,
+		},
+		{
 			name:     "s3 endpoint replaces region",
 			body:     base + "storage:\n  primary: s3\n  s3:\n    bucket: bucket\n    endpoint: http://127.0.0.1:9000\n",
-			exit:     2,
-			wants:    []string{"storage.s3: not implemented in this build"},
+			exit:     0,
 			wantsNot: []string{"storage.s3.region"},
+		},
+		{
+			name:  "s3 endpoint is not a URL",
+			body:  base + "storage:\n  primary: s3\n  s3:\n    bucket: bucket\n    endpoint: 127.0.0.1:9000\n",
+			exit:  2,
+			wants: []string{"storage.s3.endpoint"},
 		},
 		{
 			name:  "zero spool size",
@@ -233,6 +242,94 @@ func TestConfigDump(t *testing.T) {
 	validated := runSmob(t, ctx, "config", "--validate", "--config", roundTrip)
 	if validated.ExitCode != 0 {
 		t.Fatalf("round-tripped dump does not validate: exit %d\nstderr:\n%s", validated.ExitCode, validated.Stderr)
+	}
+}
+
+func TestConfigS3Resolution(t *testing.T) {
+	ctx, cancel := context.WithTimeout(context.Background(), time.Minute)
+	defer cancel()
+
+	dataDir := filepath.Join(t.TempDir(), "data")
+	cases := []struct {
+		name  string
+		body  string
+		wants []string
+	}{
+		{
+			name: "endpoint defaults",
+			body: fmt.Sprintf(`data_dir: %s
+storage:
+  primary: s3
+  s3:
+    bucket: bucket
+    endpoint: http://127.0.0.1:9000
+`, dataDir),
+			wants: []string{
+				"region: us-east-1",
+				"path_style: true",
+				"spool_dir: " + filepath.Join(dataDir, "spool"),
+			},
+		},
+		{
+			name: "explicit values are preserved",
+			body: fmt.Sprintf(`data_dir: %s
+storage:
+  primary: s3
+  s3:
+    bucket: bucket
+    region: eu-west-1
+    endpoint: http://127.0.0.1:9000
+    path_style: false
+`, dataDir),
+			wants: []string{
+				"region: eu-west-1",
+				"path_style: false",
+				"spool_dir: " + filepath.Join(dataDir, "spool"),
+			},
+		},
+	}
+
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			path := writeConfig(t, tc.body)
+			res := runSmob(t, ctx, "config", "--config", path)
+			if res.ExitCode != 0 {
+				t.Fatalf("exit = %d\nstderr:\n%s", res.ExitCode, res.Stderr)
+			}
+			for _, want := range tc.wants {
+				if !hasLine(res.Stdout, want) {
+					t.Errorf("config dump is missing %q\noutput:\n%s", want, res.Stdout)
+				}
+			}
+
+			roundTrip := writeConfig(t, res.Stdout)
+			validated := runSmob(t, ctx, "config", "--validate", "--config", roundTrip)
+			if validated.ExitCode != 0 {
+				t.Fatalf("round-tripped dump does not validate: exit %d\nstderr:\n%s", validated.ExitCode, validated.Stderr)
+			}
+		})
+	}
+}
+
+func TestS3BackendUnavailable(t *testing.T) {
+	ctx, cancel := context.WithTimeout(context.Background(), time.Minute)
+	defer cancel()
+
+	dataDir := filepath.Join(t.TempDir(), "data")
+	path := writeConfig(t, fmt.Sprintf(`data_dir: %s
+storage:
+  primary: s3
+  s3:
+    bucket: bucket
+    endpoint: http://127.0.0.1:9000
+`, dataDir))
+
+	res := runSmob(t, ctx, "collect", "--dry-run", "--config", path)
+	if res.ExitCode != 1 {
+		t.Fatalf("exit = %d, want 1\nstdout:\n%s\nstderr:\n%s", res.ExitCode, res.Stdout, res.Stderr)
+	}
+	if !strings.Contains(res.Stderr, "not supported in this build") {
+		t.Errorf("stderr does not explain that S3 is unavailable:\n%s", res.Stderr)
 	}
 }
 

@@ -74,6 +74,7 @@ func (a *app) load(cmd *cobra.Command) error {
 	if cmd.Flags().Changed("data-dir") {
 		cfg.DataDir = a.dataDir
 	}
+	cfg.Resolve()
 	if err := cfg.Validate(); err != nil {
 		return cli.UsageErrorf("%v", err)
 	}
