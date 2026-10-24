@@ -23,7 +23,7 @@ const (
 	streamRetryMax  = 30 * time.Second
 )
 
-// Options configures a Supervisor.
+// Options configures a Docker source and the Supervisor it owns.
 type Options struct {
 	// Socket is the Docker Engine Unix socket path.
 	Socket string
@@ -35,6 +35,8 @@ type Options struct {
 	// StreamStats opens one reconnecting stats stream per container instead of
 	// leaving stats acquisition to one-shot polling.
 	StreamStats bool
+	// Interval is the collector cadence used by New. NewSupervisor ignores it.
+	Interval time.Duration
 }
 
 // Supervisor owns the Docker client, the running container set, and in stream

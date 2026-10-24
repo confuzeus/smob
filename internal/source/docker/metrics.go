@@ -8,6 +8,8 @@ import (
 )
 
 const (
+	metricContainerCPUPercent              = "container.cpu.percent"
+	metricContainerMemoryUsedBytes         = "container.memory.used_bytes"
 	metricContainerNetworkRXBytesPerSecond = "container.network.rx_bytes_per_second"
 	metricContainerNetworkTXBytesPerSecond = "container.network.tx_bytes_per_second"
 
