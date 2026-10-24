@@ -145,6 +145,9 @@ Global flags:
 | `--log-level LEVEL` | Override the configured level: `debug`, `info`, `warn`, `error`. |
 | `--log-format FORMAT` | Override the configured format: `text` or `json`. |
 
+`smob --version` prints the same line as `smob version` and exits 0 without
+reading the configuration.
+
 Commands:
 
 | Command | Purpose |

@@ -14,13 +14,22 @@ func TestVersion(t *testing.T) {
 	ctx, cancel := context.WithTimeout(context.Background(), time.Minute)
 	defer cancel()
 
-	res := runSmob(t, ctx, "version")
-	if res.ExitCode != 0 {
-		t.Fatalf("exit = %d\nstderr:\n%s", res.ExitCode, res.Stderr)
-	}
-	const want = "smob test-version (commit test-commit, built test-date)\n"
-	if res.Stdout != want {
-		t.Fatalf("stdout = %q, want %q", res.Stdout, want)
+	// TestMain injects fixed ldflags, so this golden never depends on the
+	// developer's git state.
+	for _, tc := range []struct {
+		name string
+		args []string
+	}{
+		{"subcommand", []string{"version"}},
+		{"flag", []string{"--version"}},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			res := runSmob(t, ctx, tc.args...)
+			if res.ExitCode != 0 {
+				t.Fatalf("exit = %d\nstderr:\n%s", res.ExitCode, res.Stderr)
+			}
+			compareGolden(t, "version.txt", res.Stdout)
+		})
 	}
 }
 
@@ -29,9 +38,19 @@ func TestVersionIgnoresConfig(t *testing.T) {
 	defer cancel()
 
 	missing := filepath.Join(t.TempDir(), "absent.yaml")
-	res := runSmob(t, ctx, "version", "--config", missing)
-	if res.ExitCode != 0 {
-		t.Fatalf("version must not read the config: exit %d\nstderr:\n%s", res.ExitCode, res.Stderr)
+	for _, tc := range []struct {
+		name string
+		args []string
+	}{
+		{"subcommand", []string{"version", "--config", missing}},
+		{"flag", []string{"--version", "--config", missing}},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			res := runSmob(t, ctx, tc.args...)
+			if res.ExitCode != 0 {
+				t.Fatalf("version must not read the config: exit %d\nstderr:\n%s", res.ExitCode, res.Stderr)
+			}
+		})
 	}
 }
 

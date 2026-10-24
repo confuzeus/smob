@@ -414,7 +414,7 @@ Dockerfile                     # FROM scratch, static binary, CA bundle
 - [x] Add `--agg` and `--group-by`, weighting rates by `interval_ms`.
 - [x] Write the quickstart, config reference, systemd unit, compose file, and IAM policy.
 - [x] Write the disk → S3 migration note using `aws s3 sync`.
-- [ ] Add `--version` and `--help` snapshot tests.
+- [x] Add `--version` and `--help` snapshot tests.
 - [ ] Run the extended suite in CI with MinIO and Docker; keep strict mode.
 - [ ] Tag `v0.2.0`; publish binaries and the Docker image.
 - [ ] Post-release: collect feedback and scope v0.3 (live tail, chunk index, multi-host query).

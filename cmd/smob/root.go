@@ -32,19 +32,27 @@ func newRootCommand(info buildInfo) *cobra.Command {
 	a := &app{info: info}
 
 	root := &cobra.Command{
-		Use:           "smob",
-		Short:         "Simple monitoring observability tool",
-		Long:          "Record CPU, memory, and network usage over time on Linux and store it on local disk or in S3-compatible object storage.",
+		Use:   "smob",
+		Short: "Simple monitoring observability tool",
+		Long:  "Record CPU, memory, and network usage over time on Linux and store it on local disk or in S3-compatible object storage.",
+		// Cobra's version template only sees .Version, so it holds the full
+		// banner built by buildInfo.String, the single format definition.
+		Version:       info.String(),
 		SilenceErrors: true,
 		SilenceUsage:  true,
 	}
 	root.CompletionOptions.DisableDefaultCmd = true
+	root.SetVersionTemplate("{{.Version}}\n")
 	root.SetFlagErrorFunc(func(_ *cobra.Command, err error) error {
 		return cli.UsageErrorf("%v", err)
 	})
 	root.PersistentFlags().StringVar(&a.configPath, "config", config.DefaultPath, "path to the YAML configuration file")
 	root.PersistentFlags().StringVar(&a.logLevel, "log-level", "", "log level override: debug, info, warn, error")
 	root.PersistentFlags().StringVar(&a.logFormat, "log-format", "", "log format override: text, json")
+	// Register --version explicitly so cobra does not add a -v shorthand;
+	// -v is reserved for a future verbosity flag. Cobra evaluates this flag
+	// before config loading and before any RunE.
+	root.Flags().Bool("version", false, "print version, commit, and build date and exit")
 
 	root.AddCommand(
 		a.collectCommand(),

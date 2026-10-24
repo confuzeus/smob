@@ -438,7 +438,8 @@ Do not gate on coverage percentages. The phase exit criteria in
 
 **Phase 0 — foundations**
 
-- `smob version` prints version, commit, and build date from ldflags.
+- `smob version` and `smob --version` print the same version, commit, and build
+  date from ldflags, without reading config.
 - `smob config --validate` accepts valid configs and rejects a table of invalid
   ones.
 - `--help` for every subcommand matches a golden file.

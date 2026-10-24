@@ -22,6 +22,8 @@ just build
 ./smob version
 ```
 
+`./smob --version` prints the same line and does not read the configuration.
+
 Without `just`, the equivalent build command is:
 
 ```sh
