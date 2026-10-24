@@ -26,6 +26,13 @@ description: Use when writing, running, reviewing, or debugging tests in smob. I
   reason; it does not silently pass.
 - Tests live in `test/integration` and carry `//go:build integration`. Run them
   with `go test -tags=integration ./test/integration/...`.
+- Store parity is the one permitted exception to the black-box rule.
+  `internal/store/equivalence_integration_test.go` imports the store packages
+  to feed one fixed `store.Chunk` through the real disk and S3 stores, because
+  the CLI cannot replay identical `/proc` values and timestamps. It carries
+  `//go:build integration`, runs under `just test-all` in strict mode, and
+  compares decoded samples, never compressed bytes. Importing internals from
+  `test/integration` remains prohibited.
 
 ## What counts
 

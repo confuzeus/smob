@@ -278,10 +278,16 @@ a dedicated query mode can relax it later if it causes friction.
 
 Integration tests are the public contract. Every behavior a user can observe is exercised by building the `smob` binary and driving it as a subprocess against real `/proc`, a temporary data directory, and optional MinIO or Docker services. The default `go test ./...` stays fast; the tagged integration suite runs explicitly.
 
-A narrow exception is allowed for pure functions whose edge cases cannot be reached through the CLI: `/proc` parsers over byte fixtures, rate/reset math, and chunk key derivation. Those tests live beside the code, use table-driven inputs (`io.Reader` and snapshot values), and never mock a service, clock, filesystem, or store. They are a complement to the contract, not a replacement. No test-only production flags or exported internals.
+A narrow exception is allowed for pure functions whose edge cases cannot be reached through the CLI: `/proc` parsers over byte fixtures, rate/reset math, and chunk key derivation. Those tests live beside the code, use table-driven inputs (`io.Reader` and snapshot values), and never mock a service, clock, filesystem, or store. They are a complement to the contract, not a replacement. Store parity is the second exception: `internal/store/equivalence_integration_test.go` feeds one fixed chunk through the real disk and S3 stores because the CLI cannot reproduce identical `/proc` input; it runs in the extended suite and compares decoded samples, not compressed bytes. No test-only production flags or exported internals.
 
 - **Fast suite** (every change): config validation, `collect --once` → `query`, output formats, help/version snapshots, signal handling, `--dry-run`, and error paths that need no external service. Net rate tests generate loopback traffic rather than assuming a busy interface.
-- **Extended suite** (CI and `just test-all`): process scope with a CPU burner, MinIO for S3, the Docker socket for container scope, retention, spool replay, `stats`, and aggregation. Services are configured through environment variables (`SMOB_TEST_S3_ENDPOINT`, `SMOB_TEST_S3_BUCKET`, `SMOB_TEST_DOCKER_SOCKET`, …). Tests skip with a clear reason when a service is absent; `SMOB_TEST_STRICT=1` turns every skip into a failure.
+- **Extended suite** (CI and `just test-all`): process scope with a CPU burner,
+  MinIO for S3 including exact disk/S3 chunk equivalence for one fixed chunk,
+  the Docker socket for container scope, retention, spool replay, `stats`, and
+  aggregation. Services are configured through environment variables
+  (`SMOB_TEST_S3_ENDPOINT`, `SMOB_TEST_S3_BUCKET`, `SMOB_TEST_DOCKER_SOCKET`, …).
+  Tests skip with a clear reason when a service is absent; `SMOB_TEST_STRICT=1`
+  turns every skip into a failure.
 - **Assertions** cover schema, labels, ordering, chunk boundaries, and plausible ranges — not exact live values. Use wide tolerances for rates and never require nonzero traffic on an idle runner.
 - **Golden files** cover stable output: help text, config dumps, and parser output from fixtures. Live `/proc` samples are validated structurally, not compared byte-for-byte.
 - **Race detector** applies to the `smob` binary under test (`SMOB_TEST_RACE=1`), not only to the Go test process. The race binary requires cgo/gcc and is a CI artifact only; release binaries remain `CGO_ENABLED=0`.
@@ -374,7 +380,7 @@ Dockerfile                     # FROM scratch, static binary, CA bundle
 - [x] Implement retry with exponential backoff and jitter.
 - [x] Implement the local spool and background replay; cap the spool; merge spooled chunks in queries.
 - [x] Implement `LIST` prefix pruning and concurrent `GET` with a bounded worker pool.
-- [ ] Verify disk/S3 equivalent samples for identical input, not byte-identical gzip.
+- [x] Verify disk/S3 equivalent samples for identical input, not byte-identical gzip.
 - [ ] Add MinIO to CI; test network interruption and spool drain.
 - [ ] Document IAM permissions and MinIO path-style configuration.
 

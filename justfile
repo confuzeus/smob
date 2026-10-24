@@ -36,7 +36,7 @@ test: test-unit
 
 # Run the extended integration suite in strict mode.
 test-all:
-    SMOB_TEST_STRICT=1 go test -tags=integration -count=1 -shuffle=on -timeout=10m ./test/integration/...
+    SMOB_TEST_STRICT=1 go test -tags=integration -count=1 -shuffle=on -timeout=10m ./test/integration/... ./internal/store/...
 
 # Run integration tests with a race-enabled smob binary.
 test-race:
