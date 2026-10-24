@@ -9,6 +9,7 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"runtime"
 	"strings"
 	"testing"
 	"time"
@@ -357,6 +358,175 @@ func TestDockerRescanDiscoversNewContainer(t *testing.T) {
 	}
 }
 
+// TestDockerRecreateResetsRateSeries removes and re-creates a container with
+// the same name while one daemon keeps running. Labels carry the name and image
+// only, so both incarnations occupy the same label series; what the CLI can
+// observe is that rate state resets. The removed container stops producing
+// samples, nothing is fabricated in the removal gap, and the re-created
+// container's first observation is the memory gauge only because its new ID has
+// no previous CPU or network counters to diff.
+func TestDockerRecreateResetsRateSeries(t *testing.T) {
+	socket := requireDockerCLI(t)
+
+	ctx, cancel := context.WithTimeout(context.Background(), 3*time.Minute)
+	defer cancel()
+
+	unique := fmt.Sprintf("smob-cli-recreate-%d-%d", os.Getpid(), time.Now().UnixNano())
+	name := unique + "-target"
+	canary := unique + "-canary"
+
+	// The canary keeps container-scope chunks closing while the target is
+	// absent, so the quiet window is observable in closed chunks rather than
+	// inferred from a lack of chunks.
+	startNamedDockerContainer(t, ctx, socket, canary)
+	startNamedDockerContainer(t, ctx, socket, name)
+
+	dataDir := filepath.Join(t.TempDir(), "data")
+	cfg := dockerConfig(t, dataDir, socket, dockerConfigOptions{})
+
+	d := startSmob(t, ctx, "collect", "--config", cfg)
+
+	waitFor(t, 30*time.Second, "container rates before removal", func() bool {
+		return len(samplesForMetric(readSamples(t, dataDir), name, "container.cpu.percent")) > 0
+	})
+
+	runDocker(t, ctx, socket, "rm", "-f", name)
+	removedAt := time.Now()
+
+	// A tick or rescan already in flight can emit trailing samples after the
+	// removal: a 2s grace is twenty times both the polling and rescan
+	// intervals. After that, the canary must have moved collection a further
+	// quiet period forward, backed by closed chunks rather than a sleep.
+	const (
+		removalGrace = 2 * time.Second
+		quietPeriod  = 2 * time.Second
+	)
+	gapStart := removedAt.Add(removalGrace)
+	waitFor(t, 30*time.Second, "canary samples past the removal grace and quiet period", func() bool {
+		return latestSampleTimestamp(readSamples(t, dataDir), canary).After(gapStart.Add(quietPeriod))
+	})
+
+	// The gap ends when the re-creation is requested: the new container cannot
+	// exist before this instant, so any target sample in between is fabricated
+	// or belongs to the removed incarnation after the grace period.
+	recreateIssuedAt := time.Now()
+	runDocker(t, ctx, socket, "run", "-d", "--name", name, dockerTestImage, "sleep", "120")
+
+	waitFor(t, 30*time.Second, "post-recreation memory and CPU samples in closed chunks", func() bool {
+		var memory, cpu bool
+		for _, sample := range samplesForContainer(readSamples(t, dataDir), name) {
+			if sample.Timestamp.Before(recreateIssuedAt) {
+				continue
+			}
+			switch sample.Metric {
+			case "container.memory.used_bytes":
+				memory = true
+			case "container.cpu.percent":
+				cpu = true
+			}
+		}
+		return memory && cpu
+	})
+	d.stop(t, 15*time.Second)
+
+	samples := samplesForContainer(readSamples(t, dataDir), name)
+	var pre, gap, post []wireSample
+	for _, sample := range samples {
+		switch {
+		case sample.Timestamp.Before(gapStart):
+			pre = append(pre, sample)
+		case sample.Timestamp.Before(recreateIssuedAt):
+			gap = append(gap, sample)
+		default:
+			post = append(post, sample)
+		}
+	}
+
+	if len(pre) == 0 {
+		t.Fatalf("no samples for %s before the removal gap", name)
+	}
+	if got := samplesForMetric(pre, name, "container.cpu.percent"); len(got) == 0 {
+		t.Fatalf("no CPU rate for the original %s before removal", name)
+	}
+	if len(gap) != 0 {
+		t.Fatalf("%d samples for %s in the removal gap [%s, %s): %+v",
+			len(gap), name, gapStart, recreateIssuedAt, gap)
+	}
+	if len(post) == 0 {
+		t.Fatalf("no samples for %s after recreation at %s", name, recreateIssuedAt)
+	}
+
+	firstAt := post[0].Timestamp
+	for _, sample := range post[1:] {
+		if sample.Timestamp.Before(firstAt) {
+			firstAt = sample.Timestamp
+		}
+	}
+	var first []wireSample
+	for _, sample := range post {
+		if sample.Timestamp.Equal(firstAt) {
+			first = append(first, sample)
+		}
+	}
+	if len(first) != 1 || first[0].Metric != "container.memory.used_bytes" {
+		t.Fatalf("first post-recreation observation for %s at %s = %+v, want exactly the memory gauge; a leaked rate baseline would emit a rate here",
+			name, firstAt, first)
+	}
+	if first[0].IntervalMS != 0 {
+		t.Fatalf("first post-recreation memory interval_ms = %d, want 0", first[0].IntervalMS)
+	}
+	if first[0].Value <= 0 {
+		t.Fatalf("first post-recreation memory gauge = %v, want greater than zero", first[0].Value)
+	}
+	assertContainerLabels(t, first[0], name)
+
+	// A corrupted delta from the old container ID would either be rejected as a
+	// counter decrease (leaving no rates at all) or, if it survived, be far
+	// outside these sanity bounds. An idle busybox cannot plausibly move a
+	// gibibyte per second, and CPU stays within the documented per-core bound.
+	const maxPlausibleNetworkRate = 1 << 30
+	var cpu, network int
+	for _, sample := range post {
+		if !sample.Timestamp.After(firstAt) {
+			continue
+		}
+		assertContainerLabels(t, sample, name)
+		switch sample.Metric {
+		case "container.memory.used_bytes":
+			if sample.IntervalMS != 0 {
+				t.Fatalf("memory gauge interval_ms = %d, want 0", sample.IntervalMS)
+			}
+			if sample.Value <= 0 {
+				t.Fatalf("memory gauge = %v, want greater than zero", sample.Value)
+			}
+		case "container.cpu.percent":
+			cpu++
+			assertRate(t, sample)
+			if limit := 100 * float64(runtime.NumCPU()); sample.Value > limit {
+				t.Fatalf("CPU percent = %v, want at most %v for this host", sample.Value, limit)
+			}
+		case "container.network.rx_bytes_per_second", "container.network.tx_bytes_per_second":
+			network++
+			assertRate(t, sample)
+			if sample.Value > maxPlausibleNetworkRate {
+				t.Fatalf("%s = %v, want at most %d for an idle container",
+					sample.Metric, sample.Value, maxPlausibleNetworkRate)
+			}
+			if sample.Labels["interface"] == "" {
+				t.Fatalf("%s has no interface label", sample.Metric)
+			}
+		default:
+			t.Fatalf("unexpected container metric %q after recreation", sample.Metric)
+		}
+	}
+	if cpu == 0 {
+		t.Fatalf("no CPU rate for %s after the fresh baseline", name)
+	}
+	if network == 0 {
+		t.Fatalf("no network rate for %s after the fresh baseline", name)
+	}
+}
+
 // TestDockerStreamStatsSubInterval proves stream_stats produces observations
 // finer than the collector tick. The collector ticks every 3s, so a streamed
 // CPU sample with interval_ms below 3000 cannot come from one-shot polling. If
@@ -547,6 +717,18 @@ func samplesForMetric(samples []wireSample, name, metric string) []wireSample {
 		}
 	}
 	return matches
+}
+
+// latestSampleTimestamp returns the newest timestamp for a container in
+// samples, or the zero time when it has none.
+func latestSampleTimestamp(samples []wireSample, name string) time.Time {
+	var latest time.Time
+	for _, sample := range samplesForContainer(samples, name) {
+		if sample.Timestamp.After(latest) {
+			latest = sample.Timestamp
+		}
+	}
+	return latest
 }
 
 // assertContainerLabels checks the collector-supplied identity and the

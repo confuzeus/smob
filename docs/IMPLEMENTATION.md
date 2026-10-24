@@ -401,7 +401,7 @@ Dockerfile                     # FROM scratch, static binary, CA bundle
 - [x] Audit the existing `sources.docker.interval`, `sources.docker.exclude`, and `sources.docker.stream_stats`; confirm `sources.docker.rescan_interval` (default 30s).
 - [x] Add `proc_path`, `/host/proc`, `--pid=host`, and `--network=host` documentation.
 - [x] Document socket permissions, `--group-add`, and data-dir ownership in the container deployment.
-- [ ] Integration test with Docker; create, remove, and recreate a container and assert series behavior.
+- [x] Integration test with Docker; create, remove, and recreate a container and assert series behavior.
 
 ### Phase 5 — Polish and Release (v0.2.0)
 
