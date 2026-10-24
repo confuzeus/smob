@@ -398,7 +398,7 @@ Dockerfile                     # FROM scratch, static binary, CA bundle
 - [x] Compute CPU % by diffing smob's own consecutive observations, memory used excluding `inactive_file`, and per-interface network rates.
 - [x] Emit labels `container`, `image`, `scope=container`.
 - [x] Keep the source off by default; fail startup when it is enabled and the socket is unreachable.
-- [ ] Audit the existing `sources.docker.interval`, `sources.docker.exclude`, and `sources.docker.stream_stats`; confirm `sources.docker.rescan_interval` (default 30s).
+- [x] Audit the existing `sources.docker.interval`, `sources.docker.exclude`, and `sources.docker.stream_stats`; confirm `sources.docker.rescan_interval` (default 30s).
 - [ ] Add `proc_path`, `/host/proc`, `--pid=host`, and `--network=host` documentation.
 - [ ] Document socket permissions, `--group-add`, and data-dir ownership in the container deployment.
 - [ ] Integration test with Docker; create, remove, and recreate a container and assert series behavior.

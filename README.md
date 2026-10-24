@@ -193,6 +193,10 @@ sources:
   docker:
     enabled: true
     socket: /var/run/docker.sock
+    interval: 10s
+    rescan_interval: 30s
+    exclude: ""
+    stream_stats: false
 ```
 
 `collect` connects to and probes the socket at startup. If the source is
@@ -200,10 +204,16 @@ enabled and the socket is missing or unreachable, collection fails with exit
 code 1 before any sample is written. A host without Docker keeps the source
 disabled (the default) and is unaffected.
 
-`sources.docker.stream_stats: true` keeps one persistent stats stream per
-container for sub-interval resolution. `collect --once` always takes one-shot
-stats because a single snapshot has no stream history; when `stream_stats` is
-enabled, `--once` logs that it used one-shot stats for that run.
+| Field | Default | Meaning |
+| --- | --- | --- |
+| `interval` | `10s` | One-shot polling cadence, and the cadence at which streamed observations are drained. Any positive duration is accepted, including sub-second values as for the other sources; very small values increase daemon load. |
+| `rescan_interval` | `30s` | How often the running container set is enumerated. It is independent of `interval`: a shorter value just refreshes the set more often. New containers start contributing without restarting smob, and containers that stop disappear from subsequent samples. |
+| `exclude` | empty | An unanchored Go regular expression matched against the container **name** with Docker's leading slash removed. It never matches container IDs. An empty value excludes nothing; anchor with `^` and `$` for an exact name. For example, `exclude: "^smob-.*$"` drops containers whose names start with `smob-`. |
+| `stream_stats` | `false` | Keep one persistent stats stream per container for resolution at the daemon's stream cadence (typically about one second) instead of one-shot polling. This costs a persistent stream and dedicated goroutines per container, so it is opt-in. |
+
+`collect --once` always takes one-shot stats because a single snapshot has no
+stream history; when `stream_stats` is enabled, `--once` logs that it used
+one-shot stats for that run.
 
 ### `query`
 

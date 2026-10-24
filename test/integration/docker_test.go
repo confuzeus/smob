@@ -74,7 +74,7 @@ func TestDockerMissingSocketFails(t *testing.T) {
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
 			dataDir := filepath.Join(t.TempDir(), "data")
-			cfg := dockerConfig(t, dataDir, socket, false)
+			cfg := dockerConfig(t, dataDir, socket, dockerConfigOptions{})
 
 			ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
 			defer cancel()
@@ -105,7 +105,7 @@ func TestDockerCollectOnceThenQuery(t *testing.T) {
 	name := startDockerContainer(t, ctx, socket)
 
 	dataDir := filepath.Join(t.TempDir(), "data")
-	cfg := dockerConfig(t, dataDir, socket, false)
+	cfg := dockerConfig(t, dataDir, socket, dockerConfigOptions{})
 
 	res := runSmob(t, ctx, "collect", "--once", "--config", cfg)
 	if res.ExitCode != 0 {
@@ -172,7 +172,7 @@ func TestDockerCollectDaemon(t *testing.T) {
 	name := startDockerContainer(t, ctx, socket)
 
 	dataDir := filepath.Join(t.TempDir(), "data")
-	cfg := dockerConfig(t, dataDir, socket, false)
+	cfg := dockerConfig(t, dataDir, socket, dockerConfigOptions{})
 
 	d := startSmob(t, ctx, "collect", "--config", cfg)
 
@@ -237,7 +237,7 @@ func TestDockerOnceStreamStatsDowngrades(t *testing.T) {
 	name := startDockerContainer(t, ctx, socket)
 
 	dataDir := filepath.Join(t.TempDir(), "data")
-	cfg := dockerConfig(t, dataDir, socket, true)
+	cfg := dockerConfig(t, dataDir, socket, dockerConfigOptions{StreamStats: true})
 
 	res := runSmob(t, ctx, "collect", "--once", "--config", cfg)
 	if res.ExitCode != 0 {
@@ -253,10 +253,186 @@ func TestDockerOnceStreamStatsDowngrades(t *testing.T) {
 	}
 }
 
-// dockerConfig writes a Docker-only collect configuration with a short
-// interval and a one-second chunk, so a daemon run flushes quickly.
-func dockerConfig(t *testing.T, dataDir, socket string, streamStats bool) string {
+// TestDockerExcludeRemovesMatchingContainer proves the exclude filter is
+// applied on the way a user reaches it. The pattern is an unanchored substring
+// in the middle of the excluded name; the kept name does not contain it.
+func TestDockerExcludeRemovesMatchingContainer(t *testing.T) {
+	socket := requireDockerCLI(t)
+
+	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Minute)
+	defer cancel()
+
+	unique := fmt.Sprintf("smob-cli-exclude-%d-%d", os.Getpid(), time.Now().UnixNano())
+	keptName := unique + "-keep"
+	excludedName := "x-" + unique + "-skip-me"
+	startNamedDockerContainer(t, ctx, socket, keptName)
+	startNamedDockerContainer(t, ctx, socket, excludedName)
+
+	dataDir := filepath.Join(t.TempDir(), "data")
+	cfg := dockerConfig(t, dataDir, socket, dockerConfigOptions{Exclude: unique + "-skip"})
+
+	res := runSmob(t, ctx, "collect", "--once", "--config", cfg)
+	if res.ExitCode != 0 {
+		t.Fatalf("collect --once exit = %d\nstderr:\n%s", res.ExitCode, res.Stderr)
+	}
+
+	samples := readSamples(t, dataDir)
+	if got := samplesForContainer(samples, keptName); len(got) == 0 {
+		t.Fatalf("kept container %s produced no samples", keptName)
+	}
+	if got := samplesForContainer(samples, excludedName); len(got) != 0 {
+		t.Fatalf("excluded container %s produced %d samples: %+v", excludedName, len(got), got)
+	}
+}
+
+// TestDockerIntervalControlsCadence checks the configured interval on the CLI
+// path. Eight memory gauges inside closed chunks with gaps well below the 10s
+// default cannot result from the default cadence.
+func TestDockerIntervalControlsCadence(t *testing.T) {
+	socket := requireDockerCLI(t)
+
+	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Minute)
+	defer cancel()
+	name := startDockerContainer(t, ctx, socket)
+
+	dataDir := filepath.Join(t.TempDir(), "data")
+	cfg := dockerConfig(t, dataDir, socket, dockerConfigOptions{Interval: 100 * time.Millisecond})
+
+	d := startSmob(t, ctx, "collect", "--config", cfg)
+
+	waitFor(t, 20*time.Second, "a closed container chunk", func() bool {
+		return countChunks(t, dataDir) >= 1
+	})
+	waitFor(t, 20*time.Second, "eight memory gauges in closed chunks", func() bool {
+		gauges := samplesForMetric(readSamples(t, dataDir), name, "container.memory.used_bytes")
+		return len(gauges) >= 8
+	})
+	d.stop(t, 15*time.Second)
+
+	gauges := samplesForMetric(readSamples(t, dataDir), name, "container.memory.used_bytes")
+	if len(gauges) < 8 {
+		t.Fatalf("memory gauges = %d, want at least 8 after the closed-chunk wait", len(gauges))
+	}
+	var maxGap time.Duration
+	for i := 1; i < len(gauges); i++ {
+		gap := gauges[i].Timestamp.Sub(gauges[i-1].Timestamp)
+		if gap <= 0 {
+			t.Fatalf("memory gauge timestamps are not increasing: %s then %s",
+				gauges[i-1].Timestamp, gauges[i].Timestamp)
+		}
+		maxGap = max(maxGap, gap)
+	}
+	if maxGap > 500*time.Millisecond {
+		t.Fatalf("largest memory gauge gap = %s, want at most 500ms for a 100ms interval", maxGap)
+	}
+}
+
+// TestDockerRescanDiscoversNewContainer proves a container created after smob
+// started contributes without restarting the collector.
+func TestDockerRescanDiscoversNewContainer(t *testing.T) {
+	socket := requireDockerCLI(t)
+
+	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Minute)
+	defer cancel()
+	baselineName := startDockerContainer(t, ctx, socket)
+
+	dataDir := filepath.Join(t.TempDir(), "data")
+	cfg := dockerConfig(t, dataDir, socket, dockerConfigOptions{RescanInterval: 100 * time.Millisecond})
+
+	d := startSmob(t, ctx, "collect", "--config", cfg)
+	waitFor(t, 20*time.Second, "samples for the container present at startup", func() bool {
+		return len(samplesForContainer(readSamples(t, dataDir), baselineName)) > 0
+	})
+
+	lateName := fmt.Sprintf("smob-cli-late-%d-%d", os.Getpid(), time.Now().UnixNano())
+	startNamedDockerContainer(t, ctx, socket, lateName)
+
+	waitFor(t, 30*time.Second, "samples for a container created after startup", func() bool {
+		return len(samplesForContainer(readSamples(t, dataDir), lateName)) > 0
+	})
+	d.stop(t, 15*time.Second)
+
+	if got := samplesForMetric(readSamples(t, dataDir), lateName, "container.memory.used_bytes"); len(got) == 0 {
+		t.Fatalf("container %s created after startup produced no memory gauge", lateName)
+	}
+}
+
+// TestDockerStreamStatsSubInterval proves stream_stats produces observations
+// finer than the collector tick. The collector ticks every 3s, so a streamed
+// CPU sample with interval_ms below 3000 cannot come from one-shot polling. If
+// no CPU delta can be observed in the bounded window (fewer than two payloads),
+// the test skips unless strict mode is on.
+func TestDockerStreamStatsSubInterval(t *testing.T) {
+	socket := requireDockerCLI(t)
+
+	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Minute)
+	defer cancel()
+	name := startDockerContainer(t, ctx, socket)
+
+	const collectorInterval = 3 * time.Second
+	dataDir := filepath.Join(t.TempDir(), "data")
+	cfg := dockerConfig(t, dataDir, socket, dockerConfigOptions{
+		Interval:    collectorInterval,
+		StreamStats: true,
+	})
+
+	d := startSmob(t, ctx, "collect", "--config", cfg)
+
+	observedAt := time.Now()
+	waitFor(t, 40*time.Second, "streamed CPU evidence or the observation deadline", func() bool {
+		if len(samplesForMetric(readSamples(t, dataDir), name, "container.cpu.percent")) > 0 {
+			return true
+		}
+		// Bound the observation: a daemon that delivers only one payload per
+		// window has no CPU delta to report, so keep waiting would never help.
+		return time.Since(observedAt) >= 15*time.Second
+	})
+	d.stop(t, 15*time.Second)
+
+	cpu := samplesForMetric(readSamples(t, dataDir), name, "container.cpu.percent")
+	subInterval := 0
+	for _, sample := range cpu {
+		assertContainerLabels(t, sample, name)
+		if sample.IntervalMS <= 0 {
+			t.Fatalf("CPU interval_ms = %d, want greater than zero", sample.IntervalMS)
+		}
+		if sample.IntervalMS < collectorInterval.Milliseconds() {
+			subInterval++
+		}
+	}
+	if subInterval > 0 {
+		return
+	}
+	if len(cpu) == 0 {
+		reason := fmt.Sprintf("Docker delivered fewer than two stream payloads in the %s observation window; cannot observe stream cadence", 15*time.Second)
+		if os.Getenv("SMOB_TEST_STRICT") == "1" {
+			t.Fatal(reason)
+		}
+		t.Skip(reason)
+	}
+	t.Fatalf("all %d CPU samples report interval_ms >= %d; stream_stats produced one-shot cadence: %+v",
+		len(cpu), collectorInterval.Milliseconds(), cpu)
+}
+
+// dockerConfigOptions overrides the short defaults used by Docker CLI tests.
+// Zero durations take the test default so each test states only what it varies.
+type dockerConfigOptions struct {
+	Exclude        string
+	Interval       time.Duration
+	RescanInterval time.Duration
+	StreamStats    bool
+}
+
+// dockerConfig writes a Docker-only collect configuration with a one-second
+// chunk, so a daemon run flushes quickly.
+func dockerConfig(t *testing.T, dataDir, socket string, opts dockerConfigOptions) string {
 	t.Helper()
+	if opts.Interval == 0 {
+		opts.Interval = 100 * time.Millisecond
+	}
+	if opts.RescanInterval == 0 {
+		opts.RescanInterval = 100 * time.Millisecond
+	}
 	return writeConfig(t, fmt.Sprintf(`data_dir: %s
 host: test-host
 sources:
@@ -265,13 +441,14 @@ sources:
   docker:
     enabled: true
     socket: %s
-    interval: 100ms
-    rescan_interval: 100ms
+    exclude: %q
+    interval: %s
+    rescan_interval: %s
     stream_stats: %t
 storage:
   primary: disk
   chunk_interval: 1s
-`, dataDir, socket, streamStats))
+`, dataDir, socket, opts.Exclude, opts.Interval, opts.RescanInterval, opts.StreamStats))
 }
 
 // requireDockerCLI gates CLI container tests on a real socket and the docker
@@ -307,6 +484,15 @@ func startDockerContainer(t *testing.T, ctx context.Context, socket string) stri
 	t.Helper()
 
 	name := fmt.Sprintf("smob-cli-%d-%d", os.Getpid(), time.Now().UnixNano())
+	startNamedDockerContainer(t, ctx, socket, name)
+	return name
+}
+
+// startNamedDockerContainer starts a busybox container with a caller-chosen
+// name and removes it when the test ends.
+func startNamedDockerContainer(t *testing.T, ctx context.Context, socket, name string) {
+	t.Helper()
+
 	t.Cleanup(func() {
 		removeCtx, cancel := context.WithTimeout(context.Background(), 20*time.Second)
 		defer cancel()
@@ -319,7 +505,6 @@ func startDockerContainer(t *testing.T, ctx context.Context, socket string) stri
 	})
 
 	runDocker(t, ctx, socket, "run", "-d", "--name", name, dockerTestImage, "sleep", "120")
-	return name
 }
 
 // runDocker runs one docker CLI command against socket and returns its trimmed
@@ -346,6 +531,18 @@ func samplesForContainer(samples []wireSample, name string) []wireSample {
 	var matches []wireSample
 	for _, sample := range samples {
 		if sample.Labels["container"] == name {
+			matches = append(matches, sample)
+		}
+	}
+	return matches
+}
+
+// samplesForMetric returns one container's samples for a metric, in stored
+// order.
+func samplesForMetric(samples []wireSample, name, metric string) []wireSample {
+	var matches []wireSample
+	for _, sample := range samplesForContainer(samples, name) {
+		if sample.Metric == metric {
 			matches = append(matches, sample)
 		}
 	}

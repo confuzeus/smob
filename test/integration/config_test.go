@@ -180,10 +180,22 @@ func TestConfigValidate(t *testing.T) {
 			wants: []string{"sources.docker.stream_stats"},
 		},
 		{
+			name:  "zero docker interval",
+			body:  base + "sources:\n  docker:\n    enabled: true\n    interval: 0s\n",
+			exit:  2,
+			wants: []string{"sources.docker.interval"},
+		},
+		{
 			name:  "zero docker rescan interval",
 			body:  base + "sources:\n  docker:\n    enabled: true\n    rescan_interval: 0s\n",
 			exit:  2,
 			wants: []string{"sources.docker.rescan_interval"},
+		},
+		{
+			name:  "docker exclude is not a regexp",
+			body:  base + "sources:\n  docker:\n    enabled: true\n    exclude: \"[\"\n",
+			exit:  2,
+			wants: []string{"sources.docker.exclude"},
 		},
 		{
 			name:  "log level override is invalid",
@@ -359,21 +371,41 @@ func TestConfigDefaults(t *testing.T) {
 	if res.ExitCode != 0 {
 		t.Fatalf("exit = %d\nstderr:\n%s", res.ExitCode, res.Stderr)
 	}
-	for _, line := range []string{
-		"data_dir: /var/lib/smob",
-		"proc_path: /proc",
-		"host: " + host,
-		"socket: /var/run/docker.sock",
-		"stream_stats: false",
-		"chunk_interval: 5m0s",
-		"top_n: 20",
-		"interval: 10s",
-		"interval: 30s",
+	for _, want := range []struct {
+		line  string
+		count int
+	}{
+		{"data_dir: /var/lib/smob", 1},
+		{"proc_path: /proc", 1},
+		{"host: " + host, 1},
+		{"socket: /var/run/docker.sock", 1},
+		{"exclude: \"\"", 1},
+		{"stream_stats: false", 1},
+		{"chunk_interval: 5m0s", 1},
+		{"top_n: 20", 1},
+		// System and Docker share the 10s default; process alone uses 30s.
+		{"interval: 10s", 2},
+		{"interval: 30s", 1},
+		// Process and Docker share the 30s rescan default.
+		{"rescan_interval: 30s", 2},
 	} {
-		if !hasLine(res.Stdout, line) {
-			t.Errorf("defaults are missing %q\noutput:\n%s", line, res.Stdout)
+		if got := countLines(res.Stdout, want.line); got != want.count {
+			t.Errorf("defaults contain %q %d times, want %d\noutput:\n%s",
+				want.line, got, want.count, res.Stdout)
 		}
 	}
+}
+
+// countLines counts exact, trimmed lines in a config dump. Defaults are
+// asserted by count so a field cannot hide behind another source's value.
+func countLines(out, line string) int {
+	count := 0
+	for _, got := range strings.Split(out, "\n") {
+		if strings.TrimSpace(got) == line {
+			count++
+		}
+	}
+	return count
 }
 
 func TestMissingConfig(t *testing.T) {
