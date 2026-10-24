@@ -74,6 +74,7 @@ func requireS3(t *testing.T) s3TestEnv {
 		o.BaseEndpoint = aws.String(endpoint)
 		o.UsePathStyle = true
 	})
+	ensureBucket(t, ctx, client, bucket)
 
 	prefix := path.Join(
 		"smob-it",
@@ -83,6 +84,23 @@ func requireS3(t *testing.T) s3TestEnv {
 	t.Cleanup(func() { deletePrefix(t, client, bucket, prefix) })
 
 	return s3TestEnv{endpoint: endpoint, bucket: bucket, prefix: prefix, client: client}
+}
+
+// ensureBucket creates the shared test bucket when it does not exist. Tests
+// isolate themselves with unique prefixes rather than unique buckets. The
+// store-parity package may create the same bucket concurrently, so a failed
+// create is accepted when a follow-up HeadBucket succeeds.
+func ensureBucket(t *testing.T, ctx context.Context, client *awss3.Client, bucket string) {
+	t.Helper()
+
+	if _, err := client.HeadBucket(ctx, &awss3.HeadBucketInput{Bucket: aws.String(bucket)}); err == nil {
+		return
+	}
+	if _, err := client.CreateBucket(ctx, &awss3.CreateBucketInput{Bucket: aws.String(bucket)}); err != nil {
+		if _, headErr := client.HeadBucket(ctx, &awss3.HeadBucketInput{Bucket: aws.String(bucket)}); headErr != nil {
+			t.Fatalf("ensure S3 bucket %s: create: %v; head: %v", bucket, err, headErr)
+		}
+	}
 }
 
 func TestS3Unreachable(t *testing.T) {

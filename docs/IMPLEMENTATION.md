@@ -291,7 +291,7 @@ A narrow exception is allowed for pure functions whose edge cases cannot be reac
 - **Assertions** cover schema, labels, ordering, chunk boundaries, and plausible ranges — not exact live values. Use wide tolerances for rates and never require nonzero traffic on an idle runner.
 - **Golden files** cover stable output: help text, config dumps, and parser output from fixtures. Live `/proc` samples are validated structurally, not compared byte-for-byte.
 - **Race detector** applies to the `smob` binary under test (`SMOB_TEST_RACE=1`), not only to the Go test process. The race binary requires cgo/gcc and is a CI artifact only; release binaries remain `CGO_ENABLED=0`.
-- **CI**: lint, fast suite, race suite, and cross-builds on linux/amd64 and linux/arm64. The Alpine job runs the fast suite on a musl kernel. The extended job (added with Phases 3–4) runs MinIO and uses the runner's Docker daemon. Arm64 is build-only; integration runs on amd64.
+- **CI**: lint, fast suite, race suite, and cross-builds on linux/amd64 and linux/arm64. The Alpine job runs the fast suite on a musl kernel. The `extended` job runs the S3 suite against MinIO in strict mode, including the network-partition spool drain and disk/S3 equivalence; it is structured so Phase 4 can add the runner's Docker daemon. Arm64 is build-only; integration runs on amd64.
 
 ## 9. Repository Layout
 
@@ -381,7 +381,7 @@ Dockerfile                     # FROM scratch, static binary, CA bundle
 - [x] Implement the local spool and background replay; cap the spool; merge spooled chunks in queries.
 - [x] Implement `LIST` prefix pruning and concurrent `GET` with a bounded worker pool.
 - [x] Verify disk/S3 equivalent samples for identical input, not byte-identical gzip.
-- [ ] Add MinIO to CI; test network interruption and spool drain.
+- [x] Add MinIO to CI; test network interruption and spool drain.
 - [ ] Document IAM permissions and MinIO path-style configuration.
 
 ### Phase 4 — Docker Container Metrics (v0.2)

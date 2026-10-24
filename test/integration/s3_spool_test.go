@@ -45,7 +45,11 @@ func newFaultProxy(t *testing.T, endpoint string) *faultProxy {
 		t.Fatalf("S3 endpoint %q has no host", endpoint)
 	}
 	if u.Scheme != "http" {
-		t.Skipf("network-partition proxy requires an http:// S3 endpoint; got %q", endpoint)
+		reason := fmt.Sprintf("network-partition proxy requires an http:// S3 endpoint; got %q", endpoint)
+		if os.Getenv("SMOB_TEST_STRICT") == "1" {
+			t.Fatal(reason)
+		}
+		t.Skip(reason)
 	}
 	listener, err := net.Listen("tcp", "127.0.0.1:0")
 	if err != nil {
@@ -173,7 +177,9 @@ storage:
     spool_dir: %s
 `, dataDir, proxy.URL(), env.bucket, env.prefix, spoolDir))
 
-	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Minute)
+	// The bounded waits below total 5.5 minutes in the worst case; keep the
+	// context above that so a specific wait times out with its own message.
+	ctx, cancel := context.WithTimeout(context.Background(), 6*time.Minute)
 	defer cancel()
 
 	d := startSmob(t, ctx, "collect", "--config", cfg)
