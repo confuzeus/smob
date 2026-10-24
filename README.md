@@ -15,9 +15,10 @@ interchangeable and existing data can be copied between them with
 
 > **Project status:** smob is v0.1. System and process metrics, the disk and S3
 > backends (including local spool replay), `collect`, and `query` are
-> implemented. S3 IAM guidance is still pending, as are Docker, retention, and
-> aggregation. `stats` and `tail` remain stubs. The command and metric reference
-> below describes the v0.1 contract. See the
+> implemented. S3 IAM and MinIO deployment guidance is in
+> [docs/s3.md](docs/s3.md). Docker, retention, and aggregation remain planned.
+> `stats` and `tail` remain stubs. The command and metric reference below
+> describes the v0.1 contract. See the
 > [design and implementation plan](docs/IMPLEMENTATION.md) for the roadmap.
 
 ## Features
@@ -229,7 +230,8 @@ no mirroring or dual-write.
   (exit code 3). The spool is capped by `storage.s3.spool_max_bytes`; when it
   stays full, the oldest chunks are dropped with an `error` log. `query` merges
   readable spool entries with the bucket, so chunks not yet uploaded are still
-  visible on the collecting host.
+  visible on the collecting host. See [docs/s3.md](docs/s3.md) for the IAM
+  policy, credential chain, and a local MinIO recipe.
 
 Both backends use the same keys and sample format, so migrating from disk to S3
 is a copy followed by a configuration change:

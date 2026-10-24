@@ -382,7 +382,7 @@ Dockerfile                     # FROM scratch, static binary, CA bundle
 - [x] Implement `LIST` prefix pruning and concurrent `GET` with a bounded worker pool.
 - [x] Verify disk/S3 equivalent samples for identical input, not byte-identical gzip.
 - [x] Add MinIO to CI; test network interruption and spool drain.
-- [ ] Document IAM permissions and MinIO path-style configuration.
+- [x] Document IAM permissions and MinIO path-style configuration.
 
 ### Phase 4 — Docker Container Metrics (v0.2)
 
