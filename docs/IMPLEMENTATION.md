@@ -413,7 +413,7 @@ Dockerfile                     # FROM scratch, static binary, CA bundle
 - [x] Implement `smob stats`.
 - [x] Add `--agg` and `--group-by`, weighting rates by `interval_ms`.
 - [x] Write the quickstart, config reference, systemd unit, compose file, and IAM policy.
-- [ ] Write the disk → S3 migration note using `aws s3 sync`.
+- [x] Write the disk → S3 migration note using `aws s3 sync`.
 - [ ] Add `--version` and `--help` snapshot tests.
 - [ ] Run the extended suite in CI with MinIO and Docker; keep strict mode.
 - [ ] Tag `v0.2.0`; publish binaries and the Docker image.

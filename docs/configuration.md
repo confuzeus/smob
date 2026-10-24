@@ -95,6 +95,7 @@ permissions.
 
 Exactly one backend is active. `storage.primary` selects the write target, and
 `query` and `stats` read the same backend. There is no mirroring or dual-write.
+To move existing disk data to S3, see [migration.md](migration.md).
 
 | Field | Type | Default | Validation | Effect |
 | --- | --- | --- | --- | --- |

@@ -79,6 +79,7 @@ container image (`FROM scratch`, non-root user, CA bundle) can be built with
 | [Quickstart](docs/quickstart.md) | Build, minimal config, first `collect --once`/`query`, daemon, service. |
 | [Configuration reference](docs/configuration.md) | Every field with type, default, validation rule, and effect. |
 | [S3 and MinIO](docs/s3.md) | IAM policy, credential chain, MinIO recipe, spool behavior. |
+| [Disk → S3 migration](docs/migration.md) | Quiesce the collector, copy with `aws s3 sync`, verify samples, switch, roll back. |
 | [Running in Docker](docs/docker.md) | Host procfs, PID/network namespaces, socket permissions, data ownership. |
 | [systemd unit](contrib/systemd/smob.service) | Hardened service with `SIGTERM` flush and journal logging. |
 | [Compose file](compose.yaml) | Host `/proc`, data volume, host networking, optional Docker socket. |
@@ -339,12 +340,9 @@ retention defaults, is in
   policy, credential chain, and a local MinIO recipe.
 
 Both backends use the same keys and sample format, so migrating from disk to S3
-is a copy followed by a configuration change:
-
-```sh
-aws s3 sync ./data/ s3://<bucket>/<prefix>/
-# then set storage.primary: s3
-```
+is a copy followed by a configuration change. The complete procedure — stopping
+the collector, excluding the local spool, verifying the samples, switching, and
+rolling back — is in [docs/migration.md](docs/migration.md).
 
 Completed chunks are immutable. A collector crash loses at most the chunk
 currently being assembled, and `SIGINT`/`SIGTERM` flushes that chunk before
