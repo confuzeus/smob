@@ -185,6 +185,9 @@ than silently dropping data.
 
 ### Docker container metrics
 
+Deploying smob itself in a container — host `/proc`, PID and network namespace
+choices, and the data volume — is covered in [docs/docker.md](docs/docker.md).
+
 Container collection is disabled by default. Enable it when the daemon is
 available:
 
