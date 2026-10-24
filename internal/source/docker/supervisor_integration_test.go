@@ -2,8 +2,7 @@
 
 package docker
 
-// These tests drive the supervisor beside the package because the Docker
-// source is not registered with the collector yet. The daemon is real: the
+// These tests drive the supervisor beside the package. The daemon is real: the
 // fault proxy only forwards the Unix socket and can pause forwarding, which is
 // the same technique the S3 spool test uses for a network partition.
 

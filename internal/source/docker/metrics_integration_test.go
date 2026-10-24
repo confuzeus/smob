@@ -2,8 +2,7 @@
 
 package docker
 
-// These tests drive the metric computation beside the package because the
-// Docker source is not registered with the collector yet. The daemon and
+// These tests drive the metric computation beside the package. The daemon and
 // container are real; no fake server stands in for either.
 
 import (

@@ -20,10 +20,12 @@ change affects both.
 
 ## Project status
 
-System and process metrics, the disk and S3 backends (including spool replay),
-`collect`, and `query` are implemented. `stats` and `tail` remain stubs; Docker
-support is planned for Phase 4, and retention and aggregation remain in Phase 5.
-The README describes the user-facing contract.
+System, process, and Docker container metrics, the disk and S3 backends
+(including spool replay), `collect`, and `query` are implemented. The Docker
+source is registered with the collector but disabled by default; enabling it
+fails startup when the socket is unreachable. `stats` and `tail` remain stubs,
+and retention and aggregation remain in Phase 5. The README describes the
+user-facing contract.
 
 ## Commands
 

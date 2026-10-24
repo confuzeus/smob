@@ -11,6 +11,7 @@ import (
 
 	"github.com/confuzeus/smob/internal/cli"
 	"github.com/confuzeus/smob/internal/collector"
+	"github.com/confuzeus/smob/internal/source/docker"
 	"github.com/confuzeus/smob/internal/source/process"
 	"github.com/confuzeus/smob/internal/source/system"
 	"github.com/confuzeus/smob/internal/store"
@@ -45,11 +46,20 @@ func (a *app) collectCommand() *cobra.Command {
 }
 
 // runCollect builds every enabled source and the store, probes both, then runs
-// the collector. The collector owns and closes the store.
-func (a *app) runCollect(ctx context.Context, dryRun, once bool) error {
-	sources, err := a.newSources()
+// the collector. The collector owns and closes the store. The Docker source is
+// the only source with a lifecycle: it is constructed (and probed) before the
+// store, started after a successful dry-run check, and always closed.
+func (a *app) runCollect(ctx context.Context, dryRun, once bool) (err error) {
+	sources, dockerSrc, err := a.newSources(ctx, once)
 	if err != nil {
 		return err
+	}
+	if dockerSrc != nil {
+		defer func() {
+			if closeErr := dockerSrc.Close(); closeErr != nil {
+				err = errors.Join(err, fmt.Errorf("close docker source: %w", closeErr))
+			}
+		}()
 	}
 
 	st, err := newStore(ctx, a.cfg, a.logger)
@@ -80,6 +90,10 @@ func (a *app) runCollect(ctx context.Context, dryRun, once bool) error {
 		return st.Close()
 	}
 
+	if dockerSrc != nil {
+		dockerSrc.Start(ctx)
+	}
+
 	c := collector.New(a.cfg, sources, st, a.logger)
 	if once {
 		return c.RunOnce(ctx)
@@ -98,7 +112,7 @@ func (a *app) runCollect(ctx context.Context, dryRun, once bool) error {
 			replayer.Replay(replayCtx)
 		}()
 
-		err := c.Run(ctx)
+		err = c.Run(ctx)
 		stopReplay()
 		<-done
 		return err
@@ -106,14 +120,19 @@ func (a *app) runCollect(ctx context.Context, dryRun, once bool) error {
 	return c.Run(ctx)
 }
 
-// newSources constructs every enabled source. Configuration validation rejects
-// sources that are not implemented yet.
-func (a *app) newSources() ([]collector.Source, error) {
+// newSources constructs every enabled source. It returns the Docker source
+// separately because it owns a client and background goroutines: the caller
+// must Start it before the collector and Close it afterwards. A disabled source
+// is never constructed, so its socket is never touched.
+//
+// once forces one-shot container stats. A single snapshot has no stream
+// history, so stream_stats cannot produce samples for collect --once.
+func (a *app) newSources(ctx context.Context, once bool) ([]collector.Source, *docker.Source, error) {
 	var sources []collector.Source
 	if a.cfg.Sources.System.Enabled {
 		src, err := system.New(a.cfg.ProcPath, a.cfg.Sources.System.Interval.Std(), a.logger)
 		if err != nil {
-			return nil, err
+			return nil, nil, err
 		}
 		sources = append(sources, src)
 	}
@@ -126,11 +145,32 @@ func (a *app) newSources() ([]collector.Source, error) {
 			RescanInterval: a.cfg.Sources.Process.RescanInterval.Std(),
 		}, a.logger)
 		if err != nil {
-			return nil, err
+			return nil, nil, err
 		}
 		sources = append(sources, src)
 	}
-	return sources, nil
+
+	var dockerSrc *docker.Source
+	if a.cfg.Sources.Docker.Enabled {
+		streamStats := a.cfg.Sources.Docker.StreamStats
+		if once && streamStats {
+			a.logger.Info("collect --once: using one-shot container stats because stream_stats needs a running stream")
+			streamStats = false
+		}
+		src, err := docker.New(ctx, docker.Options{
+			Socket:         a.cfg.Sources.Docker.Socket,
+			Exclude:        a.cfg.Sources.Docker.Exclude,
+			Interval:       a.cfg.Sources.Docker.Interval.Std(),
+			RescanInterval: a.cfg.Sources.Docker.RescanInterval.Std(),
+			StreamStats:    streamStats,
+		}, a.logger)
+		if err != nil {
+			return nil, nil, err
+		}
+		dockerSrc = src
+		sources = append(sources, src)
+	}
+	return sources, dockerSrc, nil
 }
 
 // warnFreeSpace logs a warning when the filesystem under dataDir is low on

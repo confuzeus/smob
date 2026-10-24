@@ -13,13 +13,14 @@ libraries. Disk and S3 use one time-aligned chunk format, so the backends are
 interchangeable and existing data can be copied between them with
 `aws s3 sync`.
 
-> **Project status:** smob is v0.1. System and process metrics, the disk and S3
-> backends (including local spool replay), `collect`, and `query` are
-> implemented. S3 IAM and MinIO deployment guidance is in
-> [docs/s3.md](docs/s3.md). Docker, retention, and aggregation remain planned.
-> `stats` and `tail` remain stubs. The command and metric reference below
-> describes the v0.1 contract. See the
-> [design and implementation plan](docs/IMPLEMENTATION.md) for the roadmap.
+> **Project status:** System, process, and Docker container metrics, the disk
+> and S3 backends (including local spool replay), `collect`, and `query` are
+> implemented. The Docker source is disabled by default and is enabled with
+> `sources.docker.enabled: true`. S3 IAM and MinIO deployment guidance is in
+> [docs/s3.md](docs/s3.md). Retention, aggregation, `stats`, and `tail` remain
+> planned. The command and metric reference below describes the current
+> contract. See the [design and implementation plan](docs/IMPLEMENTATION.md) for
+> the roadmap.
 
 ## Features
 
@@ -181,6 +182,28 @@ Commands:
 
 The collector runs until interrupted. A store failure stops collection rather
 than silently dropping data.
+
+### Docker container metrics
+
+Container collection is disabled by default. Enable it when the daemon is
+available:
+
+```yaml
+sources:
+  docker:
+    enabled: true
+    socket: /var/run/docker.sock
+```
+
+`collect` connects to and probes the socket at startup. If the source is
+enabled and the socket is missing or unreachable, collection fails with exit
+code 1 before any sample is written. A host without Docker keeps the source
+disabled (the default) and is unaffected.
+
+`sources.docker.stream_stats: true` keeps one persistent stats stream per
+container for sub-interval resolution. `collect --once` always takes one-shot
+stats because a single snapshot has no stream history; when `stream_stats` is
+enabled, `--once` logs that it used one-shot stats for that run.
 
 ### `query`
 

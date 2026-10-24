@@ -2,10 +2,9 @@
 
 package docker
 
-// The Docker source is not registered yet, so the CLI cannot reach Connect.
-// These tests therefore drive the client beside the package, as the store
-// equivalence test does: the daemon is real, and no fake server stands in for
-// it. Move the connection assertions through the CLI when the source is wired.
+// These tests drive the client beside the package, as the store equivalence
+// test does: the daemon is real, and no fake server stands in for it. The CLI
+// contract for an enabled source lives in test/integration/docker_test.go.
 
 import (
 	"context"

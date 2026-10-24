@@ -163,13 +163,15 @@ func TestConfigValidate(t *testing.T) {
 			},
 		},
 		{
-			name: "docker socket missing",
-			body: base + "sources:\n  docker:\n    enabled: true\n    socket: \"\"\n",
-			exit: 2,
-			wants: []string{
-				"sources.docker.socket",
-				"sources.docker: not implemented in this build",
-			},
+			name:  "docker socket missing",
+			body:  base + "sources:\n  docker:\n    enabled: true\n    socket: \"\"\n",
+			exit:  2,
+			wants: []string{"sources.docker.socket"},
+		},
+		{
+			name: "docker source enabled",
+			body: base + "sources:\n  docker:\n    enabled: true\n",
+			exit: 0,
 		},
 		{
 			name:  "docker stream stats without enabled source",
@@ -178,13 +180,10 @@ func TestConfigValidate(t *testing.T) {
 			wants: []string{"sources.docker.stream_stats"},
 		},
 		{
-			name: "zero docker rescan interval",
-			body: base + "sources:\n  docker:\n    enabled: true\n    rescan_interval: 0s\n",
-			exit: 2,
-			wants: []string{
-				"sources.docker.rescan_interval",
-				"sources.docker: not implemented in this build",
-			},
+			name:  "zero docker rescan interval",
+			body:  base + "sources:\n  docker:\n    enabled: true\n    rescan_interval: 0s\n",
+			exit:  2,
+			wants: []string{"sources.docker.rescan_interval"},
 		},
 		{
 			name:  "log level override is invalid",

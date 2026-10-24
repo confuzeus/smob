@@ -110,10 +110,6 @@ func (c Config) Validate() error {
 				errs = append(errs, fmt.Errorf("sources.docker.exclude: %w", err))
 			}
 		}
-		// Keep rejecting an enabled Docker source until it is registered with
-		// the collector. Otherwise collect would start and silently emit no
-		// container samples.
-		errs = append(errs, errors.New("sources.docker: not implemented in this build"))
 	}
 
 	if c.Retention.Disk.MaxAge < 0 {

@@ -2,9 +2,9 @@
 
 package docker
 
-// These tests drive the Docker source beside the package because the source is
-// not registered with the collector yet. The daemon and containers are real; no
-// fake server stands in for either.
+// These tests drive the source beside the package. The daemon and containers
+// are real; no fake server stands in for either. The CLI contract lives in
+// test/integration/docker_test.go.
 
 import (
 	"fmt"

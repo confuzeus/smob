@@ -2,9 +2,9 @@
 
 package docker
 
-// The Docker source is not registered yet, so these tests drive the stats
-// acquisition layer beside the package, as the client probe test does. The
-// daemon is real and no fake server stands in for it.
+// These tests drive the stats acquisition layer beside the package, as the
+// client probe test does. The daemon is real and no fake server stands in for
+// it.
 
 import (
 	"context"
