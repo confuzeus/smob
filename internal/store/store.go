@@ -32,6 +32,13 @@ type Checker interface {
 	Check(ctx context.Context) error
 }
 
+// Replayer is implemented by stores that stage failed writes locally and can
+// drain them in the background. Only collect starts it; query reads the local
+// staging area directly.
+type Replayer interface {
+	Replay(ctx context.Context)
+}
+
 // Store persists chunks and reads samples back.
 //
 // Write stores a complete chunk. The collector owns chunk assembly, so a store

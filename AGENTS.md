@@ -20,10 +20,10 @@ change affects both.
 
 ## Project status
 
-smob is pre-v0.1. System metrics, the disk backend, `collect`, and `query` are
-implemented. `stats` and `tail` remain stubs; process, S3, and Docker support
-are planned for later phases. The README describes the target v0.1 contract, not
-only current behavior.
+System and process metrics, the disk and S3 backends (including spool replay),
+`collect`, and `query` are implemented. `stats` and `tail` remain stubs; Docker
+support is planned for Phase 4, and retention and aggregation remain in Phase 5.
+The README describes the user-facing contract.
 
 ## Commands
 

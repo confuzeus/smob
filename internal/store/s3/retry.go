@@ -14,10 +14,10 @@ import (
 )
 
 // Retry bounds. A five-minute chunk cadence tolerates a few seconds of
-// transient failure, but a longer outage is the spool's job (Phase 3 item 4).
+// transient failure, but a longer outage is the spool's job.
 // Six attempts with equal jitter add at most about 7.75s of delay, so a broken
-// backend fails collection promptly with exit 3 instead of stalling for a whole
-// chunk interval.
+// backend reaches the spool promptly instead of stalling for a whole chunk
+// interval.
 const (
 	retryAttempts  = 6
 	retryBaseDelay = 250 * time.Millisecond

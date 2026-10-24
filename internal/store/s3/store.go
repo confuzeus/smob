@@ -3,7 +3,9 @@ package s3
 import (
 	"bytes"
 	"context"
+	"errors"
 	"fmt"
+	"log/slog"
 	"strings"
 
 	"github.com/aws/aws-sdk-go-v2/aws"
@@ -17,26 +19,45 @@ import (
 // maxCollisions bounds the suffix search so a writer bug cannot spin.
 const maxCollisions = 1000
 
+// errSpoolConflict means a spooled chunk names a key that already holds
+// different bytes. Replay must not suffix: the chunk is left in the spool for
+// an operator instead of creating a duplicate window.
+var errSpoolConflict = errors.New("spooled chunk conflicts with an existing object")
+
 // Store reads and writes chunks in one S3 bucket under an optional key prefix.
-// It uses the same relative chunk keys as the disk backend.
+// It uses the same relative chunk keys as the disk backend. A local spool stages
+// writes that exhaust the retry budget.
 type Store struct {
 	client *awss3.Client
 	bucket string
 	prefix string
+	spool  *spool
+	logger *slog.Logger
 }
 
 // New returns an S3 store for cfg. The configuration must already be resolved
 // with config.Config.Resolve. New does not contact the endpoint; Check validates
-// the bucket at startup.
-func New(ctx context.Context, cfg config.S3Storage) (*Store, error) {
+// the bucket and the spool at startup.
+func New(ctx context.Context, cfg config.S3Storage, logger *slog.Logger) (*Store, error) {
 	client, err := NewClient(ctx, cfg)
 	if err != nil {
 		return nil, err
+	}
+	if strings.TrimSpace(cfg.SpoolDir) == "" {
+		return nil, errors.New("s3: spool directory must not be empty")
+	}
+	if cfg.SpoolMaxBytes <= 0 {
+		return nil, errors.New("s3: spool_max_bytes must be greater than zero")
+	}
+	if logger == nil {
+		logger = slog.New(slog.DiscardHandler)
 	}
 	return &Store{
 		client: client,
 		bucket: cfg.Bucket,
 		prefix: strings.Trim(cfg.Prefix, "/"),
+		spool:  newSpool(cfg.SpoolDir, cfg.SpoolMaxBytes, logger),
+		logger: logger,
 	}, nil
 }
 
@@ -44,6 +65,11 @@ func New(ctx context.Context, cfg config.S3Storage) (*Store, error) {
 // transient failures with the same encoded bytes. If the window already
 // exists, the writer appends -1, -2, and so on instead of overwriting,
 // matching the disk backend.
+//
+// When the upload still cannot be persisted, the same encoded bytes are written
+// atomically to the local spool under the chunk key and Write returns success.
+// The chunk is never silently dropped: if the spool write also fails, the error
+// wraps store.ErrPersistent and collection exits 3.
 func (s *Store) Write(ctx context.Context, c store.Chunk) error {
 	if err := ctx.Err(); err != nil {
 		return err
@@ -61,14 +87,21 @@ func (s *Store) Write(ctx context.Context, c store.Chunk) error {
 		if ctx.Err() != nil {
 			return ctx.Err()
 		}
-		return fmt.Errorf("write %s: %w: %w", s.objectKey(key), store.ErrPersistent, err)
+		spooled, spoolErr := s.spool.write(ctx, key, body.Bytes())
+		if spoolErr != nil {
+			return fmt.Errorf("write %s: %w", s.objectKey(key), errors.Join(store.ErrPersistent, err, spoolErr))
+		}
+		s.logger.Warn("upload failed; chunk spooled",
+			"key", key, "spool_key", spooled, "error", err)
+		s.spool.enforceCap(ctx, spooled)
+		return nil
 	}
 	return nil
 }
 
 // Check implements store.Checker. It verifies that the bucket is reachable and
-// that the configured credentials can read it. Write permission is proven by
-// the first chunk write.
+// that the configured credentials can read it, and that the spool is a writable
+// directory. Write permission to the bucket is proven by the first chunk write.
 func (s *Store) Check(ctx context.Context) error {
 	if err := ctx.Err(); err != nil {
 		return err
@@ -85,10 +118,15 @@ func (s *Store) Check(ctx context.Context) error {
 		}
 		return fmt.Errorf("check %s: %w: %w", s.location(), store.ErrPersistent, err)
 	}
+	if err := s.spool.check(ctx); err != nil {
+		return fmt.Errorf("check spool %s: %w: %w", s.spool.dir, store.ErrPersistent, err)
+	}
 	return nil
 }
 
 // Close implements store.Store. An S3 store holds no resources between calls.
+// Any background replay is owned by collect, which waits for it before the
+// process exits; an in-flight request that outlives this call is harmless.
 func (s *Store) Close() error { return nil }
 
 // put writes body to key without replacing an existing object. A conditional
@@ -224,6 +262,48 @@ func (s *Store) verifyObject(ctx context.Context, target string, body []byte) (s
 		return false, false, nil
 	}
 	return bytes.Equal(existing, body), true, nil
+}
+
+// exactAttempts bounds putExact's outer loop when a conflicting object
+// disappears between the conditional PUT and the comparison read.
+const exactAttempts = 3
+
+// putExact uploads body to exactly key. Unlike put, it never picks a collision
+// suffix. An existing object with identical bytes is treated as success, which
+// is what a replay needs when a previous upload landed but deleting the spool
+// entry failed. Different bytes are a permanent conflict: replay leaves the
+// spool entry for an operator rather than creating a -1 duplicate.
+func (s *Store) putExact(ctx context.Context, key string, body []byte) error {
+	target := s.objectKey(key)
+	for attempt := 1; attempt <= exactAttempts; attempt++ {
+		if err := ctx.Err(); err != nil {
+			return err
+		}
+		done, err := s.putCandidate(ctx, target, body)
+		if err != nil {
+			return err
+		}
+		if done {
+			return nil
+		}
+
+		// putCandidate reports false when the key is owned by another object.
+		// Compare the bytes directly, because replay must distinguish "already
+		// uploaded" from a genuine collision.
+		same, found, err := s.verifyObject(ctx, target, body)
+		if err != nil {
+			return err
+		}
+		switch {
+		case found && same:
+			return nil
+		case found:
+			return fmt.Errorf("%s: %w", target, errSpoolConflict)
+		}
+		// The object vanished between the conflict and the read. Retry the
+		// same key rather than suffixing.
+	}
+	return fmt.Errorf("put %s: retry budget exhausted", target)
 }
 
 // objectKey returns the full object key for a relative chunk key.

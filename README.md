@@ -14,10 +14,10 @@ interchangeable and existing data can be copied between them with
 `aws s3 sync`.
 
 > **Project status:** smob is v0.1. System and process metrics, the disk and S3
-> backends, `collect`, and `query` are implemented. S3 spooling and IAM
-> guidance are still pending, as are Docker, retention, and aggregation. `stats`
-> and `tail` remain stubs. The command and metric reference below describes the
-> v0.1 contract. See the
+> backends (including local spool replay), `collect`, and `query` are
+> implemented. S3 IAM guidance is still pending, as are Docker, retention, and
+> aggregation. `stats` and `tail` remain stubs. The command and metric reference
+> below describes the v0.1 contract. See the
 > [design and implementation plan](docs/IMPLEMENTATION.md) for the roadmap.
 
 ## Features
@@ -220,8 +220,16 @@ no mirroring or dual-write.
 - **S3** writes to an AWS or S3-compatible bucket using the standard AWS
   credential chain (environment, shared config, or instance role). Credentials
   are never stored in `smob.yaml`. Transient failures are retried with
-  exponential backoff and jitter; a write that still cannot be persisted is a
-  persistent store failure (exit code 3).
+  exponential backoff and jitter. A chunk that still cannot be uploaded is
+  written atomically to a local spool (`storage.s3.spool_dir`, default
+  `<data_dir>/spool`), and a background replayer uploads it in key order. Replay
+  uses the exact chunk key: an object already present with identical bytes is
+  treated as stored and the spool copy is deleted, so a failed delete cannot
+  create a duplicate. Only a failed spool write is a persistent store failure
+  (exit code 3). The spool is capped by `storage.s3.spool_max_bytes`; when it
+  stays full, the oldest chunks are dropped with an `error` log. `query` merges
+  readable spool entries with the bucket, so chunks not yet uploaded are still
+  visible on the collecting host.
 
 Both backends use the same keys and sample format, so migrating from disk to S3
 is a copy followed by a configuration change:

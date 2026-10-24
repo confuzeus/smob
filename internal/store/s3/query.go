@@ -9,7 +9,10 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"io/fs"
+	"maps"
 	"path"
+	"slices"
 	"sort"
 	"strings"
 	"time"
@@ -54,7 +57,7 @@ func (s *Store) Query(ctx context.Context, q model.Query, yield func(model.Sampl
 		if q.Limit > 0 {
 			limit = q.Limit - emitted
 		}
-		n, err := s.merge(ctx, group.keys, filter, limit, yield)
+		n, err := s.merge(ctx, group.refs, filter, limit, yield)
 		emitted += n
 		if err != nil {
 			return err
@@ -66,10 +69,54 @@ func (s *Store) Query(ctx context.Context, q model.Query, yield func(model.Sampl
 	return nil
 }
 
-// hourGroup is the set of objects that may contain chunks for one UTC hour.
+// hourGroup is the set of chunks that may contain samples for one UTC hour.
 // Groups are kept in hour order, which keeps output globally sorted.
 type hourGroup struct {
-	keys []string
+	refs []chunkRef
+}
+
+// chunkRef identifies one chunk by its relative key and where to read it. A
+// remote ref is a bucket object; a local ref is a spool file that has not been
+// uploaded yet.
+type chunkRef struct {
+	key   string
+	local bool
+}
+
+// unionRefs overlays local spool keys on bucket keys. A key present in both is
+// read from the bucket only, so an object whose spool deletion failed is not
+// emitted twice. The result is sorted by key for deterministic reads.
+func unionRefs(remote, local []string) []chunkRef {
+	seen := make(map[string]struct{}, len(remote)+len(local))
+	refs := make([]chunkRef, 0, len(remote)+len(local))
+	for _, key := range remote {
+		if _, ok := seen[key]; ok {
+			continue
+		}
+		seen[key] = struct{}{}
+		refs = append(refs, chunkRef{key: key})
+	}
+	for _, key := range local {
+		if _, ok := seen[key]; ok {
+			continue
+		}
+		seen[key] = struct{}{}
+		refs = append(refs, chunkRef{key: key, local: true})
+	}
+	sort.Slice(refs, func(i, j int) bool { return refs[i].key < refs[j].key })
+	return refs
+}
+
+// unionStrings returns the sorted union of two string slices.
+func unionStrings(a, b []string) []string {
+	set := make(map[string]struct{}, len(a)+len(b))
+	for _, value := range a {
+		set[value] = struct{}{}
+	}
+	for _, value := range b {
+		set[value] = struct{}{}
+	}
+	return slices.Sorted(maps.Keys(set))
 }
 
 // target is one host/scope path to scan.
@@ -103,20 +150,25 @@ func (s *Store) hourGroups(ctx context.Context, q model.Query) ([]hourGroup, err
 			return nil, err
 		}
 
-		var keys []string
+		var remote, local []string
 		for _, t := range targets {
 			found, err := s.listHour(ctx, t.host, t.scope, h, q.Range)
 			if err != nil {
 				return nil, err
 			}
-			keys = append(keys, found...)
+			remote = append(remote, found...)
+
+			found, err = s.spool.listHour(t.host, t.scope, h, q.Range)
+			if err != nil {
+				return nil, fmt.Errorf("list spool %s: %w", s.spool.dir, err)
+			}
+			local = append(local, found...)
 		}
-		if len(keys) == 0 {
+		refs := unionRefs(remote, local)
+		if len(refs) == 0 {
 			continue
 		}
-
-		sort.Strings(keys)
-		groups = append(groups, hourGroup{keys: keys})
+		groups = append(groups, hourGroup{refs: refs})
 	}
 	return groups, nil
 }
@@ -153,7 +205,11 @@ func (s *Store) walkHourGroups(ctx context.Context, q model.Query) ([]hourGroup,
 		}
 		for _, object := range page.Contents {
 			key := aws.ToString(object.Key)
-			name := path.Base(key)
+			rel, ok := s.relativeKey(key)
+			if !ok {
+				continue
+			}
+			name := path.Base(rel)
 			if !strings.HasSuffix(name, chunk.FileSuffix) {
 				continue
 			}
@@ -165,23 +221,51 @@ func (s *Store) walkHourGroups(ctx context.Context, q model.Query) ([]hourGroup,
 				continue
 			}
 			hour := start.UTC().Truncate(time.Hour)
-			byHour[hour] = append(byHour[hour], key)
+			byHour[hour] = append(byHour[hour], rel)
 		}
 	}
 
-	hours := make([]time.Time, 0, len(byHour))
+	spooled, err := s.spool.list(ctx, q.Range, q.Host, q.Scope)
+	if err != nil {
+		return nil, fmt.Errorf("list spool %s: %w", s.spool.dir, err)
+	}
+
+	hours := make([]time.Time, 0, len(byHour)+len(spooled))
+	seenHours := make(map[time.Time]struct{}, len(byHour)+len(spooled))
 	for hour := range byHour {
+		seenHours[hour] = struct{}{}
+		hours = append(hours, hour)
+	}
+	for hour := range spooled {
+		if _, ok := seenHours[hour]; ok {
+			continue
+		}
 		hours = append(hours, hour)
 	}
 	sort.Slice(hours, func(i, j int) bool { return hours[i].Before(hours[j]) })
 
 	groups := make([]hourGroup, 0, len(hours))
 	for _, hour := range hours {
-		keys := byHour[hour]
-		sort.Strings(keys)
-		groups = append(groups, hourGroup{keys: keys})
+		refs := unionRefs(byHour[hour], spooled[hour])
+		if len(refs) == 0 {
+			continue
+		}
+		groups = append(groups, hourGroup{refs: refs})
 	}
 	return groups, nil
+}
+
+// relativeKey strips the configured root prefix from a bucket key. A key that
+// is outside the prefix cannot come from this store and is ignored.
+func (s *Store) relativeKey(key string) (string, bool) {
+	prefix := s.rootPrefix()
+	if prefix == "" {
+		return key, true
+	}
+	if !strings.HasPrefix(key, prefix) {
+		return "", false
+	}
+	return strings.TrimPrefix(key, prefix), true
 }
 
 // targets resolves the host/scope paths to scan. An explicit host or scope is
@@ -213,7 +297,15 @@ func (s *Store) hosts(ctx context.Context, host string) ([]string, error) {
 		}
 		return []string{host}, nil
 	}
-	return s.listComponents(ctx, s.rootPrefix())
+	remote, err := s.listComponents(ctx, s.rootPrefix())
+	if err != nil {
+		return nil, err
+	}
+	local, err := s.spool.hosts()
+	if err != nil {
+		return nil, fmt.Errorf("list spool %s: %w", s.spool.dir, err)
+	}
+	return unionStrings(remote, local), nil
 }
 
 func (s *Store) scopes(ctx context.Context, host, scope string) ([]string, error) {
@@ -223,7 +315,15 @@ func (s *Store) scopes(ctx context.Context, host, scope string) ([]string, error
 		}
 		return []string{scope}, nil
 	}
-	return s.listComponents(ctx, s.rootPrefix()+host+"/")
+	remote, err := s.listComponents(ctx, s.rootPrefix()+host+"/")
+	if err != nil {
+		return nil, err
+	}
+	local, err := s.spool.scopes(host)
+	if err != nil {
+		return nil, fmt.Errorf("list spool %s: %w", s.spool.dir, err)
+	}
+	return unionStrings(remote, local), nil
 }
 
 // listComponents returns the immediate child prefixes under prefix that can be
@@ -254,8 +354,8 @@ func (s *Store) listComponents(ctx context.Context, prefix string) ([]string, er
 	return names, nil
 }
 
-// listHour returns the object keys in one host/scope/hour whose windows overlap
-// r. A missing prefix is an empty hour, not an error.
+// listHour returns the relative keys in one host/scope/hour whose windows
+// overlap r. A missing prefix is an empty hour, not an error.
 func (s *Store) listHour(ctx context.Context, host, scope string, hour time.Time, r model.TimeRange) ([]string, error) {
 	prefix := s.hourPrefix(host, scope, hour)
 
@@ -274,7 +374,11 @@ func (s *Store) listHour(ctx context.Context, host, scope string, hour time.Time
 		}
 		for _, object := range page.Contents {
 			key := aws.ToString(object.Key)
-			name := path.Base(key)
+			rel, ok := s.relativeKey(key)
+			if !ok {
+				continue
+			}
+			name := path.Base(rel)
 			if !strings.HasSuffix(name, chunk.FileSuffix) {
 				continue
 			}
@@ -285,9 +389,10 @@ func (s *Store) listHour(ctx context.Context, host, scope string, hour time.Time
 			if !chunk.Overlaps(start, end, r) {
 				continue
 			}
-			keys = append(keys, key)
+			keys = append(keys, rel)
 		}
 	}
+	sort.Strings(keys)
 	return keys, nil
 }
 
@@ -371,23 +476,49 @@ func (h *objectHeap) Pop() any {
 	return x
 }
 
-// merge downloads keys and yields their matching samples as one sorted stream.
-// A key that disappeared between listing and opening is skipped.
-func (s *Store) merge(ctx context.Context, keys []string, filter *store.Filter, limit int, yield func(model.Sample) error) (int, error) {
-	active := make([]*objectStream, 0, len(keys))
-	for _, key := range keys {
+// readRef returns the bytes of one chunk. A nil slice with a nil error means
+// the chunk disappeared between listing and opening, which is not a query
+// failure.
+func (s *Store) readRef(ctx context.Context, ref chunkRef) ([]byte, error) {
+	if ref.local {
+		data, err := s.spool.read(ref.key)
+		if errors.Is(err, fs.ErrNotExist) {
+			return nil, nil
+		}
+		if err != nil {
+			return nil, fmt.Errorf("read spool %s: %w", ref.key, err)
+		}
+		return data, nil
+	}
+
+	data, ok, err := s.getObject(ctx, s.objectKey(ref.key))
+	if err != nil {
+		return nil, err
+	}
+	if !ok {
+		return nil, nil
+	}
+	return data, nil
+}
+
+// merge reads refs from the bucket or spool and yields their matching samples
+// as one sorted stream. A chunk that disappeared between listing and opening is
+// skipped.
+func (s *Store) merge(ctx context.Context, refs []chunkRef, filter *store.Filter, limit int, yield func(model.Sample) error) (int, error) {
+	active := make([]*objectStream, 0, len(refs))
+	for _, ref := range refs {
 		if err := ctx.Err(); err != nil {
 			return 0, err
 		}
-		data, ok, err := s.getObject(ctx, key)
+		data, err := s.readRef(ctx, ref)
 		if err != nil {
 			return 0, err
 		}
-		if !ok {
+		if data == nil {
 			continue
 		}
 
-		st, err := openObjectStream(key, data)
+		st, err := openObjectStream(ref.key, data)
 		if err != nil {
 			return 0, err
 		}

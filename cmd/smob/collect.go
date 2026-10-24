@@ -52,7 +52,7 @@ func (a *app) runCollect(ctx context.Context, dryRun, once bool) error {
 		return err
 	}
 
-	st, err := newStore(ctx, a.cfg)
+	st, err := newStore(ctx, a.cfg, a.logger)
 	if err != nil {
 		return err
 	}
@@ -83,6 +83,25 @@ func (a *app) runCollect(ctx context.Context, dryRun, once bool) error {
 	c := collector.New(a.cfg, sources, st, a.logger)
 	if once {
 		return c.RunOnce(ctx)
+	}
+
+	// Drain anything staged by a previous failed upload while collection runs.
+	// The replayer shares the command context, so a signal stops it promptly;
+	// chunks written by the final flush stay in the spool for the next start.
+	// Run closes the store, but S3 Close is a no-op; replay is canceled and
+	// waited for as soon as Run returns, including the early-error path.
+	if replayer, ok := st.(store.Replayer); ok {
+		replayCtx, stopReplay := context.WithCancel(ctx)
+		done := make(chan struct{})
+		go func() {
+			defer close(done)
+			replayer.Replay(replayCtx)
+		}()
+
+		err := c.Run(ctx)
+		stopReplay()
+		<-done
+		return err
 	}
 	return c.Run(ctx)
 }
