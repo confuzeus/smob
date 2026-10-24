@@ -419,6 +419,30 @@ Dockerfile                     # FROM scratch, static binary, CA bundle
 - [x] Add `--version` and `--help` snapshot tests.
 - [x] Run the extended suite in CI with MinIO and Docker; keep strict mode.
 - [ ] Tag `v0.2.0`; publish binaries and the Docker image.
+
+  **Blocked on a remote and publication credentials.** The annotated `v0.2.0`
+  tag exists locally on the commit that contains this note. The ignored `dist/`
+  directory holds `smob-linux-amd64` and `smob-linux-arm64`, and the local
+  `smob:v0.2.0` image was built and verified. This checkout has no `origin`
+  remote, no `gh`, and no registry login, so no tag, asset, or image has been
+  pushed or published. To finish, a maintainer must run:
+
+  ```sh
+  git remote add origin <repository-url>
+  git push origin master
+  git push origin v0.2.0
+  gh release create v0.2.0 dist/smob-linux-amd64 dist/smob-linux-arm64 \
+    --title "smob v0.2.0" --notes-file docs/releases/v0.2.0.md
+  docker tag smob:v0.2.0 <registry>/smob:v0.2.0
+  docker push <registry>/smob:v0.2.0
+  ```
+
+  Rebuild the ignored artifacts with `VERSION=v0.2.0 just release` and the
+  image with `VERSION=v0.2.0 just docker` if they are no longer present. Mark
+  this item complete only after the push, release, and image publication
+  commands succeed. Release notes are in
+  [`docs/releases/v0.2.0.md`](releases/v0.2.0.md).
+
 - [ ] Post-release: collect feedback and scope v0.3 (live tail, chunk index, multi-host query).
 
 ### Cross-Cutting (run throughout)
