@@ -13,6 +13,8 @@ design rationale is in [IMPLEMENTATION.md](IMPLEMENTATION.md).
   is valid.
 - Decoding is strict. An unknown field and a second YAML document are errors,
   never silently ignored.
+- The file is read through a 4 MiB cap. A larger file is a usage error
+  (`config: file ... exceeds 4 MiB limit`) instead of being decoded.
 - Durations are Go duration strings such as `10s`, `5m`, or `1h30m`. A
   non-string duration is rejected.
 - `Resolve()` fills dependent defaults (S3 region, path style, and spool
@@ -43,7 +45,7 @@ smob config --config ./smob.yaml
 | --- | --- | --- | --- | --- |
 | `data_dir` | string | `/var/lib/smob` | Required when `storage.primary` is `disk`: `data_dir: required when storage.primary is disk`. May be empty only with S3 when `storage.s3.spool_dir` is set. | Root directory for the disk backend. Also the base for the default S3 spool directory. Must be writable by the user running `collect`; `query` only needs read access. `--data-dir` overrides it. |
 | `proc_path` | string | `/proc` | Must not be empty: `proc_path: must not be empty`. | Root of the procfs used by the system and process sources. Set it to `/host/proc` when a container mounts the host procfs there. |
-| `host` | string | `os.Hostname()` when empty | Must not be empty after resolution: `host: must not be empty`. Must be a single path component: `host: must be a single path component; got %q`. It cannot be `.` or `..` and cannot contain `/`. | Value of the `host` label on every sample and the first component of every chunk key. It identifies the writer; do not run two collectors with the same host and prefix. |
+| `host` | string | `os.Hostname()` when empty | Must not be empty after resolution: `host: must not be empty`. Must be a single path component: `host: must be a single path component; got %q`. It cannot be `.` or `..`, cannot contain `/` or an ASCII control character, cannot have leading or trailing whitespace, and is limited to 255 bytes. | Value of the `host` label on every sample and the first component of every chunk key. It identifies the writer; do not run two collectors with the same host and prefix. |
 | `log_level` | string | `info` | One of `debug`, `info`, `warn`, `error`: `log_level: must be one of debug, info, warn, error; got %q`. | Minimum severity written to stderr. `--log-level` overrides it. |
 | `log_format` | string | `text` | `text` or `json`: `log_format: must be text or json; got %q`. | Log encoding. `text` is for people; `json` is for structured log collection. `--log-format` overrides it. |
 
@@ -60,7 +62,7 @@ Host-wide CPU, memory, and network metrics from `proc_path`.
 | Field | Type | Default | Validation | Effect |
 | --- | --- | --- | --- | --- |
 | `sources.system.enabled` | boolean | `true` | — | Run the system source. |
-| `sources.system.interval` | duration | `10s` | When enabled, must be greater than zero: `sources.system.interval: must be greater than zero`. | Collection cadence. The first tick produces gauges only; later ticks also produce CPU and network rates. |
+| `sources.system.interval` | duration | `10s` | When enabled, must be greater than zero (`sources.system.interval: must be greater than zero`) and at least 1ms (`sources.system.interval: must be at least 1ms; got 500µs`). | Collection cadence. The first tick produces gauges only; later ticks also produce CPU and network rates. Sub-millisecond values are rejected so a rate window never rounds to `interval_ms=0`. |
 
 ### Process source
 
@@ -70,9 +72,9 @@ Per-process CPU and RSS from `proc_path/[pid]`.
 | --- | --- | --- | --- | --- |
 | `sources.process.enabled` | boolean | `false` | — | Run the process source. |
 | `sources.process.filter` | string | empty | When enabled, must compile as a Go regular expression: `sources.process.filter: <regexp error>`. | Unanchored expression matched against `comm`. Empty matches every process. `comm` is truncated to 15 bytes by the kernel, so match that name, not the command line. |
-| `sources.process.top_n` | integer | `20` | When enabled, must not be negative: `sources.process.top_n: must not be negative`. | Maximum number of process series per tick, selected by CPU, then RSS, then PID. `0` records every matching process and can produce a large volume. |
-| `sources.process.interval` | duration | `30s` | When enabled, must be greater than zero: `sources.process.interval: must be greater than zero`. | Collection cadence. |
-| `sources.process.rescan_interval` | duration | `30s` | When enabled, must be greater than zero: `sources.process.rescan_interval: must be greater than zero`. | How often the proc root is listed to discover new PIDs. It is independent of `interval`; a shorter value makes new processes appear sooner. |
+| `sources.process.top_n` | integer | `20` | When enabled, must not be negative: `sources.process.top_n: must not be negative`. | Maximum number of processes selected per tick, ranked by CPU, then RSS, then PID. A process with no CPU rate yet (the first tick it is seen) ranks as zero CPU, so the ranking falls through to RSS. Each selected process emits one RSS gauge and, once a previous observation exists, one CPU rate, so a tick writes at most `2 × top_n` samples. `0` selects every matching process and can produce a large volume. |
+| `sources.process.interval` | duration | `30s` | When enabled, must be greater than zero (`sources.process.interval: must be greater than zero`) and at least 1ms (`sources.process.interval: must be at least 1ms; got 500µs`). | Collection cadence. Sub-millisecond values are rejected so a rate window never rounds to `interval_ms=0`. |
+| `sources.process.rescan_interval` | duration | `30s` | When enabled, must be greater than zero: `sources.process.rescan_interval: must be greater than zero`. | Minimum age of the PID list before the proc root is listed again for new PIDs. The listing only happens on a collection tick, so the effective period is the smallest multiple of `interval` at or above this value, give or take the scheduler's ±5% tick jitter: `rescan_interval: 45s` with `interval: 30s` lists every 60s, not every 45s. The first tick always lists; a value well below `interval` lists on nearly every tick. Once a scan has succeeded, a failed listing keeps the previous PID set and retries after another rescan period. |
 
 ### Docker source
 
@@ -86,16 +88,18 @@ permissions.
 | --- | --- | --- | --- | --- |
 | `sources.docker.enabled` | boolean | `false` | — | Run the Docker source and probe the daemon at startup. |
 | `sources.docker.socket` | string | `/var/run/docker.sock` | When enabled, must not be empty: `sources.docker.socket: required when the docker source is enabled`. | Docker Engine API socket path. |
-| `sources.docker.exclude` | string | empty | When enabled, must compile as a Go regular expression: `sources.docker.exclude: <regexp error>`. | Unanchored expression matched against the container name with Docker's leading slash removed. It never matches container IDs. Empty excludes nothing; anchor with `^` and `$` for an exact name. |
-| `sources.docker.interval` | duration | `10s` | When enabled, must be greater than zero: `sources.docker.interval: must be greater than zero`. | One-shot polling cadence, and the cadence at which streamed observations are drained. Any positive duration is accepted, including sub-second values; very small values increase daemon load. |
-| `sources.docker.rescan_interval` | duration | `30s` | When enabled, must be greater than zero: `sources.docker.rescan_interval: must be greater than zero`. | How often the running container set is enumerated. New containers start contributing without a restart; stopped containers disappear from later samples. |
-| `sources.docker.stream_stats` | boolean | `false` | Requires the source: `sources.docker.stream_stats: requires sources.docker.enabled`. | Keep one persistent stats stream per container instead of polling one-shot stats. Streams cost a goroutine and connection per container, so this is opt-in. `collect --once` always uses one-shot stats because a single snapshot has no stream history. |
+| `sources.docker.exclude` | string | empty | When enabled, must compile as a Go regular expression: `sources.docker.exclude: <regexp error>`. | Unanchored expression matched against the container name with Docker's leading slash removed. It never matches container IDs. Empty excludes nothing; anchor with `^` and `$` for an exact name. An expression matching every container is accepted and yields no container series, with no warning; containers the daemon reports without a name are kept under their ID and are never filtered by name. |
+| `sources.docker.interval` | duration | `10s` | When enabled, must be greater than zero (`sources.docker.interval: must be greater than zero`) and at least 1ms (`sources.docker.interval: must be at least 1ms; got 500µs`). | One-shot polling cadence, and the cadence at which streamed observations are drained. Sub-millisecond values are rejected so a rate window never rounds to `interval_ms=0`; very small values increase daemon load. |
+| `sources.docker.rescan_interval` | duration | `30s` | When enabled, must be greater than zero: `sources.docker.rescan_interval: must be greater than zero`. | How often the running container set is enumerated. Unlike the process source, this runs on its own ticker, so a rescan can fall between collection ticks. New containers start contributing without a restart; stopped containers disappear from later samples. |
+| `sources.docker.stream_stats` | boolean | `false` | Requires the source: `sources.docker.stream_stats: requires sources.docker.enabled`. | Keep one persistent stats stream per container instead of polling one-shot stats. Streams cost a goroutine and connection per container, so this is opt-in. A stream that delivers nothing for `max(3 × interval, 30s)` is reopened. `collect --once` always uses one-shot stats because a single snapshot has no stream history. |
 
 ## Storage
 
 Exactly one backend is active. `storage.primary` selects the write target, and
 `query` and `stats` read the same backend. There is no mirroring or dual-write.
-To move existing disk data to S3, see [migration.md](migration.md).
+To move existing disk data to S3, see [migration.md](migration.md). New chunk and
+spool files are created `0640` inside `0750` directories, so ensure the service
+user and group can read the data directory.
 
 | Field | Type | Default | Validation | Effect |
 | --- | --- | --- | --- | --- |
@@ -106,16 +110,19 @@ To move existing disk data to S3, see [migration.md](migration.md).
 
 The S3 section is used when `storage.primary` is `s3`. See
 [s3.md](s3.md) for the IAM policy, credential chain, and a local MinIO recipe.
+`endpoint`, `region`, `bucket`, `prefix`, and `spool_dir` are trimmed of
+surrounding whitespace before validation; `prefix` also loses any leading and
+trailing slashes.
 
 | Field | Type | Default | Validation | Effect |
 | --- | --- | --- | --- | --- |
-| `storage.s3.endpoint` | string | empty | When `primary` is `s3` and this is set, must be an absolute `http` or `https` URL with a host: `storage.s3.endpoint: must be an http or https URL; got %q` or `storage.s3.endpoint: must include a host; got %q`. | Custom S3-compatible endpoint. Empty uses AWS S3. |
+| `storage.s3.endpoint` | string | empty | When `primary` is `s3` and this is set, must be an absolute `http` or `https` URL with a host and no userinfo, query, or fragment: `storage.s3.endpoint: must be an http or https URL; got %q`, `storage.s3.endpoint: must include a host; got %q`, `storage.s3.endpoint: must not include userinfo; got %q`, `storage.s3.endpoint: must not include a query string; got %q`, `storage.s3.endpoint: must not include a fragment; got %q`. | Custom S3-compatible endpoint. Empty uses AWS S3. |
 | `storage.s3.region` | string | empty; resolved to `us-east-1` when `endpoint` is set | When `primary` is `s3`, required when `endpoint` is empty: `storage.s3.region: required unless storage.s3.endpoint is set`. | Signing region. MinIO and most compatible services ignore the value, but the AWS SDK requires one. |
-| `storage.s3.bucket` | string | empty | Required when `primary` is `s3`: `storage.s3.bucket: required when storage.primary is s3`. | Bucket name. The bucket must already exist; smob does not create it. |
-| `storage.s3.prefix` | string | empty | — | Key root inside the bucket. Leading and trailing slashes are trimmed. Empty means the bucket root. A non-empty prefix is recommended so the IAM policy can scope object access. |
+| `storage.s3.bucket` | string | empty | Required when `primary` is `s3`: `storage.s3.bucket: required when storage.primary is s3`. At most 255 bytes, with no control characters and no whitespace: `storage.s3.bucket: must be at most 255 bytes; got %d`, `storage.s3.bucket: must not contain control characters; got %q`, `storage.s3.bucket: must not contain whitespace; got %q`. | Bucket name. The bucket must already exist; smob does not create it. The AWS DNS naming rules are not enforced, so names that only a compatible service accepts are allowed. |
+| `storage.s3.prefix` | string | empty | When `primary` is `s3`, must not contain an empty segment or a repeated slash (`storage.s3.prefix: must not contain empty segments or repeated slashes; got %q`) or a `.` or `..` segment (`storage.s3.prefix: must not contain %q segments; got %q`). | Key root inside the bucket. Leading and trailing slashes are trimmed. Empty means the bucket root. A non-empty prefix is recommended so the IAM policy can scope object access. |
 | `storage.s3.path_style` | boolean | unset; resolved to `true` when `endpoint` is set, otherwise `false` | — | Use path-style addressing (`endpoint/bucket/key`) instead of virtual-hosted style (`bucket.endpoint/key`). Set it explicitly only when the service requires virtual-hosted style and DNS supports the bucket hostname. |
 | `storage.s3.spool_dir` | string | empty; resolved to `<data_dir>/spool` | Required when `primary` is `s3` and `data_dir` is empty: `storage.s3.spool_dir: required when data_dir is empty`. | Local directory for chunks that could not be uploaded. Startup creates it if needed, probes it, and fails with exit code 3 when it is not writable. |
-| `storage.s3.spool_max_bytes` | integer (bytes) | `1073741824` (1 GiB) | Must be greater than zero: `storage.s3.spool_max_bytes: must be greater than zero`. Validated even when `primary` is `disk`. | Cap on the total size of spooled chunks. Over the cap, the lexicographically oldest unprotected chunks are dropped and each drop is logged at `error`; collection never blocks on the network. A single chunk larger than the cap can leave the spool above the limit. |
+| `storage.s3.spool_max_bytes` | integer (bytes) | `1073741824` (1 GiB) | Must be greater than zero: `storage.s3.spool_max_bytes: must be greater than zero`. Validated even when `primary` is `disk`; `0` is rejected, not treated as unlimited. | Cap on the total size of spooled chunks. It is enforced at startup before collection writes, then after each spooled chunk: the lexicographically oldest unprotected chunks are dropped and each drop is logged at `error`; collection never blocks on the network. A single chunk larger than the cap can leave the spool above the limit. |
 
 ## Retention
 
@@ -127,8 +134,24 @@ size, and size is the total on-disk size of chunk files.
 
 | Field | Type | Default | Validation | Effect |
 | --- | --- | --- | --- | --- |
-| `retention.disk.max_age` | duration | `0` (disabled) | Must not be negative: `retention.disk.max_age: must not be negative; zero disables the limit`. | Delete closed chunks whose end is at or before `now - max_age`. Age is measured from the chunk end, the moment the window is complete. |
-| `retention.disk.max_bytes` | integer (bytes) | `0` (disabled) | Must not be negative: `retention.disk.max_bytes: must not be negative; zero disables the limit`. | Keep total chunk-file size at or below this cap by deleting the oldest closed chunks first. Only files in the documented chunk layout are eligible; `.tmp` files, the S3 spool, and stray files are ignored. |
+| `retention.disk.max_age` | duration | `0` (disabled) | Must not be negative: `retention.disk.max_age: must not be negative; zero disables the limit`. | Delete closed chunks whose end is at or before `now - max_age`. Age is measured from the chunk end, the moment the window is complete; a future end falls back to the chunk start so a clock jump cannot exempt a chunk forever. |
+| `retention.disk.max_bytes` | integer (bytes) | `0` (disabled) | Must not be negative: `retention.disk.max_bytes: must not be negative; zero disables the limit`. | Keep total chunk-file size at or below this cap by deleting the oldest closed chunks first. Only files in the documented chunk layout are eligible; `.tmp` files, the configured S3 spool subtree (even inside `data_dir`), and stray files are ignored. |
+
+## Trust boundary
+
+- `data_dir` and `spool_dir` must be writable only by the user that runs
+  `collect`, and readable only by that user and its service group. smob does not
+  defend against a local user who can write inside them: a writer there can
+  already replace, delete, or plant files, so the filesystem is part of the
+  trust boundary rather than an input.
+- Chunk writes stay inside `data_dir` even when a component is a symlink. If a
+  `host` or `scope` directory resolves outside `data_dir`, the write fails
+  instead of escaping it; the `data_dir` itself may be reached through a
+  symlink. A chunk is published by a hard link, with a non-replacing rename as
+  the fallback, so a symlink planted at the target key is never followed.
+- New chunk and spool files are created `0640` inside `0750` directories, and
+  files that already exist keep their modes. Anyone who can read a chunk can
+  read every metric, label, and PID recorded in it.
 
 ## Example
 

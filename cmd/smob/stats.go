@@ -3,6 +3,7 @@ package main
 import (
 	"context"
 	"errors"
+	"fmt"
 	"syscall"
 	"time"
 
@@ -22,13 +23,14 @@ func (a *app) statsCommand() *cobra.Command {
 
 The same range defaults and filters as query apply. Each metric produces one
 row with the number of matching samples, the minimum, the maximum, and the
-arithmetic mean. Metrics are sorted alphabetically. Mean is the unweighted
-arithmetic mean of sample values; interval_ms does not affect it.
+mean. Metrics are sorted alphabetically. Mean is interval-weighted for rate
+metrics and unweighted for gauges, so it equals query --agg avg for the same
+range and filters.
 
 --limit stops the scan after N matching samples (default 10000, 0 unlimited),
 so a limited run reports partial statistics over those samples. An empty result
 prints only the header (or [] for JSON) and exits 0.`,
-		Args: cobra.NoArgs,
+		Args: noArgs,
 		RunE: func(cmd *cobra.Command, _ []string) error {
 			if err := a.load(cmd); err != nil {
 				return err
@@ -52,6 +54,19 @@ func (a *app) runStats(cmd *cobra.Command, q model.Query, format string) error {
 	}
 	defer func() { _ = st.Close() }()
 
+	var summaries query.Summarizer
+	if err := st.Query(cmd.Context(), q, func(sample model.Sample) error {
+		summaries.Add(sample)
+		return nil
+	}); err != nil {
+		return statsError(err)
+	}
+
+	rows, err := summaries.Summaries()
+	if err != nil {
+		return err
+	}
+
 	out, err := query.NewSummaryWriter(cmd.OutOrStdout(), format)
 	if err != nil {
 		if errors.Is(err, syscall.EPIPE) {
@@ -60,18 +75,7 @@ func (a *app) runStats(cmd *cobra.Command, q model.Query, format string) error {
 		return err
 	}
 
-	var summaries query.Summarizer
-	if err := st.Query(cmd.Context(), q, func(sample model.Sample) error {
-		summaries.Add(sample)
-		return nil
-	}); err != nil {
-		if errors.Is(err, context.Canceled) || errors.Is(err, syscall.EPIPE) {
-			return nil
-		}
-		return err
-	}
-
-	for _, summary := range summaries.Summaries() {
+	for _, summary := range rows {
 		if err := out.Write(summary); err != nil {
 			if errors.Is(err, syscall.EPIPE) {
 				return nil
@@ -86,4 +90,17 @@ func (a *app) runStats(cmd *cobra.Command, q model.Query, format string) error {
 		return err
 	}
 	return nil
+}
+
+// statsError classifies a scan failure. A canceled context means the summary
+// covers only part of the range, so it is reported as a failure instead of
+// being printed as complete statistics. A broken pipe stays a clean exit.
+func statsError(err error) error {
+	if errors.Is(err, syscall.EPIPE) {
+		return nil
+	}
+	if errors.Is(err, context.Canceled) {
+		return fmt.Errorf("stats interrupted: %w", err)
+	}
+	return err
 }

@@ -23,18 +23,15 @@ func main() {
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
 
-	// The first signal cancels the command context so collect can flush its
-	// active chunks. A second signal exits immediately instead of waiting.
 	sigs := make(chan os.Signal, 2)
 	signal.Notify(sigs, os.Interrupt, syscall.SIGTERM)
 	defer signal.Stop(sigs)
 
 	go func() {
-		<-sigs
-		cancel()
-		<-sigs
-		fmt.Fprintln(os.Stderr, "smob: second signal, exiting without flushing")
-		os.Exit(1)
+		if code := awaitShutdown(sigs, cancel); code != 0 {
+			fmt.Fprintln(os.Stderr, "smob: second signal, exiting without flushing")
+			os.Exit(code)
+		}
 	}()
 
 	root := newRootCommand(buildInfo{version: version, commit: commit, date: date})
@@ -45,4 +42,14 @@ func main() {
 		fmt.Fprintf(os.Stderr, "smob: %v\n", err)
 		os.Exit(cli.ExitCode(err))
 	}
+}
+
+// awaitShutdown applies the process signal contract. The first signal cancels
+// the command context so collect can flush its active chunks. A second signal
+// returns 1, and main exits without waiting for that flush.
+func awaitShutdown(sigs <-chan os.Signal, cancel context.CancelFunc) int {
+	<-sigs
+	cancel()
+	<-sigs
+	return 1
 }

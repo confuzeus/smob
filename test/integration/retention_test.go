@@ -55,6 +55,17 @@ func seedRetentionChunk(t *testing.T, dataDir string, start, end time.Time) seed
 // block appended.
 func retentionConfig(t *testing.T, dataDir, retention string) string {
 	t.Helper()
+	return retentionConfigSpool(t, dataDir, "", retention)
+}
+
+// retentionConfigSpool additionally sets storage.s3.spool_dir, so a test can
+// place the spool inside the data directory.
+func retentionConfigSpool(t *testing.T, dataDir, spoolDir, retention string) string {
+	t.Helper()
+	storage := "  primary: disk\n  chunk_interval: 1s"
+	if spoolDir != "" {
+		storage += "\n  s3:\n    spool_dir: " + spoolDir
+	}
 	return writeConfig(t, fmt.Sprintf(`data_dir: %s
 host: %s
 log_level: info
@@ -64,9 +75,8 @@ sources:
     enabled: true
     interval: 100ms
 storage:
-  primary: disk
-  chunk_interval: 1s
-%s`, dataDir, retentionHost, retention))
+%s
+%s`, dataDir, retentionHost, storage, retention))
 }
 
 func chunkExists(t *testing.T, path string) bool {
@@ -315,10 +325,90 @@ func TestRetentionIgnoresNonChunks(t *testing.T) {
 	if chunkExists(t, valid.path) {
 		t.Fatalf("valid old chunk %s survived", valid.key)
 	}
-	for _, path := range []string{tmp, notes, malformed, spooled} {
+	// The legacy <chunk>.tmp name is a crash leftover, so the store removes it
+	// at startup, before retention runs.
+	if chunkExists(t, tmp) {
+		t.Fatalf("startup cleanup left crash temp file %s", tmp)
+	}
+	for _, path := range []string{notes, malformed, spooled} {
 		if !chunkExists(t, path) {
 			t.Fatalf("retention deleted a non-chunk file %s", path)
 		}
+	}
+}
+
+func TestRetentionSparesConfiguredSpool(t *testing.T) {
+	dataDir := filepath.Join(t.TempDir(), "data")
+	now := time.Now().UTC().Truncate(time.Second)
+
+	// spool_dir equal to data_dir is legal configuration. Spooled chunks then
+	// sit at the same seven-component paths as closed data chunks; the sweeper
+	// must skip the configured spool subtree instead of deleting them.
+	spooled := seedRetentionChunk(t, dataDir, now.Add(-2*time.Hour), now.Add(-119*time.Minute))
+
+	cfg := retentionConfigSpool(t, dataDir, dataDir, "retention:\n  disk:\n    max_age: 1s\n")
+	ctx, cancel := context.WithTimeout(context.Background(), time.Minute)
+	defer cancel()
+	res := runSmob(t, ctx, "collect", "--once", "--config", cfg)
+	if res.ExitCode != 0 {
+		t.Fatalf("exit = %d\nstderr:\n%s", res.ExitCode, res.Stderr)
+	}
+
+	if !chunkExists(t, spooled.path) {
+		t.Fatalf("retention deleted spooled chunk %s", spooled.key)
+	}
+	if hasLogMessage(res.Stderr, "deleted chunk") {
+		t.Fatalf("retention logged a deletion below the spool\nstderr:\n%s", res.Stderr)
+	}
+}
+
+func TestRetentionDeletesFutureEndedChunkByStart(t *testing.T) {
+	dataDir := filepath.Join(t.TempDir(), "data")
+	now := time.Now().UTC().Truncate(time.Second)
+
+	// A clock jump or a planted filename can put the end in the future. Age
+	// then falls back to the start, so an old window is still deleted.
+	bogus := seedRetentionChunk(t, dataDir, now.Add(-2*time.Hour), now.Add(2*time.Hour))
+
+	cfg := retentionConfig(t, dataDir, "retention:\n  disk:\n    max_age: 1h\n")
+	ctx, cancel := context.WithTimeout(context.Background(), time.Minute)
+	defer cancel()
+	res := runSmob(t, ctx, "collect", "--once", "--config", cfg)
+	if res.ExitCode != 0 {
+		t.Fatalf("exit = %d\nstderr:\n%s", res.ExitCode, res.Stderr)
+	}
+
+	if chunkExists(t, bogus.path) {
+		t.Fatalf("future-ended chunk %s survived despite an old start", bogus.key)
+	}
+	assertDeletionLogged(t, res.Stderr, bogus.key, bogus.size, "age")
+}
+
+func TestRetentionSparesInFlightChunkBySize(t *testing.T) {
+	dataDir := filepath.Join(t.TempDir(), "data")
+	now := time.Now().UTC().Truncate(time.Second)
+
+	older := seedRetentionChunk(t, dataDir, now.Add(-2*time.Hour), now.Add(-119*time.Minute))
+	// A chunk being assembled now starts in the past and ends in the future.
+	// The size pass must still spare it.
+	inflight := seedRetentionChunk(t, dataDir, now.Add(-time.Minute), now.Add(time.Minute))
+
+	cfg := retentionConfig(t, dataDir, "retention:\n  disk:\n    max_bytes: 1\n")
+	ctx, cancel := context.WithTimeout(context.Background(), time.Minute)
+	defer cancel()
+	res := runSmob(t, ctx, "collect", "--once", "--config", cfg)
+	if res.ExitCode != 0 {
+		t.Fatalf("exit = %d\nstderr:\n%s", res.ExitCode, res.Stderr)
+	}
+
+	if chunkExists(t, older.path) {
+		t.Fatalf("size retention left the older chunk %s behind", older.key)
+	}
+	if !chunkExists(t, inflight.path) {
+		t.Fatalf("size retention deleted an in-flight chunk %s", inflight.key)
+	}
+	if !hasLogMessage(res.Stderr, "retention size limit remains exceeded") {
+		t.Fatalf("no warning that the size cap could not be met\nstderr:\n%s", res.Stderr)
 	}
 }
 

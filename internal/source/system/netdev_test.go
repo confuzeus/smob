@@ -3,7 +3,9 @@ package system
 import (
 	"bytes"
 	"fmt"
+	"math"
 	"reflect"
+	"strconv"
 	"strings"
 	"testing"
 )
@@ -46,9 +48,26 @@ func TestParseNetDev(t *testing.T) {
 			want:  netDevSnapshot{"lo": {rxBytes: 7, txBytes: 8}},
 		},
 		{
+			name: "maximum counters do not overflow",
+			input: netdevHeader + netdevLine("lo",
+				strconv.FormatUint(math.MaxUint64, 10),
+				strconv.FormatUint(math.MaxUint64, 10)) + "\n",
+			want: netDevSnapshot{"lo": {rxBytes: math.MaxUint64, txBytes: math.MaxUint64}},
+		},
+		{
+			name:    "counter above uint64 range",
+			input:   netdevHeader + netdevLine("lo", "18446744073709551616", "1") + "\n",
+			wantErr: "rx_bytes",
+		},
+		{
 			name:    "header only",
 			input:   netdevHeader,
 			wantErr: "no interfaces",
+		},
+		{
+			name:    "mangled data line after headers",
+			input:   netdevHeader + netdevLine("lo", "7", "8") + "\neth0 9 10 11 12\n",
+			wantErr: "line 4: missing ':' separator",
 		},
 		{
 			name:    "empty input",

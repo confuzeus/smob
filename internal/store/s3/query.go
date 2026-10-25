@@ -30,26 +30,34 @@ import (
 // cancellation.
 const ctxCheckInterval = 1024
 
-// queryGetWorkers bounds concurrent bucket GETs within one hour group. Query
-// merges one UTC hour at a time, so this is also the in-flight limit for the
-// whole query. Eight lets a typical hour of five-minute chunks finish in a
-// couple of rounds over a slow link without bursting a small endpoint.
+// queryGetWorkers bounds concurrent bucket GETs within one window group. Query
+// merges one window group at a time, so this is also the in-flight limit for the
+// whole query. Eight lets a window shared by several hosts and scopes finish in
+// one round over a slow link without bursting a small endpoint.
 const queryGetWorkers = 8
 
 // Query yields matching samples in timestamp, metric, then canonical label
-// order. It processes one UTC hour at a time: it lists that hour's prefixes,
-// downloads its bucket chunks with a bounded worker pool, reads its spool
-// chunks locally, and merges the result. Memory is therefore bounded by one
-// hour rather than the whole range, and Limit stops before any later hour is
+// order. It processes one UTC hour at a time and, within that hour, one chunk
+// window at a time: it lists the hour's prefixes, groups the chunks by window
+// start, downloads and decodes the refs that share a start with a bounded
+// worker pool, merges them, and yields the group before moving on. Chunk
+// windows are disjoint, so samples in an earlier window precede samples in a
+// later one; the output stays globally ordered while memory holds only one
+// window group's decoded samples. Limit stops before any later group or hour is
 // listed or fetched.
 //
-// A zero range boundary means unbounded. That fallback discovers the full key
-// set once and groups it by hour, because a host and scope path has to be known
-// before an hour prefix can exist.
+// Both range boundaries are required. The CLI always supplies them; a query
+// unbounded at both ends would have to list the whole bucket and is rejected.
+// A zero start or end alone is still accepted: that fallback discovers the full
+// key set once and groups it by hour, because a host and scope path has to be
+// known before an hour prefix can exist.
 func (s *Store) Query(ctx context.Context, q model.Query, yield func(model.Sample) error) error {
 	filter, err := store.NewFilter(q)
 	if err != nil {
 		return err
+	}
+	if q.Range.Start.IsZero() && q.Range.End.IsZero() {
+		return errors.New("query: range start and end are both zero; set a start or an end so the query does not list the whole bucket")
 	}
 
 	if q.Range.Start.IsZero() || q.Range.End.IsZero() {
@@ -84,7 +92,7 @@ func (s *Store) Query(ctx context.Context, q model.Query, yield func(model.Sampl
 			continue
 		}
 
-		n, err := s.merge(ctx, refs, filter, remainingLimit(q.Limit, emitted), yield)
+		n, err := s.mergeHour(ctx, refs, filter, remainingLimit(q.Limit, emitted), yield)
 		emitted += n
 		if err != nil {
 			return err
@@ -106,7 +114,7 @@ func (s *Store) mergeGroups(ctx context.Context, q model.Query, filter *store.Fi
 			return err
 		}
 
-		n, err := s.merge(ctx, group.refs, filter, remainingLimit(q.Limit, emitted), yield)
+		n, err := s.mergeHour(ctx, group.refs, filter, remainingLimit(q.Limit, emitted), yield)
 		emitted += n
 		if err != nil {
 			return err
@@ -118,7 +126,7 @@ func (s *Store) mergeGroups(ctx context.Context, q model.Query, filter *store.Fi
 	return nil
 }
 
-// remainingLimit returns how many samples the next hour may still emit, or 0
+// remainingLimit returns how many samples the next group may still emit, or 0
 // when the query is unlimited.
 func remainingLimit(limit, emitted int) int {
 	if limit <= 0 {
@@ -139,6 +147,33 @@ type hourGroup struct {
 type chunkRef struct {
 	key   string
 	local bool
+}
+
+// groupWindows orders refs by window start. Each group holds the refs that
+// share one start, at most one chunk per host and scope plus collision
+// suffixes, because only they can interleave in the merge.
+func groupWindows(refs []chunkRef) ([][]chunkRef, error) {
+	byStart := make(map[time.Time][]chunkRef, len(refs))
+	for _, ref := range refs {
+		start, _, err := chunk.ParseName(path.Base(ref.key))
+		if err != nil {
+			return nil, fmt.Errorf("%s: %w", ref.key, err)
+		}
+		start = start.UTC()
+		byStart[start] = append(byStart[start], ref)
+	}
+
+	starts := make([]time.Time, 0, len(byStart))
+	for start := range byStart {
+		starts = append(starts, start)
+	}
+	sort.Slice(starts, func(i, j int) bool { return starts[i].Before(starts[j]) })
+
+	groups := make([][]chunkRef, 0, len(starts))
+	for _, start := range starts {
+		groups = append(groups, byStart[start])
+	}
+	return groups, nil
 }
 
 // unionRefs overlays local spool keys on bucket keys. A key present in both is
@@ -225,7 +260,7 @@ func (s *Store) walkHourGroups(ctx context.Context, q model.Query) ([]hourGroup,
 	paginator := awss3.NewListObjectsV2Paginator(s.client, &awss3.ListObjectsV2Input{
 		Bucket: aws.String(s.bucket),
 		Prefix: aws.String(prefix),
-	})
+	}, stopOnDuplicateToken)
 	for paginator.HasMorePages() {
 		page, err := nextListPage(ctx, paginator)
 		if err != nil {
@@ -365,7 +400,7 @@ func (s *Store) listComponents(ctx context.Context, prefix string) ([]string, er
 		Bucket:    aws.String(s.bucket),
 		Prefix:    aws.String(prefix),
 		Delimiter: aws.String("/"),
-	})
+	}, stopOnDuplicateToken)
 	for paginator.HasMorePages() {
 		page, err := nextListPage(ctx, paginator)
 		if err != nil {
@@ -394,7 +429,7 @@ func (s *Store) listHour(ctx context.Context, host, scope string, hour time.Time
 	paginator := awss3.NewListObjectsV2Paginator(s.client, &awss3.ListObjectsV2Input{
 		Bucket: aws.String(s.bucket),
 		Prefix: aws.String(prefix),
-	})
+	}, stopOnDuplicateToken)
 	for paginator.HasMorePages() {
 		page, err := nextListPage(ctx, paginator)
 		if err != nil {
@@ -427,6 +462,12 @@ func (s *Store) listHour(ctx context.Context, host, scope string, hour time.Time
 	return keys, nil
 }
 
+// stopOnDuplicateToken stops a listing when a backend repeats its continuation
+// token, so a broken page sequence cannot loop forever.
+func stopOnDuplicateToken(o *awss3.ListObjectsV2PaginatorOptions) {
+	o.StopOnDuplicateToken = true
+}
+
 // nextListPage fetches one listing page, retrying transient failures. The
 // paginator advances its continuation token only after a successful page, so a
 // retry cannot skip or duplicate results.
@@ -454,96 +495,111 @@ func (s *Store) hourPrefix(host, scope string, hour time.Time) string {
 	return s.objectKey(key)
 }
 
-// objectStream decodes one downloaded chunk and holds its current sample.
-type objectStream struct {
-	key string
-	dec *json.Decoder
-	cur model.Sample
+// sampleCursor walks one decoded chunk. The chunk is sorted by timestamp,
+// metric, then canonical label order, so a heap over the cursors merges chunks
+// in the same order.
+type sampleCursor struct {
+	samples []model.Sample
+	pos     int
 }
 
-func openObjectStream(key string, data []byte) (*objectStream, error) {
-	gz, err := gzip.NewReader(bytes.NewReader(data))
-	if err != nil {
-		return nil, fmt.Errorf("open %s: %w", key, err)
-	}
-	return &objectStream{key: key, dec: json.NewDecoder(gz)}, nil
+// sampleHeap orders cursors by their current sample.
+type sampleHeap struct {
+	cursors []*sampleCursor
 }
 
-func (s *objectStream) next() (model.Sample, bool, error) {
-	var sample model.Sample
-	err := s.dec.Decode(&sample)
-	if errors.Is(err, io.EOF) {
-		return model.Sample{}, false, nil
-	}
-	if err != nil {
-		return model.Sample{}, false, fmt.Errorf("decode %s: %w", s.key, err)
-	}
-	if sample.Metric == "" {
-		return model.Sample{}, false, fmt.Errorf("decode %s: sample has an empty metric", s.key)
-	}
-	return sample, true, nil
+func (h *sampleHeap) Len() int { return len(h.cursors) }
+func (h *sampleHeap) Less(i, j int) bool {
+	return model.LessSample(
+		h.cursors[i].samples[h.cursors[i].pos],
+		h.cursors[j].samples[h.cursors[j].pos],
+	)
 }
-
-// objectHeap orders streams by their current sample.
-type objectHeap struct {
-	streams []*objectStream
+func (h *sampleHeap) Swap(i, j int) {
+	h.cursors[i], h.cursors[j] = h.cursors[j], h.cursors[i]
 }
-
-func (h *objectHeap) Len() int { return len(h.streams) }
-func (h *objectHeap) Less(i, j int) bool {
-	return model.LessSample(h.streams[i].cur, h.streams[j].cur)
+func (h *sampleHeap) Push(x any) {
+	h.cursors = append(h.cursors, x.(*sampleCursor))
 }
-func (h *objectHeap) Swap(i, j int) {
-	h.streams[i], h.streams[j] = h.streams[j], h.streams[i]
-}
-func (h *objectHeap) Push(x any) {
-	h.streams = append(h.streams, x.(*objectStream))
-}
-func (h *objectHeap) Pop() any {
-	old := h.streams
+func (h *sampleHeap) Pop() any {
+	old := h.cursors
 	n := len(old)
 	x := old[n-1]
-	h.streams = old[:n-1]
+	h.cursors = old[:n-1]
 	return x
 }
 
-// readRef returns the bytes of one chunk. A nil slice with a nil error means
-// the chunk disappeared between listing and opening, which is not a query
-// failure.
-func (s *Store) readRef(ctx context.Context, ref chunkRef) ([]byte, error) {
-	if ref.local {
-		data, err := s.spool.read(ref.key)
-		if errors.Is(err, fs.ErrNotExist) {
-			return nil, nil
+// decodeSamples decodes one gzip JSONL chunk from r. It does not close r, and
+// it retains only the decoded samples, never the compressed body.
+func decodeSamples(key string, r io.Reader) ([]model.Sample, error) {
+	gz, err := gzip.NewReader(r)
+	if err != nil {
+		return nil, fmt.Errorf("open %s: %w", key, err)
+	}
+	defer gz.Close()
+
+	var samples []model.Sample
+	dec := json.NewDecoder(gz)
+	for {
+		var sample model.Sample
+		err := dec.Decode(&sample)
+		if errors.Is(err, io.EOF) {
+			return samples, nil
 		}
 		if err != nil {
-			return nil, fmt.Errorf("read spool %s: %w", ref.key, err)
+			return nil, fmt.Errorf("decode %s: %w", key, err)
 		}
-		return data, nil
+		if sample.Metric == "" {
+			return nil, fmt.Errorf("decode %s: sample has an empty metric", key)
+		}
+		samples = append(samples, sample)
+	}
+}
+
+// readRefSamples fetches one chunk and decodes it immediately. A nil slice with
+// a nil error means the chunk disappeared between listing and opening, which is
+// not a query failure.
+func (s *Store) readRefSamples(ctx context.Context, ref chunkRef) ([]model.Sample, error) {
+	if ref.local {
+		return s.readSpoolSamples(ref.key)
 	}
 
-	data, ok, err := s.getObject(ctx, s.objectKey(ref.key))
+	samples, ok, err := s.getSamples(ctx, s.objectKey(ref.key))
 	if err != nil {
 		return nil, err
 	}
 	if !ok {
 		return nil, nil
 	}
-	return data, nil
+	return samples, nil
 }
 
-// fetchChunks returns the bytes for every ref, indexed by ref position. Bucket
-// chunks are downloaded concurrently; spool chunks are read sequentially on the
-// calling goroutine. A nil entry means the chunk disappeared between listing and
-// reading, which the merge skips.
+// readSpoolSamples decodes one spooled chunk. A missing file is skipped; the
+// bytes are released as soon as the samples are decoded.
+func (s *Store) readSpoolSamples(key string) ([]model.Sample, error) {
+	data, err := s.spool.read(key)
+	if errors.Is(err, fs.ErrNotExist) {
+		return nil, nil
+	}
+	if err != nil {
+		return nil, fmt.Errorf("read spool %s: %w", key, err)
+	}
+	return decodeSamples(key, bytes.NewReader(data))
+}
+
+// readWindow fetches and decodes every ref in one window group. Bucket chunks
+// are downloaded and decoded concurrently; a worker keeps only the decoded
+// samples, so the compressed body is released as soon as it has been read.
+// Spool chunks are read on the calling goroutine. A nil entry means the chunk
+// disappeared between listing and reading, which the merge skips.
 //
 // Downloads may finish out of order, but each result is stored at its ref
 // position, so the caller merges a length-stable, key-ordered slice. At most
 // queryGetWorkers GETs are in flight. The first error cancels the siblings and
 // is returned once every worker has been joined. A cancellation that leaves
 // refs unfetched is reported as an error, never mistaken for absence.
-func (s *Store) fetchChunks(ctx context.Context, refs []chunkRef) ([][]byte, error) {
-	bodies := make([][]byte, len(refs))
+func (s *Store) readWindow(ctx context.Context, refs []chunkRef) ([][]model.Sample, error) {
+	decoded := make([][]model.Sample, len(refs))
 	remote := make([]int, 0, len(refs))
 	for i, ref := range refs {
 		if !ref.local {
@@ -553,17 +609,17 @@ func (s *Store) fetchChunks(ctx context.Context, refs []chunkRef) ([][]byte, err
 		if err := ctx.Err(); err != nil {
 			return nil, err
 		}
-		data, err := s.readRef(ctx, ref)
+		samples, err := s.readRefSamples(ctx, ref)
 		if err != nil {
 			return nil, err
 		}
-		bodies[i] = data
+		decoded[i] = samples
 	}
 	if len(remote) == 0 {
-		return bodies, nil
+		return decoded, nil
 	}
 
-	// Sibling GETs are cancelled on the first error. On the success path, the
+	// Sibling fetches are cancelled on the first error. On the success path, the
 	// deferred cancel releases the child context before returning.
 	ctx, cancel := context.WithCancel(ctx)
 	defer cancel()
@@ -580,7 +636,7 @@ func (s *Store) fetchChunks(ctx context.Context, refs []chunkRef) ([][]byte, err
 		go func() {
 			defer wg.Done()
 			for idx := range jobs {
-				data, err := s.readRef(ctx, refs[idx])
+				samples, err := s.readRefSamples(ctx, refs[idx])
 				if err != nil {
 					errOnce.Do(func() {
 						firstErr = err
@@ -588,7 +644,7 @@ func (s *Store) fetchChunks(ctx context.Context, refs []chunkRef) ([][]byte, err
 					})
 					return
 				}
-				bodies[idx] = data
+				decoded[idx] = samples
 			}
 		}()
 	}
@@ -613,43 +669,55 @@ feed:
 	if err := ctx.Err(); err != nil {
 		return nil, err
 	}
-	return bodies, nil
+	return decoded, nil
 }
 
-// merge downloads one hour's refs and yields their matching samples as one
-// sorted stream. A chunk that disappeared between listing and opening is
-// skipped.
-func (s *Store) merge(ctx context.Context, refs []chunkRef, filter *store.Filter, limit int, yield func(model.Sample) error) (int, error) {
-	bodies, err := s.fetchChunks(ctx, refs)
+// mergeHour merges one hour's refs one window group at a time, stopping after
+// limit matching samples when limit is positive. Groups run in window-start
+// order, so an earlier group is fully yielded before a later one is fetched.
+func (s *Store) mergeHour(ctx context.Context, refs []chunkRef, filter *store.Filter, limit int, yield func(model.Sample) error) (int, error) {
+	groups, err := groupWindows(refs)
 	if err != nil {
 		return 0, err
 	}
 
-	active := make([]*objectStream, 0, len(refs))
-	for i, ref := range refs {
+	emitted := 0
+	for _, group := range groups {
 		if err := ctx.Err(); err != nil {
-			return 0, err
-		}
-		if bodies[i] == nil {
-			continue
+			return emitted, err
 		}
 
-		st, err := openObjectStream(ref.key, bodies[i])
+		n, err := s.mergeWindow(ctx, group, filter, remainingLimit(limit, emitted), yield)
+		emitted += n
 		if err != nil {
-			return 0, err
+			return emitted, err
 		}
-		sample, ok, err := st.next()
-		if err != nil {
-			return 0, err
+		if limit > 0 && emitted >= limit {
+			return emitted, nil
 		}
-		if !ok {
-			continue
-		}
-		st.cur = sample
-		active = append(active, st)
+	}
+	return emitted, nil
+}
+
+// mergeWindow downloads and decodes one window group's refs and yields their
+// matching samples as one sorted stream. A chunk that disappeared between
+// listing and opening is skipped. Reaching limit stops the merge before any
+// later group is fetched.
+func (s *Store) mergeWindow(ctx context.Context, refs []chunkRef, filter *store.Filter, limit int, yield func(model.Sample) error) (int, error) {
+	decoded, err := s.readWindow(ctx, refs)
+	if err != nil {
+		return 0, err
 	}
 
-	h := &objectHeap{streams: active}
+	active := make([]*sampleCursor, 0, len(decoded))
+	for _, samples := range decoded {
+		if len(samples) == 0 {
+			continue
+		}
+		active = append(active, &sampleCursor{samples: samples})
+	}
+
+	h := &sampleHeap{cursors: active}
 	heap.Init(h)
 
 	emitted, loops := 0, 0
@@ -661,8 +729,8 @@ func (s *Store) merge(ctx context.Context, refs []chunkRef, filter *store.Filter
 			}
 		}
 
-		st := h.streams[0]
-		sample := st.cur
+		cursor := h.cursors[0]
+		sample := cursor.samples[cursor.pos]
 		if filter.Match(sample) {
 			if err := yield(sample); err != nil {
 				return emitted, err
@@ -673,29 +741,22 @@ func (s *Store) merge(ctx context.Context, refs []chunkRef, filter *store.Filter
 			}
 		}
 
-		next, ok, err := st.next()
-		if err != nil {
-			return emitted, err
-		}
-		if !ok {
+		cursor.pos++
+		if cursor.pos >= len(cursor.samples) {
 			heap.Pop(h)
 			continue
 		}
-		st.cur = next
 		heap.Fix(h, 0)
 	}
 	return emitted, nil
 }
 
-// getObject downloads one chunk, retrying transient failures. A missing key is
-// reported as ok == false so the caller can skip it without failing the query.
-func (s *Store) getObject(ctx context.Context, key string) ([]byte, bool, error) {
-	var (
-		data     []byte
-		notFound bool
-	)
-	err := retry(ctx, func(ctx context.Context) error {
-		data, notFound = nil, false
+// getBody downloads one object and passes its body to consume before closing
+// it. A missing key is reported as found == false. Transient failures,
+// including a body that fails mid-decode, are retried with a fresh GET.
+func (s *Store) getBody(ctx context.Context, key string, consume func(io.Reader) error) (found bool, err error) {
+	err = retry(ctx, func(ctx context.Context) error {
+		found = false
 
 		out, err := s.client.GetObject(ctx, &awss3.GetObjectInput{
 			Bucket: aws.String(s.bucket),
@@ -703,27 +764,60 @@ func (s *Store) getObject(ctx context.Context, key string) ([]byte, bool, error)
 		})
 		if err != nil {
 			if isNotFound(err) {
-				notFound = true
 				return nil
 			}
 			return err
 		}
 		defer out.Body.Close()
 
-		data, err = io.ReadAll(out.Body)
+		found = true
+		return consume(out.Body)
+	})
+	if err != nil {
+		if ctx.Err() != nil {
+			return false, ctx.Err()
+		}
+		return false, fmt.Errorf("get %s: %w", key, err)
+	}
+	return found, nil
+}
+
+// getObject returns one object's bytes, retrying transient failures. A missing
+// key is reported as ok == false so the caller can skip it without failing the
+// query.
+func (s *Store) getObject(ctx context.Context, key string) ([]byte, bool, error) {
+	var data []byte
+	found, err := s.getBody(ctx, key, func(r io.Reader) error {
+		var err error
+		data, err = io.ReadAll(r)
 		if err != nil {
 			return fmt.Errorf("read %s: %w", key, err)
 		}
 		return nil
 	})
 	if err != nil {
-		if ctx.Err() != nil {
-			return nil, false, ctx.Err()
-		}
-		return nil, false, fmt.Errorf("get %s: %w", key, err)
+		return nil, false, err
 	}
-	if notFound {
+	if !found {
 		return nil, false, nil
 	}
 	return data, true, nil
+}
+
+// getSamples streams one chunk through gzip and JSON decoding without holding
+// the compressed body. A missing key is reported as ok == false.
+func (s *Store) getSamples(ctx context.Context, key string) ([]model.Sample, bool, error) {
+	var samples []model.Sample
+	found, err := s.getBody(ctx, key, func(r io.Reader) error {
+		var err error
+		samples, err = decodeSamples(key, r)
+		return err
+	})
+	if err != nil {
+		return nil, false, err
+	}
+	if !found {
+		return nil, false, nil
+	}
+	return samples, true, nil
 }

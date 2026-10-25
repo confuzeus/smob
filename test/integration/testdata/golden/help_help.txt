@@ -1,0 +1,13 @@
+Help provides help for any command in the application.
+Simply type smob help [path to command] for full details.
+
+Usage:
+  smob help [command] [flags]
+
+Flags:
+  -h, --help   help for help
+
+Global Flags:
+      --config string       path to the YAML configuration file (default "/etc/smob/smob.yaml")
+      --log-format string   log format override: text, json
+      --log-level string    log level override: debug, info, warn, error

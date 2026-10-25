@@ -8,6 +8,7 @@ import (
 	"encoding/json"
 	"maps"
 	"math"
+	"os"
 	"path/filepath"
 	"slices"
 	"strconv"
@@ -148,7 +149,7 @@ func aggregateUnit(metric string) string {
 		return "B/s"
 	case strings.HasSuffix(metric, ".percent"):
 		return "%"
-	case strings.HasSuffix(metric, ".bytes"):
+	case strings.HasSuffix(metric, ".bytes"), strings.HasSuffix(metric, "_bytes"):
 		return "B"
 	default:
 		return ""
@@ -474,7 +475,11 @@ func TestQueryAggInvalidFlags(t *testing.T) {
 }
 
 func TestQueryAggEmpty(t *testing.T) {
-	cfg := writeConfig(t, "data_dir: "+filepath.Join(t.TempDir(), "missing")+"\n")
+	dataDir := filepath.Join(t.TempDir(), "data")
+	if err := os.MkdirAll(dataDir, 0o755); err != nil {
+		t.Fatalf("create empty data dir: %v", err)
+	}
+	cfg := writeConfig(t, "data_dir: "+dataDir+"\n")
 	ctx, cancel := context.WithTimeout(context.Background(), time.Minute)
 	defer cancel()
 

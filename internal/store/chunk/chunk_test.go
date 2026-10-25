@@ -7,6 +7,7 @@ import (
 	"errors"
 	"io"
 	"path"
+	"strings"
 	"testing"
 	"time"
 
@@ -151,6 +152,36 @@ func TestKey(t *testing.T) {
 			}
 			if got != tc.want {
 				t.Fatalf("Key() = %q, want %q", got, tc.want)
+			}
+		})
+	}
+}
+
+func TestIsComponent(t *testing.T) {
+	cases := []struct {
+		name  string
+		value string
+		want  bool
+	}{
+		{name: "hostname", value: "web-1", want: true},
+		{name: "255 bytes", value: strings.Repeat("a", 255), want: true},
+		{name: "256 bytes", value: strings.Repeat("a", 256)},
+		{name: "empty", value: ""},
+		{name: "dot", value: "."},
+		{name: "dot dot", value: ".."},
+		{name: "slash", value: "a/b"},
+		{name: "newline", value: "a\nb"},
+		{name: "tab", value: "a\tb"},
+		{name: "NUL", value: "a\x00b"},
+		{name: "DEL", value: "a\x7fb"},
+		{name: "leading space", value: " a"},
+		{name: "trailing space", value: "a "},
+	}
+
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			if got := IsComponent(tc.value); got != tc.want {
+				t.Fatalf("IsComponent(%q) = %v, want %v", tc.value, got, tc.want)
 			}
 		})
 	}

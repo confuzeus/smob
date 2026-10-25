@@ -10,6 +10,7 @@ import (
 	"os/exec"
 	"path/filepath"
 	"runtime"
+	"slices"
 	"strconv"
 	"strings"
 	"testing"
@@ -101,6 +102,14 @@ func firstTimestamp(samples []wireSample) time.Time {
 		}
 	}
 	return first
+}
+
+// median returns the middle value of values, which must not be empty. An even
+// count returns the upper middle value, which is fine for a lower-bound check.
+func median(values []float64) float64 {
+	sorted := slices.Clone(values)
+	slices.Sort(sorted)
+	return sorted[len(sorted)/2]
 }
 
 func TestProcessCollectOnce(t *testing.T) {
@@ -229,21 +238,31 @@ func TestProcessTopN(t *testing.T) {
 }
 
 func TestProcessCPUPercent(t *testing.T) {
+	// The whole test stays inside the fast suite's budget: two measured CPU
+	// samples at a 100ms cadence need a couple of seconds.
 	dataDir := filepath.Join(t.TempDir(), "data")
 	busy := startBusy(t)
 	pid := busy.Process.Pid
 	cfg := processConfig(t, dataDir, "/proc", "^yes$", 0, "100ms", "30s")
 
-	ctx, cancel := context.WithTimeout(context.Background(), time.Minute)
+	ctx, cancel := context.WithTimeout(context.Background(), 20*time.Second)
 	defer cancel()
 	d := startSmob(t, ctx, "collect", "--config", cfg)
-	waitFor(t, 20*time.Second, "a CPU sample for the busy process", func() bool {
+
+	// A measured CPU window is required: /proc/pid/stat counters are quantized
+	// at USER_HZ, so a window shorter than 50ms says more about quantization
+	// than about the process.
+	measuredCPU := func() []wireSample {
+		var samples []wireSample
 		for _, sample := range processSamples(t, dataDir, pid) {
-			if sample.Metric == "process.cpu.percent" {
-				return true
+			if sample.Metric == "process.cpu.percent" && sample.IntervalMS >= 50 {
+				samples = append(samples, sample)
 			}
 		}
-		return false
+		return samples
+	}
+	waitFor(t, 15*time.Second, "two CPU samples with a measured window for the busy process", func() bool {
+		return len(measuredCPU()) >= 2
 	})
 	d.stop(t, 10*time.Second)
 
@@ -258,8 +277,8 @@ func TestProcessCPUPercent(t *testing.T) {
 			t.Fatalf("unexpected metric %q for pid %d", sample.Metric, pid)
 		}
 	}
-	if len(cpuSamples) == 0 {
-		t.Fatalf("no CPU samples for the busy process")
+	if len(cpuSamples) < 2 {
+		t.Fatalf("CPU samples for the busy process = %d, want at least 2", len(cpuSamples))
 	}
 	if len(rssSamples) == 0 {
 		t.Fatalf("no RSS samples for the busy process")
@@ -271,10 +290,19 @@ func TestProcessCPUPercent(t *testing.T) {
 		"pid":   strconv.Itoa(pid),
 		"comm":  "yes",
 	}
-	maxPercent := 100 * float64(runtime.NumCPU())
+	// A tight `yes` burner keeps one core busy, so percent stays near 100 on a
+	// single thread. The 120x upper bound leaves headroom for a loaded runner
+	// and per-core accounting; the 5% floor and 25% median catch a scale error
+	// (raw ticks read as percent, or percent divided by the core count).
+	maxPercent := 120 * float64(runtime.NumCPU())
+	const (
+		minPercent  = 5
+		medianFloor = 25
+	)
+	values := make([]float64, 0, len(cpuSamples))
 	for _, sample := range cpuSamples {
-		if sample.Value <= 0 || sample.Value > maxPercent {
-			t.Fatalf("cpu = %v, want greater than zero and at most %v", sample.Value, maxPercent)
+		if sample.Value < minPercent || sample.Value > maxPercent {
+			t.Fatalf("cpu = %v%%, want between %v and %v", sample.Value, minPercent, maxPercent)
 		}
 		if sample.IntervalMS <= 0 || sample.IntervalMS > 10_000 {
 			t.Fatalf("interval_ms = %d, want a measured window", sample.IntervalMS)
@@ -285,7 +313,27 @@ func TestProcessCPUPercent(t *testing.T) {
 		if !maps.Equal(sample.Labels, wantLabels) {
 			t.Fatalf("labels = %v, want %v", sample.Labels, wantLabels)
 		}
+		values = append(values, sample.Value)
 	}
+	if got := median(values); got < medianFloor {
+		t.Fatalf("median cpu = %v%%, want at least %v%% for a tight burner", got, medianFloor)
+	}
+
+	// RSS is a plausible resident set for a dynamically linked `yes`, with room
+	// for a different libc without asserting an exact footprint.
+	const (
+		minRSS = 1 << 20 // 1 MiB
+		maxRSS = 1 << 30 // 1 GiB
+	)
+	for _, sample := range rssSamples {
+		if sample.Value < minRSS || sample.Value > maxRSS {
+			t.Fatalf("rss = %v bytes, want between %v and %v", sample.Value, minRSS, maxRSS)
+		}
+		if !maps.Equal(sample.Labels, wantLabels) {
+			t.Fatalf("rss labels = %v, want %v", sample.Labels, wantLabels)
+		}
+	}
+	t.Logf("cpu samples = %v, rss bytes = %v", values, rssSamples[0].Value)
 
 	// The first tick records RSS only: a CPU rate needs two snapshots.
 	if !firstTimestamp(cpuSamples).After(firstTimestamp(rssSamples)) {
@@ -335,40 +383,46 @@ func TestProcessRescanDiscoversNewPID(t *testing.T) {
 }
 
 func TestProcessExitingPIDIsNormal(t *testing.T) {
-	dataDir := filepath.Join(t.TempDir(), "data")
-	exiting := startSleep(t)
-	surviving := startSleep(t)
-	// A long rescan interval keeps the exited PID in the cached list, so the
-	// next tick must tolerate ENOENT instead of failing.
-	cfg := processConfig(t, dataDir, "/proc", "^sleep$", 0, "100ms", "30s")
+	// A long rescan keeps the exited PID in the cached list, so every later
+	// tick must tolerate ENOENT. A short one races the rescan against the exit,
+	// so a process that vanishes mid-scan must not abort the tick or the
+	// daemon. Both cases must keep sampling the survivors.
+	for _, rescan := range []string{"30s", "100ms"} {
+		t.Run("rescan="+rescan, func(t *testing.T) {
+			dataDir := filepath.Join(t.TempDir(), "data")
+			exiting := startSleep(t)
+			surviving := startSleep(t)
+			cfg := processConfig(t, dataDir, "/proc", "^sleep$", 0, "100ms", rescan)
 
-	ctx, cancel := context.WithTimeout(context.Background(), time.Minute)
-	defer cancel()
-	d := startSmob(t, ctx, "collect", "--config", cfg)
+			ctx, cancel := context.WithTimeout(context.Background(), time.Minute)
+			defer cancel()
+			d := startSmob(t, ctx, "collect", "--config", cfg)
 
-	waitFor(t, 15*time.Second, "samples for both processes", func() bool {
-		return len(processSamples(t, dataDir, exiting.Process.Pid)) > 0 &&
-			len(processSamples(t, dataDir, surviving.Process.Pid)) > 0
-	})
+			waitFor(t, 15*time.Second, "samples for both processes", func() bool {
+				return len(processSamples(t, dataDir, exiting.Process.Pid)) > 0 &&
+					len(processSamples(t, dataDir, surviving.Process.Pid)) > 0
+			})
 
-	killedAt := time.Now().UTC()
-	stopProcess(t, exiting)
+			killedAt := time.Now().UTC()
+			stopProcess(t, exiting)
 
-	waitFor(t, 15*time.Second, "a sample for the surviving process after the other exited", func() bool {
-		for _, sample := range processSamples(t, dataDir, surviving.Process.Pid) {
-			if sample.Timestamp.After(killedAt) {
-				return true
+			waitFor(t, 15*time.Second, "a sample for the surviving process after the other exited", func() bool {
+				for _, sample := range processSamples(t, dataDir, surviving.Process.Pid) {
+					if sample.Timestamp.After(killedAt) {
+						return true
+					}
+				}
+				return false
+			})
+
+			select {
+			case <-d.done:
+				t.Fatalf("collector exited after a process disappeared:\n%s", d.stderr.String())
+			default:
 			}
-		}
-		return false
-	})
-
-	select {
-	case <-d.done:
-		t.Fatalf("collector exited after a process disappeared:\n%s", d.stderr.String())
-	default:
+			d.stop(t, 10*time.Second)
+		})
 	}
-	d.stop(t, 10*time.Second)
 }
 
 func TestProcessProcPathMissing(t *testing.T) {

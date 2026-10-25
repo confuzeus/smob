@@ -3,6 +3,7 @@ package s3
 import (
 	"context"
 	"errors"
+	"fmt"
 	"io"
 	"math/rand/v2"
 	"net"
@@ -22,7 +23,16 @@ const (
 	retryAttempts  = 6
 	retryBaseDelay = 250 * time.Millisecond
 	retryMaxDelay  = 4 * time.Second
+	// attemptTimeout bounds one attempt, including reading the response body,
+	// so a stalled endpoint cannot hold the whole retry budget open. The
+	// caller's context still bounds the total.
+	attemptTimeout = 30 * time.Second
 )
+
+// errAttemptTimeout marks an attempt that exceeded attemptTimeout. It is
+// retryable even though the underlying error is context.DeadlineExceeded: the
+// attempt budget is smob's, not the caller's cancellation.
+var errAttemptTimeout = errors.New("attempt timed out")
 
 // retry runs op until it succeeds, a terminal error occurs, or the attempt
 // budget is exhausted. It returns the context error as soon as ctx is done and
@@ -34,7 +44,7 @@ func retry(ctx context.Context, op func(context.Context) error) error {
 			return ctxErr
 		}
 
-		err = op(ctx)
+		err = attemptWithTimeout(ctx, op)
 		if err == nil {
 			return nil
 		}
@@ -47,6 +57,26 @@ func retry(ctx context.Context, op func(context.Context) error) error {
 		if err := waitRetry(ctx, attempt); err != nil {
 			return err
 		}
+	}
+	return err
+}
+
+// attemptWithTimeout runs one attempt under its own deadline. A timeout is
+// reported as errAttemptTimeout so the retry loop treats it as transient; the
+// caller's cancellation is returned unchanged and never retried.
+func attemptWithTimeout(ctx context.Context, op func(context.Context) error) error {
+	attemptCtx, cancel := context.WithTimeout(ctx, attemptTimeout)
+	defer cancel()
+
+	err := op(attemptCtx)
+	if err == nil {
+		return nil
+	}
+	if ctxErr := ctx.Err(); ctxErr != nil {
+		return ctxErr
+	}
+	if attemptCtx.Err() != nil {
+		return fmt.Errorf("%w: %w", errAttemptTimeout, err)
 	}
 	return err
 }
@@ -93,6 +123,10 @@ func jitter(d time.Duration, u float64) time.Duration {
 func isRetryable(err error) bool {
 	if err == nil {
 		return false
+	}
+	if errors.Is(err, errAttemptTimeout) {
+		// One attempt stalled; a fresh connection may succeed.
+		return true
 	}
 	if errors.Is(err, context.Canceled) || errors.Is(err, context.DeadlineExceeded) {
 		return false

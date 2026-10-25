@@ -7,6 +7,7 @@ import (
 	"fmt"
 	"io"
 	"maps"
+	"math"
 	"slices"
 	"strconv"
 	"strings"
@@ -56,12 +57,15 @@ type tableWriter struct {
 }
 
 func (t *tableWriter) Write(sample model.Sample) error {
+	if err := validateFinite(sample.Metric, sample.Value); err != nil {
+		return err
+	}
 	_, err := fmt.Fprintf(t.w, "%s\t%s\t%s\t%s\t%s\n",
 		formatTime(sample.Timestamp),
-		sample.Metric,
+		escapeCell(sample.Metric),
 		formatValue(sample.Value),
 		unitFor(sample.Metric),
-		formatLabels(sample.Labels),
+		escapeCell(formatLabels(sample.Labels)),
 	)
 	return err
 }
@@ -76,6 +80,9 @@ type jsonWriter struct {
 }
 
 func (j *jsonWriter) Write(sample model.Sample) error {
+	if err := validateFinite(sample.Metric, sample.Value); err != nil {
+		return err
+	}
 	data, err := json.Marshal(sample)
 	if err != nil {
 		return err
@@ -103,6 +110,9 @@ type jsonlWriter struct {
 }
 
 func (j *jsonlWriter) Write(sample model.Sample) error {
+	if err := validateFinite(sample.Metric, sample.Value); err != nil {
+		return err
+	}
 	return j.enc.Encode(sample)
 }
 
@@ -113,6 +123,9 @@ type csvWriter struct {
 }
 
 func (c *csvWriter) Write(sample model.Sample) error {
+	if err := validateFinite(sample.Metric, sample.Value); err != nil {
+		return err
+	}
 	return c.w.Write([]string{
 		formatTime(sample.Timestamp),
 		sample.Metric,
@@ -137,6 +150,31 @@ func formatValue(value float64) string {
 	return strconv.FormatFloat(value, 'f', -1, 64)
 }
 
+// validateFinite rejects values that JSON cannot encode and that would
+// otherwise render as NaN or +Inf in table and CSV output. It runs before a row
+// is written, so a bad sample never leaves partial output.
+func validateFinite(metric string, value float64) error {
+	if math.IsNaN(value) || math.IsInf(value, 0) {
+		return fmt.Errorf("metric %s: non-finite value %v", metric, value)
+	}
+	return nil
+}
+
+// tableEscaper keeps a table cell on one line. A label value such as a process
+// comm may contain newlines, carriage returns, or tabs; left verbatim they
+// split a row or shift its columns.
+var tableEscaper = strings.NewReplacer(
+	`\`, `\\`,
+	"\n", `\n`,
+	"\r", `\r`,
+	"\t", `\t`,
+)
+
+// escapeCell renders value as one table cell with control characters visible.
+func escapeCell(value string) string {
+	return tableEscaper.Replace(value)
+}
+
 // formatLabels renders labels in canonical key order.
 func formatLabels(labels map[string]string) string {
 	keys := slices.Sorted(maps.Keys(labels))
@@ -147,14 +185,16 @@ func formatLabels(labels map[string]string) string {
 	return strings.Join(parts, ",")
 }
 
-// unitFor derives the display unit from the metric name.
+// unitFor derives the display unit from the metric name. Both `.bytes` and
+// `_bytes` suffixes are byte gauges; the process source names its RSS gauge
+// `process.memory.rss_bytes`.
 func unitFor(metric string) string {
 	switch {
 	case strings.HasSuffix(metric, ".bytes_per_second"):
 		return "B/s"
 	case strings.HasSuffix(metric, ".percent"):
 		return "%"
-	case strings.HasSuffix(metric, ".bytes"):
+	case strings.HasSuffix(metric, ".bytes"), strings.HasSuffix(metric, "_bytes"):
 		return "B"
 	default:
 		return ""

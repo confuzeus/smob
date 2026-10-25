@@ -7,6 +7,7 @@ import (
 	"encoding/csv"
 	"encoding/json"
 	"math"
+	"os"
 	"path/filepath"
 	"slices"
 	"strconv"
@@ -249,7 +250,7 @@ func TestStatsFormats(t *testing.T) {
 	defer cancel()
 
 	want := []wireSummary{
-		{Metric: "process.cpu.percent", Count: 2, Min: 50, Max: 150, Mean: 100},
+		{Metric: "process.cpu.percent", Count: 2, Min: 50, Max: 150, Mean: 75},
 		{Metric: "process.memory.rss_bytes", Count: 1, Min: 1024, Max: 1024, Mean: 1024},
 		{Metric: "system.cpu.percent", Count: 3, Min: 10, Max: 30, Mean: 20},
 		{Metric: "system.memory.used_bytes", Count: 2, Min: 100, Max: 300, Mean: 200},
@@ -290,19 +291,75 @@ func TestStatsFormats(t *testing.T) {
 	assertSameSummaries(t, decodeCSVSummaries(t, csvOut.Stdout), want)
 }
 
-func TestStatsMeanIsUnweighted(t *testing.T) {
+func TestStatsMeanMatchesAggAvg(t *testing.T) {
 	cfg, base := seedStatsData(t)
 	ctx, cancel := context.WithTimeout(context.Background(), time.Minute)
 	defer cancel()
 
-	summaries := runStatsJSON(t, ctx, cfg, base, "--metric", "process.cpu.percent")
-	if len(summaries) != 1 {
-		t.Fatalf("got %d summaries, want 1", len(summaries))
+	cases := []struct {
+		name     string
+		metric   string
+		wantMean float64
+	}{
+		// The samples are 50 with interval_ms=30000 and 150 with interval_ms=10000.
+		// Interval weighting produces 75; the unweighted mean would be 100.
+		{"weighted rate", "process.cpu.percent", 75},
+		// Gauges carry no interval, so their mean stays arithmetic: (100+300)/2.
+		{"unweighted gauge", "system.memory.used_bytes", 200},
 	}
-	// The samples are 50 with interval_ms=30000 and 150 with interval_ms=10000.
-	// Interval weighting would produce 75, so 100 pins the unweighted mean.
-	if summaries[0].Mean != 100 {
-		t.Fatalf("mean = %v, want the unweighted mean 100", summaries[0].Mean)
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			summaries := runStatsJSON(t, ctx, cfg, base, "--metric", tc.metric)
+			if len(summaries) != 1 {
+				t.Fatalf("got %d summaries, want 1", len(summaries))
+			}
+			if summaries[0].Mean != tc.wantMean {
+				t.Fatalf("stats mean = %v, want %v", summaries[0].Mean, tc.wantMean)
+			}
+
+			aggregates := runAggJSON(t, ctx, cfg, base, "--agg", "avg", "--metric", tc.metric)
+			if len(aggregates) != 1 {
+				t.Fatalf("got %d aggregates, want 1", len(aggregates))
+			}
+			if summaries[0].Mean != aggregates[0].Value {
+				t.Fatalf("stats mean %v does not equal query --agg avg %v", summaries[0].Mean, aggregates[0].Value)
+			}
+			if summaries[0].Count != aggregates[0].Count {
+				t.Fatalf("stats count %d does not equal query --agg count %d", summaries[0].Count, aggregates[0].Count)
+			}
+		})
+	}
+}
+
+func TestStatsRejectsNonFinite(t *testing.T) {
+	dataDir := filepath.Join(t.TempDir(), "data")
+	cfg := writeConfig(t, "data_dir: "+dataDir+"\n")
+	base := time.Date(2026, 10, 23, 16, 0, 0, 0, time.UTC)
+
+	// 1e308 x interval_ms overflows float64, so the interval-weighted mean
+	// becomes +Inf while min and max stay finite.
+	writeChunk(t, dataDir, "alpha", "process", base, base.Add(5*time.Minute), []wireSample{
+		{
+			Timestamp:  base.Add(time.Second),
+			Metric:     "process.cpu.percent",
+			Value:      1e308,
+			IntervalMS: 30_000,
+			Labels:     map[string]string{"host": "alpha", "scope": "process", "pid": "42", "comm": "nginx"},
+		},
+	})
+
+	ctx, cancel := context.WithTimeout(context.Background(), time.Minute)
+	defer cancel()
+
+	res := runSmob(t, ctx, statsArgs(cfg, base, "--metric", "process.cpu.percent", "--format", "json")...)
+	if res.ExitCode != 1 {
+		t.Fatalf("non-finite stats exit = %d, want 1\nstderr:\n%s", res.ExitCode, res.Stderr)
+	}
+	if res.Stdout != "" {
+		t.Fatalf("non-finite stats wrote a partial document: %q", res.Stdout)
+	}
+	if !strings.Contains(res.Stderr, "process.cpu.percent") || !strings.Contains(res.Stderr, "not finite") {
+		t.Fatalf("non-finite stats stderr = %q, want the metric name and a non-finite error", res.Stderr)
 	}
 }
 
@@ -319,7 +376,7 @@ func TestStatsFilters(t *testing.T) {
 		{
 			name: "metric",
 			args: []string{"--metric", "process.cpu.percent"},
-			want: []wireSummary{{Metric: "process.cpu.percent", Count: 2, Min: 50, Max: 150, Mean: 100}},
+			want: []wireSummary{{Metric: "process.cpu.percent", Count: 2, Min: 50, Max: 150, Mean: 75}},
 		},
 		{
 			name: "host",
@@ -333,7 +390,7 @@ func TestStatsFilters(t *testing.T) {
 			name: "scope",
 			args: []string{"--scope", "process"},
 			want: []wireSummary{
-				{Metric: "process.cpu.percent", Count: 2, Min: 50, Max: 150, Mean: 100},
+				{Metric: "process.cpu.percent", Count: 2, Min: 50, Max: 150, Mean: 75},
 				{Metric: "process.memory.rss_bytes", Count: 1, Min: 1024, Max: 1024, Mean: 1024},
 			},
 		},
@@ -346,7 +403,7 @@ func TestStatsFilters(t *testing.T) {
 			name: "regex label",
 			args: []string{"--label", "comm~nginx|postgres"},
 			want: []wireSummary{
-				{Metric: "process.cpu.percent", Count: 2, Min: 50, Max: 150, Mean: 100},
+				{Metric: "process.cpu.percent", Count: 2, Min: 50, Max: 150, Mean: 75},
 				{Metric: "process.memory.rss_bytes", Count: 1, Min: 1024, Max: 1024, Mean: 1024},
 			},
 		},
@@ -402,7 +459,11 @@ func TestStatsLimit(t *testing.T) {
 }
 
 func TestStatsEmpty(t *testing.T) {
-	cfg := writeConfig(t, "data_dir: "+filepath.Join(t.TempDir(), "missing")+"\n")
+	dataDir := filepath.Join(t.TempDir(), "data")
+	if err := os.MkdirAll(dataDir, 0o755); err != nil {
+		t.Fatalf("create empty data dir: %v", err)
+	}
+	cfg := writeConfig(t, "data_dir: "+dataDir+"\n")
 	ctx, cancel := context.WithTimeout(context.Background(), time.Minute)
 	defer cancel()
 
@@ -441,6 +502,50 @@ func TestStatsEmpty(t *testing.T) {
 	}
 	if got := decodeCSVSummaries(t, csvOut.Stdout); len(got) != 0 {
 		t.Fatalf("empty csv stats returned %d rows, want 0", len(got))
+	}
+}
+
+// TestStatsInterrupt proves a signal during a large scan fails the process
+// instead of printing a summary of the samples it managed to read as if it
+// covered the whole range.
+func TestStatsInterrupt(t *testing.T) {
+	dataDir := filepath.Join(t.TempDir(), "data")
+	cfg := writeConfig(t, "data_dir: "+dataDir+"\n")
+	base := time.Date(2026, 10, 23, 16, 0, 0, 0, time.UTC)
+
+	// Enough rows that the scan is still running when the signal arrives.
+	labels := map[string]string{"host": "h", "scope": "system"}
+	samples := make([]wireSample, 300_000)
+	for i := range samples {
+		samples[i] = wireSample{
+			Timestamp: base.Add(time.Second + time.Duration(i)*time.Microsecond),
+			Metric:    "system.cpu.percent",
+			Value:     float64(i % 100),
+			Labels:    labels,
+		}
+	}
+	writeChunk(t, dataDir, "h", "system", base, base.Add(5*time.Minute), samples)
+
+	ctx, cancel := context.WithTimeout(context.Background(), time.Minute)
+	defer cancel()
+
+	d := startSmob(t, ctx, statsArgs(cfg, base,
+		"--format", "json", "--limit", "0", "--log-format", "json", "--log-level", "debug")...)
+	// The debug record is written while the command runs, before the store is
+	// opened, so the signal cannot arrive before the handler is installed.
+	waitFor(t, 30*time.Second, "stats to load its configuration", func() bool {
+		return hasLogMessage(d.stderr.String(), "loaded configuration")
+	})
+	d.signal(t, os.Interrupt)
+
+	if code := d.waitExit(t, 10*time.Second); code != 1 {
+		t.Fatalf("interrupted stats exit = %d, want 1\nstderr:\n%s", code, d.stderr.String())
+	}
+	if got := d.stdout.String(); got != "" {
+		t.Fatalf("interrupted stats wrote a document: %q", got)
+	}
+	if !strings.Contains(d.stderr.String(), "stats interrupted") {
+		t.Fatalf("stderr does not report the interruption:\n%s", d.stderr.String())
 	}
 }
 

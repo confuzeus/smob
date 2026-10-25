@@ -182,6 +182,76 @@ func TestSourceStream(t *testing.T) {
 	t.Logf("Source.Close joined the supervisor and stream bridge in %s", time.Since(closeStart))
 }
 
+// TestSourceStreamDropsRatesForRemovedContainer proves the drain filter: rates
+// buffered for a container that vanished between ticks must not be written
+// under its stale labels.
+func TestSourceStreamDropsRatesForRemovedContainer(t *testing.T) {
+	socket := requireDocker(t)
+	c, ctx := connectDocker(t)
+
+	unique := fmt.Sprintf("smob-source-%d-%d", os.Getpid(), time.Now().UnixNano())
+	name := unique + "-removed"
+	id := startNamedContainer(t, ctx, c, name)
+	_ = waitForOneShotStats(t, ctx, newTestStatsAcquirer(c), id)
+
+	src, err := New(ctx, Options{
+		Socket:         socket,
+		RescanInterval: 200 * time.Millisecond,
+		StreamStats:    true,
+		Interval:       time.Second,
+	}, newSupervisorTestLogger())
+	if err != nil {
+		t.Fatalf("new source: %v", err)
+	}
+	t.Cleanup(func() { _ = src.Close() })
+	src.Start(ctx)
+
+	waitForCondition(t, 60*time.Second, "a buffered rate for the container", func() bool {
+		return hasBufferedRate(src, name)
+	})
+
+	if err := c.ContainerRemove(ctx, id, container.RemoveOptions{Force: true}); err != nil {
+		t.Fatalf("remove container %s: %v", id, err)
+	}
+	waitForCondition(t, 30*time.Second, "removed container to disappear from the snapshot", func() bool {
+		return !hasContainer(src.supervisor, id)
+	})
+	if !hasBufferedRate(src, name) {
+		t.Fatal("no buffered rate for the removed container survived; the filter was not exercised")
+	}
+
+	samples, err := src.Collect(ctx, time.Now())
+	if err != nil {
+		t.Fatalf("collect after removal: %v", err)
+	}
+	if got := samplesForContainer(samples, name); len(got) != 0 {
+		t.Fatalf("collect emitted %d samples for removed container %s: %+v", len(got), name, got)
+	}
+
+	// A later tick must stay empty too: the drop happens in the drain filter,
+	// so no buffered rate can reappear under the removed container's labels.
+	again, err := src.Collect(ctx, time.Now())
+	if err != nil {
+		t.Fatalf("second collect after removal: %v", err)
+	}
+	if got := samplesForContainer(again, name); len(got) != 0 {
+		t.Fatalf("second collect emitted %d samples for removed container %s: %+v", len(got), name, got)
+	}
+}
+
+// hasBufferedRate reports whether the source still holds a rate sample labeled
+// for the named container.
+func hasBufferedRate(s *Source, name string) bool {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	for _, sample := range s.rates.samples {
+		if sample.Labels["container"] == name {
+			return true
+		}
+	}
+	return false
+}
+
 // assertRateTick checks the second one-shot tick: one memory gauge, one CPU
 // rate, and at least one network rate, all with the expected labels.
 func assertRateTick(t *testing.T, samples []model.Sample, name, image string, minIntervalMS int64) {

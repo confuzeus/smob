@@ -7,6 +7,9 @@ import (
 	"regexp"
 	"strings"
 	"time"
+	"unicode"
+
+	"github.com/confuzeus/smob/internal/store/chunk"
 )
 
 // Validate reports every problem in the configuration at once. Each message
@@ -17,7 +20,7 @@ func (c Config) Validate() error {
 	switch {
 	case c.Host == "":
 		errs = append(errs, errors.New("host: must not be empty"))
-	case !validHost(c.Host):
+	case !chunk.IsComponent(c.Host):
 		errs = append(errs, fmt.Errorf("host: must be a single path component; got %q", c.Host))
 	}
 	if c.ProcPath == "" {
@@ -51,6 +54,8 @@ func (c Config) Validate() error {
 	case "s3":
 		if c.Storage.S3.Bucket == "" {
 			errs = append(errs, errors.New("storage.s3.bucket: required when storage.primary is s3"))
+		} else if err := validS3Bucket(c.Storage.S3.Bucket); err != nil {
+			errs = append(errs, fmt.Errorf("storage.s3.bucket: %w", err))
 		}
 		if c.Storage.S3.Region == "" && c.Storage.S3.Endpoint == "" {
 			errs = append(errs, errors.New("storage.s3.region: required unless storage.s3.endpoint is set"))
@@ -59,6 +64,9 @@ func (c Config) Validate() error {
 			if err := validS3Endpoint(c.Storage.S3.Endpoint); err != nil {
 				errs = append(errs, fmt.Errorf("storage.s3.endpoint: %w", err))
 			}
+		}
+		if err := validS3Prefix(c.Storage.S3.Prefix); err != nil {
+			errs = append(errs, fmt.Errorf("storage.s3.prefix: %w", err))
 		}
 		if c.Storage.S3.SpoolDir == "" && c.DataDir == "" {
 			errs = append(errs, errors.New("storage.s3.spool_dir: required when data_dir is empty"))
@@ -73,15 +81,17 @@ func (c Config) Validate() error {
 	if !c.Sources.System.Enabled && !c.Sources.Process.Enabled && !c.Sources.Docker.Enabled {
 		errs = append(errs, errors.New("sources: at least one source must be enabled"))
 	}
-	if c.Sources.System.Enabled && c.Sources.System.Interval <= 0 {
-		errs = append(errs, errors.New("sources.system.interval: must be greater than zero"))
+	if c.Sources.System.Enabled {
+		if err := validateInterval("sources.system.interval", c.Sources.System.Interval); err != nil {
+			errs = append(errs, err)
+		}
 	}
 	if c.Sources.Process.Enabled {
 		if c.Sources.Process.TopN < 0 {
 			errs = append(errs, errors.New("sources.process.top_n: must not be negative"))
 		}
-		if c.Sources.Process.Interval <= 0 {
-			errs = append(errs, errors.New("sources.process.interval: must be greater than zero"))
+		if err := validateInterval("sources.process.interval", c.Sources.Process.Interval); err != nil {
+			errs = append(errs, err)
 		}
 		if c.Sources.Process.RescanInterval <= 0 {
 			errs = append(errs, errors.New("sources.process.rescan_interval: must be greater than zero"))
@@ -99,8 +109,8 @@ func (c Config) Validate() error {
 		if c.Sources.Docker.Socket == "" {
 			errs = append(errs, errors.New("sources.docker.socket: required when the docker source is enabled"))
 		}
-		if c.Sources.Docker.Interval <= 0 {
-			errs = append(errs, errors.New("sources.docker.interval: must be greater than zero"))
+		if err := validateInterval("sources.docker.interval", c.Sources.Docker.Interval); err != nil {
+			errs = append(errs, err)
 		}
 		if c.Sources.Docker.RescanInterval <= 0 {
 			errs = append(errs, errors.New("sources.docker.rescan_interval: must be greater than zero"))
@@ -122,14 +132,23 @@ func (c Config) Validate() error {
 	return errors.Join(errs...)
 }
 
-// validHost reports whether host can be used unchanged as a single path
-// component in the chunk key layout.
-func validHost(host string) bool {
-	return host != "." && host != ".." && !strings.ContainsRune(host, '/')
+// validateInterval checks a source collection interval. The floor of one
+// millisecond keeps every rate window represented by a positive interval_ms
+// instead of rounding to zero, which would make the sample look like a gauge.
+func validateInterval(field string, d Duration) error {
+	switch {
+	case d <= 0:
+		return fmt.Errorf("%s: must be greater than zero", field)
+	case d < Duration(time.Millisecond):
+		return fmt.Errorf("%s: must be at least 1ms; got %s", field, d)
+	}
+	return nil
 }
 
 // validS3Endpoint requires an absolute http or https URL for a custom S3
-// endpoint.
+// endpoint. Userinfo, a query, and a fragment are rejected because the AWS SDK
+// silently drops them: the endpoint would validate here and then fail at
+// HeadBucket with a confusing authentication or routing error.
 func validS3Endpoint(endpoint string) error {
 	u, err := url.Parse(endpoint)
 	if err != nil {
@@ -140,6 +159,51 @@ func validS3Endpoint(endpoint string) error {
 	}
 	if u.Host == "" {
 		return fmt.Errorf("must include a host; got %q", endpoint)
+	}
+	if u.User != nil {
+		return fmt.Errorf("must not include userinfo; got %q", endpoint)
+	}
+	if u.RawQuery != "" || u.ForceQuery {
+		return fmt.Errorf("must not include a query string; got %q", endpoint)
+	}
+	if u.Fragment != "" {
+		return fmt.Errorf("must not include a fragment; got %q", endpoint)
+	}
+	return nil
+}
+
+// validS3Bucket rejects a bucket name that no endpoint can use. It does not
+// implement the AWS DNS rule set: MinIO and other compatible services accept
+// names AWS itself would reject, and smob must keep working with them.
+func validS3Bucket(bucket string) error {
+	if len(bucket) > 255 {
+		return fmt.Errorf("must be at most 255 bytes; got %d", len(bucket))
+	}
+	for i := 0; i < len(bucket); i++ {
+		if c := bucket[i]; c < 0x20 || c == 0x7f {
+			return fmt.Errorf("must not contain control characters; got %q", bucket)
+		}
+	}
+	if strings.ContainsFunc(bucket, unicode.IsSpace) {
+		return fmt.Errorf("must not contain whitespace; got %q", bucket)
+	}
+	return nil
+}
+
+// validS3Prefix rejects a key prefix that a normalising gateway could rewrite
+// into a different object key. Surrounding slashes are trimmed during
+// resolution, so an empty segment here means a repeated slash.
+func validS3Prefix(prefix string) error {
+	if prefix == "" {
+		return nil
+	}
+	for _, segment := range strings.Split(prefix, "/") {
+		switch segment {
+		case "":
+			return fmt.Errorf("must not contain empty segments or repeated slashes; got %q", prefix)
+		case ".", "..":
+			return fmt.Errorf("must not contain %q segments; got %q", segment, prefix)
+		}
 	}
 	return nil
 }

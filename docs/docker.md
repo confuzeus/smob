@@ -84,6 +84,12 @@ with `Read-only file system`. smob only opens these files for reading, so it
 needs no write access, and the host's `/proc` cannot be modified through the
 container.
 
+Read-only is not private, though. The mount exposes host process metadata to
+everything in the container, not only to smob: `[pid]/stat` (which carries
+`comm`), `[pid]/status`, and `[pid]/cmdline` are readable for every host
+process the reader's UID may open. Run nothing else in this container, and
+treat the mount as a disclosure of host process names and command lines.
+
 ## Host PID namespace (`--pid=host`)
 
 The recommended deployment does **not** use `--pid=host`. A bind mount of the
@@ -92,21 +98,31 @@ host procfs preserves the host PID namespace: `/host/proc` lists host PIDs and
 namespace. That is the least-privilege choice.
 
 Use `--pid=host` instead of the mount when you want `proc_path` to stay
-`/proc`. Sharing the host PID namespace makes the container's `/proc` the
-host's procfs, so the process source sees host processes without a separate
-mount. Do not combine it with the mount unless you need both paths to show the
-host view.
+`/proc`. Sharing the host PID namespace makes the container's `/proc` a procfs
+for the host's PID namespace, so the process source sees host processes without
+a separate mount. Do not combine it with the mount unless you need both paths to
+show the host view.
 
 The trade-off is isolation. With `--pid=host` the container can see host
 processes and, subject to UID and capability checks, signal them. A monitoring
 agent may accept that, but it is unnecessary with the `/host/proc` mount, so
 add the flag only when you need it.
 
-A host that mounts `/proc` with `hidepid=1` or `hidepid=2` hides other users'
-processes from the container too. The image runs as UID 65532, so process
-coverage is limited to the processes that UID can read. Neither the
-`/host/proc` mount nor `--pid=host` changes the mount's `hidepid` setting; use
-a UID that can read the processes you need, or adjust the host mount.
+A host that mounts `/proc` with `hidepid=1` or `hidepid=2` limits the
+`/host/proc` bind mount too, because a bind mount shares the host procfs
+superblock and its options. The image runs as UID 65532, so process coverage
+through the mount is limited to the processes that UID can read; use a UID
+that can read the processes you need, or adjust the host mount.
+
+That limit does not carry over to `--pid=host`. There the container mounts a
+fresh procfs instance for the host PID namespace in its own mount namespace,
+and `hidepid` is a per-mount option, so the new mount uses the kernel default:
+every host PID stays visible even on a `hidepid=2` host. The consequence is
+blunt — all host process metadata is readable from `/proc` by anything in the
+container, and host processes can be signalled subject to UID and capability
+checks. Prefer the `/host/proc` mount unless you specifically need `proc_path`
+to stay `/proc`, and accept that the mount keeps the host's `hidepid` policy
+while the namespace flag discards it.
 
 ## Host network interfaces (`--network=host`)
 
@@ -134,9 +150,18 @@ stable:
 VERSION=local just docker
 ```
 
-The image runs as UID 65532, so `data_dir` must be writable by that user.
-Create and initialize the data volume once, before the `docker run` below, as
-described in [Data-directory ownership](#data-directory-ownership).
+`VERSION` becomes the image tag, so `just docker` rejects a value that is not a
+valid tag (letters, digits, `_`, `.`, and `-`; no whitespace or `:`) before it
+invokes Docker. `COMMIT` is the git short hash and `DATE` is an RFC 3339 UTC
+timestamp; neither may contain whitespace, which the linker would split between
+`-X` assignments.
+
+The image runs as UID 65532, so `data_dir` must be writable by that user. A
+fresh named volume is initialized from the image's `/data` directory, which is
+owned by that UID, so `docker run -v smob-data:/data` works as-is; only a
+bind-mounted host directory or a volume created before the image included
+`/data` needs preparation, as described in
+[Data-directory ownership](#data-directory-ownership).
 
 With `storage.primary: s3`, `spool_dir` defaults to `<data_dir>/spool`, so the
 same volume also holds chunks waiting to be uploaded; it needs the same
@@ -156,6 +181,28 @@ docker run -d --name smob \
 
 `$PWD/smob.yaml` is read from the current directory on the host and mounted at
 the image's default configuration path.
+
+`smob-data` above is the volume `docker run` creates. Compose prefixes the
+project name, so the examples in this guide talk to a *different* volume from
+the one [compose.yaml](../compose.yaml) writes (`smob_smob-data` for a `smob`
+project). Use the same name in the probe and query commands, or point both at
+one host directory with `SMOB_DATA`.
+
+The repository [compose.yaml](../compose.yaml) mounts `${SMOB_CONFIG:-./smob.yaml}`
+the same way and refuses to start when that file is missing, so create it first
+(`cp smob.example.yaml smob.yaml`) or set `SMOB_CONFIG` to an existing file.
+
+It also runs the service with `read_only: true`, `cap_drop: [ALL]`,
+`no-new-privileges:true`, `init: true`, `restart: unless-stopped`, and
+`stop_grace_period: 30s`. The binary needs no writable path outside `/data` and
+no capabilities, and tini forwards `SIGTERM` on the `scratch` image so the stop
+still flushes the partial chunk. Its `healthcheck` repeats the startup probe
+with `collect --dry-run`, because the image has no shell; check it with
+`docker inspect --format '{{.State.Health.Status}}' <container>`. With
+`storage.primary: s3` each run costs one `HeadBucket` per interval and the disk
+backend probes `data_dir` instead, so the check reports a broken store rather
+than a running process. A Docker socket mounted read-only is a bind mount and
+does not conflict with the read-only root filesystem.
 
 ## Container scope (optional)
 
@@ -182,6 +229,23 @@ the source is disabled.
 `:ro` makes the socket mount read-only, but it does not restrict the Docker
 API; see
 [Read-only socket mounts do not restrict the API](#read-only-socket-mounts-do-not-restrict-the-api).
+
+### Series identity
+
+Container samples carry the `container` and `image` labels plus
+`scope=container`; network samples add `interface`, including loopback (`lo`).
+The `container` label is the container name without Docker's leading `/`; an
+unnamed container falls back to the full 64-character container ID. The `image`
+label is the creation reference Docker reports, such as `busybox:1.36`, a digest
+reference, or a bare image ID. It is not a resolved digest and can be empty for
+unusual containers.
+
+There is no `container_id` label. Re-creating a container with the same name and
+image therefore continues the same label series with a gap. The first payload
+after recreation produces a memory gauge but no CPU or network rate, because the
+rate baseline is keyed by container ID. Renaming a running container splits the
+`container` series at the rename; the rate baseline continues because it is
+keyed by ID, so the rename itself does not cause a rate gap.
 
 ## Socket permissions and data ownership
 
@@ -238,13 +302,29 @@ your primary group, not the socket's group, so use `stat` on the socket path.
 If `sources.docker.socket` points somewhere other than `/var/run/docker.sock`,
 stat that path and mount it at the same path.
 
-The repository's [compose.yaml](../compose.yaml) has the socket mount and
-`group_add` entries commented out. Enable `sources.docker` in `smob.yaml`,
-uncomment both lines, then pass the socket's numeric GID:
+The repository's [compose.yaml](../compose.yaml) has no socket mount in the
+active service. The block at the end of the file is marked **off by default**
+and lists the three YAML lines that enable container metrics, verbatim: the
+socket entry for the service's `volumes:` list
+(`- /var/run/docker.sock:/var/run/docker.sock:ro`), the `group_add:` key at
+the same indentation as `volumes:`, and its single list item. Enable
+`sources.docker` in `smob.yaml`, add those three lines, then pass the socket's
+numeric GID:
 
 ```sh
 DOCKER_SOCKET_GID="$(stat -c '%g' /var/run/docker.sock)" docker compose up -d
 ```
+
+`DOCKER_SOCKET_GID` is required as soon as `group_add` is enabled. The compose
+entry uses `${DOCKER_SOCKET_GID:?...}`, so an unset value stops `docker compose
+config` and `up` with
+
+```text
+error while interpolating services.smob.group_add.[]: required variable DOCKER_SOCKET_GID is missing a value: set DOCKER_SOCKET_GID to the numeric GID of the docker socket
+```
+
+instead of starting a container that dies with `unable to find group : no
+matching entries in group file`.
 
 **Rootless Docker.** A rootless daemon usually listens on
 `$XDG_RUNTIME_DIR/docker.sock` (for example `/run/user/1000/docker.sock`)
@@ -277,14 +357,12 @@ The image runs as UID 65532, so `data_dir` must be owned by that UID (or
 otherwise writable by it). A directory owned by root and mode `0755` is not
 writable, and a bind-mounted host directory keeps its host ownership.
 
-Initialize a named volume once:
+The image carries an empty `/data` owned by `65532:65532`, and Docker creates a
+fresh named volume from that path, so a named volume needs no manual step. New
+files are then created as `65532:65532`.
 
-```sh
-docker volume create smob-data
-docker run --rm -v smob-data:/data busybox:1.36 chown 65532:65532 /data
-```
-
-Initialize a bind-mounted host directory the same way:
+A bind-mounted host directory is not initialized from the image and does need
+one `chown`:
 
 ```sh
 mkdir -p ./data
@@ -293,16 +371,35 @@ docker run --rm -v "$PWD/data:/data" busybox:1.36 chown 65532:65532 /data
 
 Then mount it as `-v "$PWD/data:/data"`. The `chown` has to run as root or
 through a container: an ordinary host user cannot give a file to another UID.
-Running `chown 65532:65532` as an ordinary user fails. The mode does not need to be
-group-writable: owner `65532` with mode `0755` is enough. Docker creates a fresh
-named volume from the image's path when that path exists, but a `scratch` image
-has no `/data`, so a new volume starts as `root:root` and needs this
-initialization once. New files are then created as `65532:65532`.
+Running `chown 65532:65532` as an ordinary user fails. The mode does not need
+to be group-writable: owner `65532` with mode `0755` is enough.
 
-For the repository [compose.yaml](../compose.yaml), the default volume is
-project-scoped (`smob_smob-data` when the project is `smob`). `docker compose
-config` prints the actual name; initialize that name once, or set `SMOB_DATA`
-to a prepared host directory.
+On a host with SELinux in enforcing mode, ownership alone is not enough: the
+container is also denied by the mount's label. Add `:z` to the bind mount so
+Docker relabels the host directory for container use, for example
+`-v "$PWD/data:/data:z"`; in [compose.yaml](../compose.yaml), append `:z` to the
+`/data` entry when `SMOB_DATA` is a host directory. Without it the store probe
+still fails with `permission denied` even though the owner is `65532`. The same
+applies to the read-only config bind mount: `-v
+"$PWD/smob.yaml:/etc/smob/smob.yaml:ro,z"` with `docker run`, or
+`bind: { selinux: z }` for the long-syntax mount in compose.yaml. Use `:Z` only
+when no other container needs the same host directory, because it makes the
+label private to this container.
+
+A named volume created before this image included `/data` is the other case:
+it starts as `root:root` and needs the same one-off initialization.
+
+Compose names volumes with the project prefix: `smob_smob-data` for a project
+named `smob`, not the bare `smob-data` that `docker run -v` creates. `docker
+volume ls` lists the actual names and `docker compose config` prints the one
+the file resolves to. Use that name for the `chown`:
+
+```sh
+docker run --rm -v smob_smob-data:/data busybox:1.36 chown 65532:65532 /data
+```
+
+Set `SMOB_DATA` to a prepared host directory to use a bind mount instead of the
+project volume.
 
 When the directory is not writable, `collect` probes the store before writing
 any sample and exits with code **3**:
@@ -311,7 +408,8 @@ any sample and exits with code **3**:
 smob: check /data: persistent store failure: open /data/.check-...: permission denied
 ```
 
-A named volume that was never initialized fails the same way. With
+A bind-mounted directory, or a volume that was never initialized, fails the
+same way. With
 `storage.primary: s3`, `spool_dir` defaults to `<data_dir>/spool`, so the same
 volume and ownership cover the spool. A separate `spool_dir` on a bind mount
 needs the same `chown`; a failed spool probe is also exit **3** and names the
@@ -321,11 +419,32 @@ spool:
 smob: check spool /data/spool: persistent store failure: mkdir /data/spool: permission denied
 ```
 
+### Data volume trust
+
+Ownership is also a security boundary. The volume must be writable only by UID
+`65532`, or by a service group you deliberately share with it; a container or
+host user that can write `/data` can forge chunks, delete retention candidates,
+and fill the volume. The symlink containment check rejects a write that resolves
+outside the data directory, but it does not make a writable directory safe.
+`spool_dir` defaults to `/data/spool` and needs the same protection.
+
+Files are created `0640` inside `0750` directories, so anything that can read the
+volume can read process `pid` and `comm`, container names and images, and host
+interface names. Group read is enough for `query`; do not grant group write.
+Keep the host parent of a bind mount owned by root and not world-writable. The
+full rules are in
+[configuration.md#trust-boundary](configuration.md#trust-boundary).
+
+The Docker socket is the other half of the boundary: it is root-equivalent, so
+mount it only when container metrics are enabled. See
+[Why the Docker socket is special](#why-the-docker-socket-is-special).
+
 ### Checking access
 
 Run the startup probe with the same mounts the collector will use. It checks
-the configuration, reads `/host/proc`, probes the store, and connects to the
-Docker daemon when the source is enabled:
+the configuration, constructs the enabled sources — reading `/host/proc` and
+connecting to the Docker daemon when that source is enabled — and then probes
+the store:
 
 ```sh
 docker run --rm \
@@ -352,8 +471,9 @@ exit **1**:
 smob: docker: connect to /var/run/docker.sock: Cannot connect to the Docker daemon at unix:///var/run/docker.sock. Is the docker daemon running?
 ```
 
-Because the Docker probe runs first, a bad socket hides a bad data directory;
-fix them in that order. A data-directory failure exits **3**, as shown above.
+Sources are probed before the store, so a bad socket or an unreadable
+`/host/proc` hides a bad data directory; fix them in that order. A
+data-directory failure exits **3**, as shown above.
 
 Then take one snapshot and query it:
 
@@ -385,7 +505,7 @@ does not appear.
 | --- | --- | --- |
 | `docker: connect ... permission denied` | UID 65532 does not have the socket's GID | 1 |
 | `docker: connect ... Cannot connect` | socket not mounted or wrong `sources.docker.socket` | 1 |
-| `check /data: persistent store failure: ... permission denied` | `data_dir` or named volume not owned by 65532 | 3 |
+| `check /data: persistent store failure: ... permission denied` | `data_dir` or bind-mounted host directory not owned by 65532 | 3 |
 | `check spool ...: persistent store failure: ... permission denied` | S3 spool directory not writable by 65532 | 3 |
 
 ## Verifying the deployment

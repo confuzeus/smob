@@ -48,11 +48,15 @@ type statSnapshot struct {
 }
 
 // parseStat parses /proc/stat. It requires the aggregate cpu line and accepts
-// four to ten counter fields per line, the range seen on supported kernels.
+// four or more counter fields per line; kernels have added counters over time,
+// so trailing fields beyond the ten this package models are ignored.
 func parseStat(r io.Reader) (statSnapshot, error) {
 	s := statSnapshot{cpus: make(map[int]cpuTimes)}
 
 	scanner := bufio.NewScanner(r)
+	// The intr line lists one counter per IRQ, so hosts with thousands of
+	// interrupts exceed the scanner's 64 KiB default token limit.
+	scanner.Buffer(make([]byte, 64*1024), 1<<20)
 	line := 0
 	foundAll := false
 	for scanner.Scan() {
@@ -90,7 +94,8 @@ func parseStat(r io.Reader) (statSnapshot, error) {
 		}
 	}
 	if err := scanner.Err(); err != nil {
-		return statSnapshot{}, fmt.Errorf("read stat: %w", err)
+		// Scan stops before consuming the failed line, so it is the next one.
+		return statSnapshot{}, fmt.Errorf("line %d: %w", line+1, err)
 	}
 	if !foundAll {
 		return statSnapshot{}, errors.New("missing aggregate cpu line")
@@ -99,10 +104,11 @@ func parseStat(r io.Reader) (statSnapshot, error) {
 }
 
 // parseCPUTimes decodes the counters after the cpu name. Kernels before 2.6.33
-// emit four fields; modern kernels emit ten.
+// emit four fields; modern kernels emit ten. A future kernel may append fields,
+// which are accepted but not modelled.
 func parseCPUTimes(fields []string) (cpuTimes, error) {
-	if len(fields) < 4 || len(fields) > 10 {
-		return cpuTimes{}, fmt.Errorf("got %d fields, want 4 to 10", len(fields))
+	if len(fields) < 4 {
+		return cpuTimes{}, fmt.Errorf("got %d fields, want at least 4", len(fields))
 	}
 
 	var times cpuTimes
@@ -119,6 +125,9 @@ func parseCPUTimes(fields []string) (cpuTimes, error) {
 		&times.guestNice,
 	}
 	for i, field := range fields {
+		if i == len(dst) {
+			break
+		}
 		value, err := strconv.ParseUint(field, 10, 64)
 		if err != nil {
 			return cpuTimes{}, fmt.Errorf("field %d: %w", i+1, err)

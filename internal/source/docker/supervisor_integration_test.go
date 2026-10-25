@@ -7,13 +7,16 @@ package docker
 // the same technique the S3 spool test uses for a network partition.
 
 import (
+	"bytes"
 	"context"
+	"encoding/json"
 	"fmt"
 	"io"
 	"log/slog"
 	"net"
 	"os"
 	"path/filepath"
+	"strings"
 	"sync"
 	"testing"
 	"time"
@@ -218,6 +221,323 @@ func TestSupervisorStreamReconnect(t *testing.T) {
 	_ = sup.Close()
 }
 
+// TestSupervisorPublishesSnapshotBeforeStreams proves the first payload for a
+// newly discovered container is attributed against a snapshot that already
+// contains it. A worker started before setContainers would race that publish.
+func TestSupervisorPublishesSnapshotBeforeStreams(t *testing.T) {
+	socket := requireDocker(t)
+	c, ctx := connectDocker(t)
+
+	unique := fmt.Sprintf("smob-sup-%d-%d", os.Getpid(), time.Now().UnixNano())
+	firstID := startNamedContainer(t, ctx, c, unique+"-first")
+
+	sup, err := NewSupervisor(ctx, Options{
+		Socket:         socket,
+		RescanInterval: 200 * time.Millisecond,
+		StreamStats:    true,
+	}, newSupervisorTestLogger())
+	if err != nil {
+		t.Fatalf("new supervisor: %v", err)
+	}
+
+	runCtx, cancel := context.WithCancel(ctx)
+	done := make(chan struct{})
+	go func() {
+		sup.Run(runCtx)
+		close(done)
+	}()
+	t.Cleanup(func() {
+		cancel()
+		select {
+		case <-done:
+		case <-time.After(10 * time.Second):
+			t.Errorf("supervisor did not stop within 10s")
+		}
+		_ = sup.Close()
+	})
+
+	// The initial stream must be live before the new container appears, so the
+	// payload that matters is produced after Run established the snapshot.
+	_ = waitForStats(t, runCtx, sup, firstID, 45*time.Second)
+
+	name := unique + "-new"
+	newID := startNamedContainer(t, ctx, c, name)
+	first := waitForStats(t, runCtx, sup, newID, 60*time.Second)
+
+	container, ok := containerByID(sup, first.containerID)
+	if !ok {
+		t.Fatalf("first payload for container %s arrived before its snapshot was published", newID)
+	}
+	if container.ID != newID || container.Name != name {
+		t.Fatalf("payload attributed to %+v, want id %s name %s", container, newID, name)
+	}
+}
+
+// TestSupervisorRunIsSingleUse proves a second Run is a no-op: it must not
+// start a second lifecycle, disturb the first, or close the stats channel
+// twice.
+func TestSupervisorRunIsSingleUse(t *testing.T) {
+	socket := requireDocker(t)
+	c, ctx := connectDocker(t)
+
+	sup, err := NewSupervisor(ctx, Options{
+		Socket:         socket,
+		RescanInterval: 200 * time.Millisecond,
+		StreamStats:    true,
+	}, newSupervisorTestLogger())
+	if err != nil {
+		t.Fatalf("new supervisor: %v", err)
+	}
+
+	runCtx, cancel := context.WithCancel(ctx)
+	done := make(chan struct{})
+	go func() {
+		sup.Run(runCtx)
+		close(done)
+	}()
+	t.Cleanup(func() {
+		cancel()
+		select {
+		case <-done:
+		case <-time.After(10 * time.Second):
+			t.Errorf("supervisor did not stop within 10s")
+		}
+		_ = sup.Close()
+	})
+
+	// Wait until the first call owns the lifecycle; otherwise the second call
+	// could win the race and the test would prove nothing.
+	waitForCondition(t, 10*time.Second, "the first Run to claim the supervisor", func() bool {
+		sup.runMu.Lock()
+		defer sup.runMu.Unlock()
+		return sup.running
+	})
+
+	second := make(chan struct{})
+	go func() {
+		sup.Run(runCtx)
+		close(second)
+	}()
+	select {
+	case <-second:
+	case <-time.After(10 * time.Second):
+		t.Fatal("second Run did not return; Run must be single-use")
+	}
+
+	// The first Run still owns the lifecycle.
+	unique := fmt.Sprintf("smob-sup-%d-%d", os.Getpid(), time.Now().UnixNano())
+	id := startNamedContainer(t, ctx, c, unique+"-after-second-run")
+	_ = waitForStats(t, runCtx, sup, id, 45*time.Second)
+
+	cancel()
+	select {
+	case <-done:
+	case <-time.After(10 * time.Second):
+		t.Fatal("supervisor did not stop within 10s")
+	}
+
+	// A second close of the stats channel would have panicked; reaching a
+	// closed channel here proves the single close.
+	closed := make(chan struct{})
+	go func() {
+		for range sup.stats {
+		}
+		close(closed)
+	}()
+	select {
+	case <-closed:
+	case <-time.After(10 * time.Second):
+		t.Fatal("stats channel stayed open after Run returned")
+	}
+}
+
+// TestSupervisorFlapDoesNotResetBackoff drives repeated one-payload streams.
+// A daemon that closes each connection after one sample must not reset the
+// reconnect backoff to the minimum or warn on every flap.
+func TestSupervisorFlapDoesNotResetBackoff(t *testing.T) {
+	socket := requireDocker(t)
+	c, ctx := connectDocker(t)
+	proxy := newUnixFaultProxy(t, socket)
+
+	unique := fmt.Sprintf("smob-sup-%d-%d", os.Getpid(), time.Now().UnixNano())
+	id := startNamedContainer(t, ctx, c, unique+"-flap")
+
+	logs := &logCapture{}
+	sup, err := NewSupervisor(ctx, Options{
+		Socket:         proxy.Socket(),
+		RescanInterval: 200 * time.Millisecond,
+		StreamStats:    true,
+	}, slog.New(slog.NewJSONHandler(logs, &slog.HandlerOptions{Level: slog.LevelDebug})))
+	if err != nil {
+		t.Fatalf("new supervisor: %v", err)
+	}
+
+	runCtx, cancel := context.WithCancel(ctx)
+	done := make(chan struct{})
+	go func() {
+		sup.Run(runCtx)
+		close(done)
+	}()
+	t.Cleanup(func() {
+		cancel()
+		select {
+		case <-done:
+		case <-time.After(10 * time.Second):
+			t.Errorf("supervisor did not stop within 10s")
+		}
+		_ = sup.Close()
+	})
+
+	_ = waitForStats(t, runCtx, sup, id, 45*time.Second)
+
+	// Each cycle closes the live stream after one payload, rejects the
+	// immediate reconnect, then resumes so the next one-payload stream can be
+	// closed again. That is a flap, not a stable connection.
+	rejected := proxy.Rejected()
+	for i := 0; i < 3; i++ {
+		cutoff := time.Now()
+		proxy.Pause()
+		waitForCondition(t, 15*time.Second, "a reconnect rejected by the paused proxy", func() bool {
+			return proxy.Rejected() > rejected
+		})
+		rejected = proxy.Rejected()
+		proxy.Resume()
+		_ = waitForStatsAfter(t, runCtx, sup, id, cutoff, 45*time.Second)
+	}
+
+	records := logs.records(t)
+	warned := countLogs(records, "container stats stream ended; reconnecting", id)
+	if warned > 1 {
+		t.Fatalf("stream ended warning logged %d times; a flapping stream must back off after the first", warned)
+	}
+	if warned == 0 {
+		t.Fatal("flapping stream was never reported")
+	}
+	if debugged := countLogs(records, "container stats stream still unavailable; retrying", id); debugged == 0 {
+		t.Fatal("repeated flaps were not logged at debug")
+	}
+
+	last := time.Duration(0)
+	for _, record := range records {
+		if record["container"] != id {
+			continue
+		}
+		if d, ok := retryIn(record); ok {
+			last = d
+		}
+	}
+	if last < time.Second {
+		t.Fatalf("last retry_in = %s, want at least 1s; the flap reset the backoff", last)
+	}
+}
+
+// TestSupervisorIdleStreamRestarts proves a stream that is established but
+// delivers nothing is torn down by the idle watchdog and reconnected.
+func TestSupervisorIdleStreamRestarts(t *testing.T) {
+	socket := requireDocker(t)
+	c, ctx := connectDocker(t)
+	proxy := newUnixFaultProxy(t, socket)
+
+	unique := fmt.Sprintf("smob-sup-%d-%d", os.Getpid(), time.Now().UnixNano())
+	id := startNamedContainer(t, ctx, c, unique+"-idle")
+
+	logs := &logCapture{}
+	sup, err := NewSupervisor(ctx, Options{
+		Socket:         proxy.Socket(),
+		RescanInterval: time.Second,
+		StreamStats:    true,
+		// The watchdog is max(3*interval, 30s), so a short interval still
+		// exercises the floor and the restart.
+		Interval: 100 * time.Millisecond,
+	}, slog.New(slog.NewJSONHandler(logs, &slog.HandlerOptions{Level: slog.LevelDebug})))
+	if err != nil {
+		t.Fatalf("new supervisor: %v", err)
+	}
+
+	runCtx, cancel := context.WithCancel(ctx)
+	done := make(chan struct{})
+	go func() {
+		sup.Run(runCtx)
+		close(done)
+	}()
+	t.Cleanup(func() {
+		cancel()
+		select {
+		case <-done:
+		case <-time.After(10 * time.Second):
+			t.Errorf("supervisor did not stop within 10s")
+		}
+		_ = sup.Close()
+	})
+
+	_ = waitForStats(t, runCtx, sup, id, 45*time.Second)
+
+	stalledAt := time.Now()
+	proxy.Stall()
+	waitForCondition(t, 60*time.Second, "the idle watchdog to restart the stalled stream", func() bool {
+		return countLogs(logs.records(t), "container stats stream idle; reconnecting", id) > 0
+	})
+	proxy.Unstall()
+
+	// The replacement stream must deliver a payload newer than the stall.
+	_ = waitForStatsAfter(t, runCtx, sup, id, stalledAt, 45*time.Second)
+}
+
+// logCapture is a slog destination that keeps JSON records for assertions. It
+// is safe for the discovery and stream goroutines to write concurrently.
+type logCapture struct {
+	mu   sync.Mutex
+	data bytes.Buffer
+}
+
+func (c *logCapture) Write(p []byte) (int, error) {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	return c.data.Write(p)
+}
+
+// records decodes the captured log lines.
+func (c *logCapture) records(t *testing.T) []map[string]any {
+	t.Helper()
+	c.mu.Lock()
+	body := c.data.String()
+	c.mu.Unlock()
+
+	var records []map[string]any
+	for _, line := range strings.Split(strings.TrimSpace(body), "\n") {
+		if line == "" {
+			continue
+		}
+		var record map[string]any
+		if err := json.Unmarshal([]byte(line), &record); err != nil {
+			t.Fatalf("decode log line %q: %v", line, err)
+		}
+		records = append(records, record)
+	}
+	return records
+}
+
+// countLogs counts records with the given message and container.
+func countLogs(records []map[string]any, msg, container string) int {
+	count := 0
+	for _, record := range records {
+		if record["msg"] == msg && record["container"] == container {
+			count++
+		}
+	}
+	return count
+}
+
+// retryIn reads the structured retry delay from a record. slog encodes a
+// duration as nanoseconds.
+func retryIn(record map[string]any) (time.Duration, bool) {
+	value, ok := record["retry_in"].(float64)
+	if !ok {
+		return 0, false
+	}
+	return time.Duration(value), true
+}
+
 // unixFaultProxy forwards a Unix socket to the real daemon and can stop
 // forwarding on demand. It is a fault injector, not a fake Docker service.
 type unixFaultProxy struct {
@@ -227,6 +547,8 @@ type unixFaultProxy struct {
 
 	mu       sync.Mutex
 	paused   bool
+	stall    chan struct{}
+	closed   chan struct{}
 	conns    map[net.Conn]struct{}
 	rejected int
 }
@@ -243,6 +565,7 @@ func newUnixFaultProxy(t *testing.T, target string) *unixFaultProxy {
 		path:     path,
 		listener: listener,
 		target:   target,
+		closed:   make(chan struct{}),
 		conns:    make(map[net.Conn]struct{}),
 	}
 	go p.accept()
@@ -267,6 +590,30 @@ func (p *unixFaultProxy) Resume() {
 	p.paused = false
 }
 
+// Stall closes every forwarded connection and then holds new connections open
+// without forwarding a byte, so a stats stream is established but delivers
+// nothing. Unstall releases the held connections.
+func (p *unixFaultProxy) Stall() {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	p.paused = false
+	if p.stall == nil {
+		p.stall = make(chan struct{})
+	}
+	for conn := range p.conns {
+		_ = conn.Close()
+	}
+}
+
+func (p *unixFaultProxy) Unstall() {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	if p.stall != nil {
+		close(p.stall)
+		p.stall = nil
+	}
+}
+
 func (p *unixFaultProxy) Rejected() int {
 	p.mu.Lock()
 	defer p.mu.Unlock()
@@ -274,6 +621,7 @@ func (p *unixFaultProxy) Rejected() int {
 }
 
 func (p *unixFaultProxy) close() {
+	close(p.closed)
 	p.mu.Lock()
 	for conn := range p.conns {
 		_ = conn.Close()
@@ -303,6 +651,20 @@ func (p *unixFaultProxy) accept() {
 }
 
 func (p *unixFaultProxy) handle(clientConn net.Conn) {
+	p.mu.Lock()
+	stall := p.stall
+	p.mu.Unlock()
+	if stall != nil {
+		// Hold the connection without forwarding: the client sees an accepted
+		// socket whose request never gets a response.
+		select {
+		case <-stall:
+		case <-p.closed:
+			_ = clientConn.Close()
+			return
+		}
+	}
+
 	upstream, err := net.Dial("unix", p.target)
 	if err != nil {
 		_ = clientConn.Close()

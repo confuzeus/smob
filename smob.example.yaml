@@ -1,0 +1,27 @@
+# Minimal configuration for the compose deployment in compose.yaml.
+#
+# The config file must exist before `docker compose up -d`, so copy this one
+# into place first:
+#   cp smob.example.yaml smob.yaml
+# Or mount a different file with SMOB_CONFIG=/path/to/smob.yaml.
+#
+# Paths match the compose mounts: data_dir is the mounted volume and proc_path
+# is the host procfs mounted at /host/proc. The quickstart's local config uses
+# /proc and ./data instead; do not reuse it here.
+#
+# `host` defaults to the container hostname, which is the container ID. Set it
+# to the machine's name when several writers share one store.
+#
+# Field reference: docs/configuration.md
+
+data_dir: /data
+proc_path: /host/proc
+
+sources:
+  system:
+    enabled: true
+  process:
+    enabled: true
+
+storage:
+  primary: disk

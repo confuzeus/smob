@@ -9,6 +9,8 @@ Type=simple
 ExecStart=/usr/local/bin/smob collect --config /etc/smob/smob.yaml
 Restart=on-failure
 RestartSec=5s
+# Exit 2 is a usage/config error needing a human; exit 1 (runtime) and 3 (store) still restart.
+RestartPreventExitStatus=2
 
 # The first SIGTERM flushes the active chunk and exits 0; the second exits 1
 # without waiting. Give a final S3 upload time to finish.

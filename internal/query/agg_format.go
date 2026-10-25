@@ -50,12 +50,15 @@ type aggregateTableWriter struct {
 }
 
 func (t *aggregateTableWriter) Write(aggregate Aggregate) error {
+	if err := validateFinite(aggregate.Metric, aggregate.Value); err != nil {
+		return err
+	}
 	_, err := fmt.Fprintf(t.w, "%s\t%d\t%s\t%s\t%s\n",
-		aggregate.Metric,
+		escapeCell(aggregate.Metric),
 		aggregate.Count,
 		formatValue(aggregate.Value),
 		unitFor(aggregate.Metric),
-		formatLabels(aggregate.Labels),
+		escapeCell(formatLabels(aggregate.Labels)),
 	)
 	return err
 }
@@ -70,6 +73,9 @@ type aggregateJSONWriter struct {
 }
 
 func (j *aggregateJSONWriter) Write(aggregate Aggregate) error {
+	if err := validateFinite(aggregate.Metric, aggregate.Value); err != nil {
+		return err
+	}
 	data, err := json.Marshal(aggregate)
 	if err != nil {
 		return err
@@ -97,6 +103,9 @@ type aggregateJSONLWriter struct {
 }
 
 func (j *aggregateJSONLWriter) Write(aggregate Aggregate) error {
+	if err := validateFinite(aggregate.Metric, aggregate.Value); err != nil {
+		return err
+	}
 	return j.enc.Encode(aggregate)
 }
 
@@ -107,6 +116,9 @@ type aggregateCSVWriter struct {
 }
 
 func (c *aggregateCSVWriter) Write(aggregate Aggregate) error {
+	if err := validateFinite(aggregate.Metric, aggregate.Value); err != nil {
+		return err
+	}
 	return c.w.Write([]string{
 		aggregate.Metric,
 		formatLabels(aggregate.Labels),

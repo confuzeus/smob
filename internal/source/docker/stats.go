@@ -61,10 +61,13 @@ func newStatsAcquirer(c *client.Client, logger *slog.Logger) *statsAcquirer {
 //
 // A container that disappeared or failed is logged at warn once per distinct
 // error and omitted; it never fails the whole tick. A canceled context stops
-// outstanding requests and returns the samples that completed.
-func (a *statsAcquirer) oneShot(ctx context.Context, ids []string) []rawStats {
+// outstanding requests; when that context is a tick deadline the partial batch
+// is returned with an error, so the collector records the timeout instead of
+// treating it as a complete tick. A canceled parent is shutdown, not a source
+// failure, and returns no error.
+func (a *statsAcquirer) oneShot(ctx context.Context, ids []string) ([]rawStats, error) {
 	if len(ids) == 0 {
-		return nil
+		return nil, nil
 	}
 
 	type result struct {
@@ -93,22 +96,36 @@ func (a *statsAcquirer) oneShot(ctx context.Context, ids []string) []rawStats {
 	previous := a.failed
 	failed := make(map[string]string)
 	out := make([]rawStats, 0, len(ids))
+	timedOut := false
 	for i, r := range results {
 		id := ids[i]
 		if r.err != nil {
-			if ctx.Err() == nil {
-				message := r.err.Error()
-				if previous[id] != message {
-					a.logger.Warn("container stats unavailable", "container", id, "error", r.err)
+			if err := ctx.Err(); err != nil {
+				// The tick ended while this request was outstanding. Carry the
+				// memo entry forward rather than clearing it: a timeout is not
+				// evidence the container recovered.
+				if message, ok := previous[id]; ok {
+					failed[id] = message
 				}
-				failed[id] = message
+				if errors.Is(err, context.DeadlineExceeded) {
+					timedOut = true
+				}
+				continue
 			}
+			message := r.err.Error()
+			if previous[id] != message {
+				a.logger.Warn("container stats unavailable", "container", id, "error", r.err)
+			}
+			failed[id] = message
 			continue
 		}
 		out = append(out, r.stats)
 	}
 	a.failed = failed
-	return out
+	if timedOut {
+		return out, fmt.Errorf("container stats: %w", ctx.Err())
+	}
+	return out, nil
 }
 
 // oneShotContainer fetches and decodes one stats payload. The response body is

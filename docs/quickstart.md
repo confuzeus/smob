@@ -8,7 +8,11 @@ at the end.
 ## Requirements
 
 - Linux (amd64 or arm64).
-- Go 1.27 or newer to build from source.
+- Go 1.27.3 or newer to build from source. The `go` directive in
+  [go.mod](../go.mod) requires that exact patch level: a 1.27.0 toolchain
+  succeeds only when Go may fetch a newer one (the default
+  `GOTOOLCHAIN=auto`), and with `GOTOOLCHAIN=local` the build stops with a
+  version error.
 - No Docker or S3 service is needed for this walkthrough.
 
 ## Build and install
@@ -131,6 +135,22 @@ suffix rules are in
 [IMPLEMENTATION.md](IMPLEMENTATION.md#3-storage-format-and-chunking). Nothing
 else in the data directory is part of the format.
 
+## Exit codes
+
+Every subcommand uses the same codes, including `config --validate` and
+`version`:
+
+| Code | Meaning |
+| --- | --- |
+| `0` | Success, including `--help`, `--version`, and a query with no matching samples |
+| `1` | Runtime failure that is not a usage or store error, such as a source read error |
+| `2` | Usage or configuration error: bad flags or arguments, or a missing, unreadable, or invalid configuration file |
+| `3` | Persistent store failure: a full filesystem (`ENOSPC`), an unwritable `data_dir`, or a failed S3 write and spool write |
+
+`collect` checks the store before collecting, so an unusable `data_dir` exits 3
+without producing samples. On shutdown, the first `SIGINT`/`SIGTERM` flushes the
+active chunk and exits 0; a second signal exits 1 immediately without flushing.
+
 ## Run as a service
 
 The repository ships a hardened unit at
@@ -155,9 +175,48 @@ systemctl status smob
 journalctl -u smob -f
 ```
 
-If you use a different `data_dir`, give that directory to the service user and
-add a `ReadWritePaths=` drop-in; the unit comments explain the static-user
-alternative.
+`StateDirectory=smob` creates `/var/lib/smob`, hands it to the service user, and
+keeps it writable under `ProtectSystem=strict`. That is why the default
+`data_dir` needs no ownership work. A non-default `data_dir` does: with
+`DynamicUser=yes` the UID is transient, so a `chown` you run today may no longer
+match after a restart, and `ReadWritePaths=` only permits access to a path the
+unit can already write; it never changes ownership. Use the unit's
+static-account alternative instead:
+
+```sh
+sudo useradd --system --user-group --no-create-home \
+  --home-dir /var/lib/smob --shell /usr/sbin/nologin smob
+sudo install -d -o smob -g smob -m 0750 /srv/smob
+sudoedit /etc/systemd/system/smob.service   # apply the block below
+sudo systemctl daemon-reload
+sudo systemctl restart smob
+```
+
+In `[Service]`, replace `DynamicUser=yes` with the static account, keep
+`StateDirectory=smob`, and open the new path to the unit:
+
+```ini
+User=smob
+Group=smob
+StateDirectory=smob
+ReadWritePaths=/srv/smob
+```
+
+Then set `data_dir: /srv/smob` in `/etc/smob/smob.yaml`. `StateDirectory` still
+creates and manages `/var/lib/smob` for the static user, which is harmless when
+unused. Under `/home`, also change `ProtectHome=yes` to `ProtectHome=read-only`
+or `no`, because the unit hides `/home` by default. If you keep
+`DynamicUser=yes`, the only writable directory you can name portably is a
+`StateDirectory=` path under `/var/lib`: replace `StateDirectory=smob` with
+`StateDirectory=smob-data` and set `data_dir: /var/lib/smob-data`. A path such
+as `/srv/smob` or `/mnt/data` requires the static account above.
+
+`Restart=on-failure` restarts the unit on a runtime failure (exit code 1) and a
+persistent store failure (exit code 3). A usage or configuration error (exit
+code 2) is excluded by `RestartPreventExitStatus=2`: it needs a human, so the
+service stops in `failed` instead of retrying. Fix `/etc/smob/smob.yaml`, check
+it with `smob config --validate --config /etc/smob/smob.yaml`, then
+`sudo systemctl start smob`.
 
 ### Container deployment
 

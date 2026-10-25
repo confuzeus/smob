@@ -2,6 +2,7 @@ package system
 
 import (
 	"bytes"
+	"math"
 	"strings"
 	"testing"
 )
@@ -71,8 +72,31 @@ func TestParseMeminfo(t *testing.T) {
 			wantErr: "duplicate MemTotal",
 		},
 		{
+			name:    "duplicate available field",
+			input:   "MemTotal: 1024 kB\nMemAvailable: 512 kB\nMemAvailable: 256 kB\n",
+			wantErr: "duplicate MemAvailable",
+		},
+		{
+			name:  "largest value that fits in bytes",
+			input: "MemTotal: 18014398509481983 kB\nMemAvailable: 1 kB\n",
+			want: meminfoSnapshot{
+				totalBytes:     math.MaxUint64 / 1024 * 1024,
+				availableBytes: 1024,
+			},
+		},
+		{
+			name:    "overflow by one kilobyte",
+			input:   "MemTotal: 18014398509481984 kB\nMemAvailable: 1 kB\n",
+			wantErr: "overflows bytes",
+		},
+		{
 			name:    "overflow",
 			input:   "MemTotal: 18446744073709551615 kB\nMemAvailable: 512 kB\n",
+			wantErr: "overflows bytes",
+		},
+		{
+			name:    "available overflows",
+			input:   "MemTotal: 1024 kB\nMemAvailable: 18446744073709551615 kB\n",
 			wantErr: "overflows bytes",
 		},
 	}

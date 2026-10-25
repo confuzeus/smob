@@ -13,7 +13,7 @@ func (a *app) configCommand() *cobra.Command {
 	cmd := &cobra.Command{
 		Use:   "config",
 		Short: "Print the effective configuration",
-		Args:  cobra.NoArgs,
+		Args:  noArgs,
 		RunE: func(cmd *cobra.Command, _ []string) error {
 			if err := a.load(cmd); err != nil {
 				return err

@@ -14,9 +14,10 @@
 #
 # Build the image first with: VERSION=local just docker
 #
-# The image runs as UID 65532. The default named volume must be initialized
-# once, or set SMOB_DATA to a host directory owned by that UID. See
-# docs/docker.md#data-directory-ownership.
+# The image runs as UID 65532 and ships an empty /data owned by that UID, so a
+# fresh named volume is writable as-is. A bind-mounted host directory, or a
+# named volume created before the image included /data, needs a one-off chown
+# to 65532:65532. See docs/docker.md#data-directory-ownership.
 
 services:
   smob:
@@ -26,6 +27,35 @@ services:
     security_opt:
       - no-new-privileges:true
 
+    # The binary only reads mounts and writes /data, so the image filesystem can
+    # stay immutable. /data is a volume, the config and host procfs are
+    # read-only bind mounts, and a bind-mounted Docker socket (optional block at
+    # the end of this file) is a mount rather than a root-filesystem write, so
+    # enabling container metrics does not conflict with this.
+    read_only: true
+    # No Linux capabilities are needed: smob opens /host/proc for reading and
+    # writes /data as UID 65532; it never binds a privileged port or changes
+    # ownership, so dropping every capability costs nothing.
+    cap_drop:
+      - ALL
+    # The scratch image has no init of its own. Docker injects tini, which
+    # forwards SIGTERM to the collector instead of leaving it unhandled, so the
+    # partial chunk is still flushed on `docker compose stop`.
+    init: true
+
+    # The scratch image ships no shell or curl, so the check runs the binary.
+    # A dry run validates the configuration, reads /host/proc, probes the store,
+    # and checks free space, then exits non-zero if any of those fail. It writes
+    # no sample, so it is safe to repeat every minute. With storage.primary: s3
+    # it costs one HeadBucket per interval; the disk backend probes the data
+    # directory instead.
+    healthcheck:
+      test: ["CMD", "/smob", "collect", "--dry-run", "--config", "/etc/smob/smob.yaml"]
+      interval: 60s
+      timeout: 10s
+      retries: 3
+      start_period: 15s
+
     # Host networking makes system.network.* describe the host interfaces.
     # Remove it to keep the container network isolated; network metrics then
     # describe the container namespace. See docs/docker.md.
@@ -33,19 +63,50 @@ services:
 
     volumes:
       - ${SMOB_DATA:-smob-data}:/data
-      - ${SMOB_CONFIG:-./smob.yaml}:/etc/smob/smob.yaml:ro
+      # The config must already exist. create_host_path: false makes a missing
+      # file fail the start with a clear Docker error; the short syntax would
+      # create a root-owned directory at ./smob.yaml and send the container
+      # into a restart loop. Create one first, or point SMOB_CONFIG at it:
+      #   cp smob.example.yaml smob.yaml && docker compose up -d
+      #   SMOB_CONFIG=/etc/smob/host.yaml docker compose up -d
+      - type: bind
+        source: ${SMOB_CONFIG:-./smob.yaml}
+        target: /etc/smob/smob.yaml
+        read_only: true
+        bind:
+          create_host_path: false
       # The host procfs plus proc_path: /host/proc exposes host processes
       # without sharing the PID namespace. Do not add pid: host.
       - /proc:/host/proc:ro
-      # Optional container metrics. Enable sources.docker in smob.yaml, then
-      # uncomment this mount and group_add below. The Docker socket is
-      # root-equivalent; mount it only when container metrics are intended.
-      # - /var/run/docker.sock:/var/run/docker.sock:ro
-
-    # Pass the socket's numeric GID, not a group name (the scratch image has
-    # no /etc/group). Uncomment after mounting the socket:
-    # group_add:
-    #   - "${DOCKER_SOCKET_GID}"
 
 volumes:
   smob-data:
+
+# =============================================================================
+# Optional: container metrics (Docker socket) — OFF BY DEFAULT
+# =============================================================================
+#
+# The Docker socket grants root-equivalent control of the host daemon, so this
+# file does not mount it. Enable container metrics only when you intend to
+# collect container.* samples, and only on a host where smob may hold that
+# authority. See docs/docker.md#why-the-docker-socket-is-special.
+#
+# To enable, first set sources.docker.enabled: true in smob.yaml, then make two
+# edits inside the smob service above:
+#
+#   1. Add the socket to the existing `volumes:` list:
+#        - /var/run/docker.sock:/var/run/docker.sock:ro
+#
+#   2. Add a `group_add:` key beside `volumes:`, at the same indentation:
+#        group_add:
+#          - "${DOCKER_SOCKET_GID:?set DOCKER_SOCKET_GID to the numeric GID of the docker socket}"
+#
+# DOCKER_SOCKET_GID is required once group_add is enabled. It must be the
+# socket's numeric GID, not a group name: the scratch image has no /etc/group.
+# The `:?` form makes `docker compose config` and `up` fail when the value is
+# unset, instead of starting a container that dies with "unable to find group
+# : no matching entries in group file".
+#
+# Then start it with the GID from the host:
+#
+#     DOCKER_SOCKET_GID="$(stat -c '%g' /var/run/docker.sock)" docker compose up -d

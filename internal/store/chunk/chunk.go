@@ -153,6 +153,10 @@ func Overlaps(start, end time.Time, r model.TimeRange) bool {
 	return true
 }
 
+// maxComponentBytes bounds a host or scope to the 255-byte name limit shared by
+// Linux filesystems and object stores.
+const maxComponentBytes = 255
+
 // ValidateComponent requires a value that can be used unchanged as one path
 // component. It keeps a malformed host or scope from escaping the store root.
 func ValidateComponent(field, value string) error {
@@ -162,14 +166,24 @@ func ValidateComponent(field, value string) error {
 	return nil
 }
 
-// IsComponent reports whether value is a single, non-empty path component that
-// is neither "." nor "..".
+// IsComponent reports whether value can be used unchanged as one path
+// component. It rejects empty and dot names, forward slashes, ASCII control
+// characters (including NUL and DEL), surrounding whitespace, and names longer
+// than the 255-byte limit, so a host or scope cannot escape the store root or
+// produce an unreadable object key. It does not allocate.
 func IsComponent(value string) bool {
-	return value != "" &&
-		value != "." &&
-		value != ".." &&
-		!strings.ContainsRune(value, '/') &&
-		!strings.ContainsRune(value, 0)
+	if value == "" || value == "." || value == ".." || len(value) > maxComponentBytes {
+		return false
+	}
+	if strings.TrimSpace(value) != value {
+		return false
+	}
+	for i := 0; i < len(value); i++ {
+		if c := value[i]; c == '/' || c < 0x20 || c == 0x7f {
+			return false
+		}
+	}
+	return true
 }
 
 // Encode writes samples as one JSON object per line through gzip. Go's gzip

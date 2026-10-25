@@ -3,3 +3,16 @@
 .agents
 dist
 smob
+
+# Local runtime configuration and secrets. smob.example.yaml stays: it is the
+# public template the operator copies to smob.yaml.
+smob.yaml
+.env
+.env.*
+
+# Runtime state: the data directory, the default S3 spool, and any temporary
+# chunk files a collector leaves behind.
+data/
+spool/
+*.tmp
+*.check-*

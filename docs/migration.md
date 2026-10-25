@@ -10,7 +10,9 @@ layout:
 `<root>` is `data_dir` on disk and `storage.s3.prefix` in the bucket. Migration
 is therefore a copy of that tree followed by a configuration change. smob does
 not mirror or dual-write: exactly one backend is active, and `query` and `stats`
-read the same backend the collector writes.
+read the same backend the collector writes. The reverse direction copies the
+same tree with source and destination swapped; see
+[Migrating back from S3 to disk](#migrating-back-from-s3-to-disk).
 
 Run one collector per host and prefix. Stop the old writer before copying.
 Completed chunks are immutable, but a running collector can create new chunks
@@ -57,23 +59,8 @@ configured, the disk collector runs a startup sweep immediately, so check
 
 ## Copy the chunks
 
-The minimal command uses trailing slashes to make the directory intent explicit:
-
-```sh
-aws s3 sync /var/lib/smob/ s3://smob-metrics/smob/
-```
-
-`/var/lib/smob/` is the source directory contents. `s3://smob-metrics/smob/` is
-the bucket plus `storage.s3.prefix`. The copy preserves the `<host>/<scope>/...`
-components; they are part of the key, not a directory to flatten.
-
-In testing with aws-cli/1.46.2, removing either trailing slash produced the same
-keys: `s3 sync` treats both sides as directories in either form. The trailing
-slashes are kept here to make that intent explicit. The dangerous mistake is
-syncing the wrong directory level (see below), not the slash.
-
-A safe form for a data directory that may also contain the S3 spool or leftover
-temporary files:
+`data_dir` also holds the S3 spool and may hold leftover temporary files, so the
+copy excludes them. Trailing slashes make the directory intent explicit:
 
 ```sh
 aws s3 sync /var/lib/smob/ s3://smob-metrics/smob/ \
@@ -82,19 +69,66 @@ aws s3 sync /var/lib/smob/ s3://smob-metrics/smob/ \
   --exclude ".check-*"
 ```
 
-Add `--dryrun` to either command to preview the uploads without writing objects.
+`/var/lib/smob/` is the source directory contents. `s3://smob-metrics/smob/` is
+the bucket plus `storage.s3.prefix`. The copy preserves the `<host>/<scope>/...`
+components; they are part of the key, not a directory to flatten.
+
+If `storage.s3.spool_dir` points at a different directory inside `data_dir`,
+exclude that relative path instead of `spool/*`. The exclude follows the
+configured spool, not the default name.
+
+In testing with aws-cli/1.46.2, removing either trailing slash produced the same
+keys: `s3 sync` treats both sides as directories in either form. The trailing
+slashes are kept here to make that intent explicit. The dangerous mistake is
+syncing the wrong directory level (see below), not the slash.
+
+Add `--dryrun` to preview the uploads without writing objects.
+
+### Re-running a sync
+
+A resumed copy should use `--size-only`. Without it, `aws s3 sync` compares each
+source file's size and modification time against the destination object's
+`LastModified`, which is the time of the upload, not the time the chunk was
+written. gzip rewrites also change the source mtime without changing the
+samples. Object ETags identify compressed bytes, not samples, and `sync` does
+not compare them by default, so neither timestamp nor ETag tells you whether a
+run is complete. Expect a bare re-run to re-upload files that are already
+correct.
+
+For a re-run against the same, unchanged source, add `--size-only` to the
+command above:
+
+```sh
+aws s3 sync /var/lib/smob/ s3://smob-metrics/smob/ \
+  --size-only \
+  --exclude "spool/*" \
+  --exclude "*.tmp" \
+  --exclude ".check-*"
+```
+
+With `--size-only`, a second run over the same source is a no-op: nothing is
+uploaded and the key listing is unchanged. That is the expected result after an
+interrupted copy, not a sign that the copy was skipped. `--size-only` compares
+size alone, so it will also skip a destination object of the right size with
+different bytes; it is a resumption aid, not a correctness check. The query
+comparison below is what proves the samples arrived.
 
 ### Why the excludes matter
 
 - `spool/*` is the local S3 spool, not disk chunk data. It lives at
   `<data_dir>/spool` by default and is used by the S3 store for chunks whose
   upload exhausted the retry budget. Without the exclude, its files are copied
-  to `<prefix>/spool/...`, a path smob does not treat as disk data; if the
-  replayer later uploads such a chunk, the same samples exist under two keys.
-- A spool from a previous S3 run is still the new S3 store's spool when
-  `spool_dir` resolves to the same `<data_dir>/spool`. Leave it in place and the
-  replayer uploads valid pending chunks after the switch. If it is stale,
-  remove it deliberately; do not copy it as disk data.
+  to `<prefix>/spool/...`, which is outside the host/scope chunk layout: `query`
+  does not treat those objects as chunk data, and the replayer uploads the real
+  spool entry from the local spool, not from the bucket copy. The copy is junk
+  under the prefix — it contributes no samples, but it does inflate the object
+  count, so the count check below no longer matches.
+- Spool contents are never disposable. A spool from a previous S3 run is still
+  the new S3 store's spool when `spool_dir` resolves to the same
+  `<data_dir>/spool`; leave it in place and the replayer uploads the valid
+  pending chunks after the switch. A spooled chunk may exist nowhere else, so
+  never delete entries to tidy up. If a test needs a clean spool, point
+  `spool_dir` at a new empty directory instead.
 - `*.tmp` files are partial writes left by a crash or interrupted write. They
   are not chunks and are ignored by `query`.
 - `.check-*` files are startup probe files.
@@ -116,6 +150,42 @@ component and the resulting keys do not match the layout, so `query` finds
 nothing. Sync `data_dir/` so the host directory is copied as the first key
 component.
 
+### Write semantics: sync overwrites, smob does not
+
+smob uploads a chunk with a conditional `PUT` (`If-None-Match: *`). If an object
+already exists at that host/window key, the write does not replace it: the
+collector retries the same body under `-1`, `-2`, and so on. smob therefore
+never overwrites an existing object for a window. The disk store enforces the
+same rule with a filesystem primitive: it hard-links the finished chunk into
+place and `link(2)` fails with `EEXIST` when the name is taken, so it suffixes
+instead of replacing. Neither backend replaces an existing window.
+
+`aws s3 sync` has no such guard. It uploads every source file whose destination
+key is missing or differs in size or modification time, replacing the existing
+object unconditionally. Syncing into a prefix that already holds chunks for the
+same host overwrites them with the disk copy, and a window that exists only in
+the bucket stays beside the new one under its own key.
+
+The reverse copy behaves the same way. Syncing the bucket back into `data_dir`
+replaces local chunk files whose keys already exist in the bucket. That is fine
+when the bucket copy is the newer, authoritative one, but it is still an
+overwrite: check the destination before you copy, not after.
+
+Before syncing, check the destination for each host you are migrating. Forward,
+that is the bucket prefix; reverse, it is the local tree you are about to
+overwrite:
+
+```sh
+aws s3 ls --recursive s3://smob-metrics/smob/<host>/
+find /var/lib/smob/<host> -type f -name '*.jsonl.gz' | wc -l
+```
+
+An empty listing is the expected forward state. A non-zero local count is
+expected in reverse, because `data_dir` usually still holds the pre-migration
+tree; the point is to know what you are overwriting. If the destination already
+holds data, decide per key whether the existing chunks are intentional before
+copying over them; smob will not restore what `sync` replaced.
+
 ### AWS and MinIO credentials
 
 For AWS, use the standard profile chain:
@@ -123,7 +193,10 @@ For AWS, use the standard profile chain:
 ```sh
 aws s3 sync /var/lib/smob/ s3://smob-metrics/smob/ \
   --profile smob-migration \
-  --region eu-west-1
+  --region eu-west-1 \
+  --exclude "spool/*" \
+  --exclude "*.tmp" \
+  --exclude ".check-*"
 ```
 
 `AWS_PROFILE` and the instance role work the same way. For MinIO or another
@@ -158,12 +231,15 @@ that can remove:
 - objects that a bucket lifecycle rule or another tool placed under the prefix.
 
 It also removes the destination copy of any chunk that disk retention deleted
-after an earlier copy. If a partial copy must be cleaned up, verify the key
-lists first and remove objects deliberately. Do not use `--delete` against real
-data.
+after an earlier copy. In the reverse direction `--delete` is worse: every local
+file the bucket lacks is deleted, including the spool and any chunks the disk
+collector wrote before the cutover. If a partial copy must be cleaned up, verify
+the key lists first and remove objects or files deliberately. Do not use
+`--delete` against real data in either direction.
 
-`sync` compares object size and modification time, not content. The query
-comparison below is the real check that the samples arrived.
+`sync` compares object size and modification time, not content; add
+`--size-only` for a re-run, as described above. The query comparison below is
+the real check that the samples arrived.
 
 ## Verify before switching
 
@@ -236,6 +312,40 @@ aws s3 ls --recursive s3://smob-metrics/smob/ \
 The relative names should match. A `-1` chunk contains real samples, so the
 query diff, not only the key count, is what proves the copy.
 
+### Checklist for one hour
+
+A short pass that avoids hardcoded clock times and does not compare file
+metadata. Do it for one host and one hour you know is fully inside the copied
+range.
+
+1. **Take the hour from the source path, not from the clock.** Pick one hour
+   directory under `<root>/<host>/<scope>/YYYY/MM/DD/` (the disk tree for a
+   forward copy, the bucket key for a reverse copy). The trailing
+   `YYYY/MM/DD/HH/` components are the UTC hour the chunks cover, so
+   `.../system/2026/10/24/00/` gives `START=2026-10-24T00:00:00Z` and
+   `END=2026-10-24T01:00:00Z`. Verification never needs the exact timestamps of
+   individual samples, only that hour boundary.
+2. **Query both backends with the limit disabled.** Same `--host`, same hour,
+   with `--limit 0 --format jsonl`: once with the disk config (before) and once
+   with a config that sets `storage.primary: s3` (after).
+
+   ```sh
+   ./smob query --config disk.yaml --host web-1 --since "$START" --until "$END" \
+     --limit 0 --format jsonl | sort > /tmp/disk.jsonl
+   ./smob query --config s3.yaml --host web-1 --since "$START" --until "$END" \
+     --limit 0 --format jsonl | sort > /tmp/s3.jsonl
+   ```
+
+3. **Compare sorted lines and require equal counts.** `wc -l` on both files must
+   agree, and `diff -u /tmp/disk.jsonl /tmp/s3.jsonl` must be empty. Sorting
+   removes scan order from the comparison, so an empty diff means the same
+   sample set regardless of how each backend walked its store; a non-empty diff
+   names the samples that differ or went missing. The counts catch a whole hour
+   missing, the diff catches a single wrong sample.
+4. **Do not check mtimes or `LastModified`.** `sync` stamps the destination at
+   copy time and a gzip rewrite moves the source mtime, so neither says anything
+   about samples. The sorted sample diff is the check.
+
 ### Wrong prefix and wrong source level
 
 A wrong prefix does not fail loudly. With an empty local spool, `query` returns
@@ -247,8 +357,10 @@ where you expect.
 
 `query` with `primary: s3` also merges the local spool. If that spool still
 holds chunks, a wrong-prefix check can return spooled samples instead of an
-empty result. Point `spool_dir` at an empty directory when testing a prefix, or
-empty the spool first.
+empty result. Point `spool_dir` at a new empty directory when testing a prefix,
+or let the collector drain the spool before the cutover. Never empty the spool
+to get a clean result: a spooled chunk may exist nowhere else, so deleting it
+loses samples.
 
 Syncing `data_dir/<host>/` instead of `data_dir/` is the other silent failure:
 the copied keys start with `<scope>/` and no host, so `query` finds no chunks
@@ -328,6 +440,69 @@ Compare the key lists and the sample sets before deleting anything. Decide
 which copy is authoritative per window; do not assume a suffix is safe to drop.
 There is no automatic merge or deduplication.
 
+## Migrating back from S3 to disk
+
+The layout is identical in both directions, so the reverse move is a download
+followed by the same configuration change. Use it when the bucket holds chunks
+the old disk tree does not, for example when retiring S3 without losing the
+samples written since the cutover.
+
+1. **Drain the spool while the S3 store is still active.** Replay is started by
+   `collect` under `primary: s3`; the disk store does not read
+   `<data_dir>/spool`. Start the S3 collector once more, let the spool directory
+   empty, and only then stop it. That run may also collect new chunks; they land
+   in the bucket and are included in the download. A spool entry left behind
+   stays local and is invisible to the disk store, because a spool entry is not
+   a chunk in the layout: its name is a candidate key, but it lives under
+   `<data_dir>/spool`, not under `<host>/<scope>/YYYY/MM/DD/HH/`. Never copy
+   spool files into a host directory to "restore" them; replay is the only path
+   from a spool entry to a published chunk.
+
+2. **Stop the collector, then copy the bucket down.** Do not copy while it runs.
+
+   ```sh
+   aws s3 sync s3://smob-metrics/smob/ /var/lib/smob/ \
+     --exclude "spool/*" \
+     --exclude "*.tmp"
+   ```
+
+   The `<host>/<scope>/...` components are keys, so they arrive as directories.
+   Do not flatten a host's prefix into `data_dir/<host>/`, and do not add
+   `--delete`: on the download side it removes every local file the bucket
+   lacks, including the spool and any pre-cutover chunks. A re-run takes
+   `--size-only` for the same reason as above. This copy needs `s3:GetObject` as
+   well as `s3:ListBucket` on the tooling identity, unlike the upload direction;
+   see the IAM note below.
+
+   The `--exclude "spool/*"` guards the destination: a bucket copy of spool
+   objects is not chunk data, and restoring it into `<data_dir>/spool` would
+   place junk where the next S3 run expects replayable entries.
+
+3. **Check the destination and retention.** `data_dir` usually still holds the
+   pre-migration tree, and `sync` overwrites same-key chunk files with the
+   bucket copy. Either accept that overwrite (the bucket copy is the newer one)
+   or download into a fresh directory and point `data_dir` at it. If a retention
+   limit is configured, the first `collect` start runs the disk sweep
+   immediately, so check `retention.disk.max_age` and
+   `retention.disk.max_bytes` before starting it.
+
+4. **Switch back.** Set `storage.primary: disk`, validate, and query one hour:
+
+   ```yaml
+   data_dir: /var/lib/smob
+   storage:
+     primary: disk
+   ```
+
+   The spool stays where it is; it is not part of the disk chunk tree and does
+   not need to move with the data. If you later switch to S3 again, the same
+   `spool_dir` makes a drained spool a no-op and keeps an undrained one
+   replayable.
+
+   Verify this copy with the [one-hour checklist](#checklist-for-one-hour)
+   before relying on it: the disk config is the new state, and a config that
+   still points at S3 is the old one.
+
 ## Layout-specific caveats
 
 - **Suffixes are part of the name.** `-1`, `-2`, and so on are valid chunks and
@@ -343,9 +518,13 @@ There is no automatic merge or deduplication.
   [s3.md](s3.md#iam-policy).
 - **IAM for the copy is separate.** smob's runtime identity needs the policy in
   [s3.md](s3.md#iam-policy). The identity that runs `aws s3 sync` is a tooling
-  identity and needs `s3:ListBucket` and `s3:PutObject`, plus `s3:GetObject` for
-  verification and head requests. Do not reuse the runtime policy without
-  checking those permissions.
+  identity and needs `s3:ListBucket` and `s3:PutObject` for a disk-to-S3 copy,
+  plus `s3:GetObject` for an S3-to-disk copy. The upload does not need
+  `s3:GetObject`: `sync` only lists and uploads, and its size and modification
+  time comparison comes from the listing. Verification reads go through
+  `query`, which uses the runtime identity, or through `aws s3 ls`, which is
+  `s3:ListBucket`. Do not reuse the runtime policy without checking those
+  permissions.
 - **No `--delete`.** Migration is additive; see the `--delete` section above.
 - **Shared buckets need per-host checks.** A prefix can contain several hosts.
   Compare one host at a time, and never run a destination-wide delete.

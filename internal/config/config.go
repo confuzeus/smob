@@ -163,9 +163,15 @@ func Default() Config {
 	}
 }
 
+// maxConfigBytes caps how much of a configuration file is read. A real
+// configuration is a few kilobytes; the cap keeps a misdirected --config, such
+// as a large log or a device, from consuming memory proportional to the file.
+const maxConfigBytes = 4 << 20 // 4 MiB
+
 // Load reads and decodes the configuration at path. The file is decoded
-// strictly: an unknown field is an error, never silently ignored. Host
-// defaults to the machine's hostname when the file does not set one.
+// strictly: an unknown field is an error, never silently ignored, and a file
+// larger than 4 MiB is a usage error. Host defaults to the machine's hostname
+// when the file does not set one.
 func Load(path string) (Config, error) {
 	f, err := os.Open(path)
 	if err != nil {
@@ -173,7 +179,13 @@ func Load(path string) (Config, error) {
 	}
 	defer f.Close()
 
-	cfg, err := Parse(f)
+	// Read one byte past the cap so a file of exactly maxConfigBytes still
+	// decodes, while anything larger leaves the reader exhausted.
+	r := &io.LimitedReader{R: f, N: maxConfigBytes + 1}
+	cfg, err := Parse(r)
+	if r.N <= 0 {
+		return Config{}, fmt.Errorf("config: file %s exceeds %d MiB limit", path, maxConfigBytes>>20)
+	}
 	if err != nil {
 		return Config{}, fmt.Errorf("parse config %s: %w", path, err)
 	}

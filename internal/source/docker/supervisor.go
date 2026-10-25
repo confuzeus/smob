@@ -21,6 +21,20 @@ import (
 const (
 	streamRetryBase = 500 * time.Millisecond
 	streamRetryMax  = 30 * time.Second
+
+	// streamStablePayloads and streamStableLifetime are what makes a connection
+	// count as healthy. A daemon that accepts a connection, emits one sample,
+	// and closes it must not reset the backoff, or it would flap at 250-500ms
+	// intervals and warn on every cycle.
+	streamStablePayloads = 2
+	streamStableLifetime = 30 * time.Second
+
+	// streamIdleFloor bounds the idle watchdog. Three collection intervals
+	// detect a stalled stream promptly at fast cadences, and the floor keeps a
+	// slow cadence from declaring a healthy stream dead between payloads.
+	streamIdleFloor = 30 * time.Second
+	// defaultStreamInterval stands in when a supervisor is built without one.
+	defaultStreamInterval = time.Second
 )
 
 // Options configures a Docker source and the Supervisor it owns.
@@ -35,7 +49,9 @@ type Options struct {
 	// StreamStats opens one reconnecting stats stream per container instead of
 	// leaving stats acquisition to one-shot polling.
 	StreamStats bool
-	// Interval is the collector cadence used by New. NewSupervisor ignores it.
+	// Interval is the collector cadence. In stream mode it sizes the idle
+	// watchdog that restarts a stream which stops delivering payloads. New also
+	// uses it as the collection interval.
 	Interval time.Duration
 }
 
@@ -44,8 +60,9 @@ type Options struct {
 //
 // The client is created and probed by NewSupervisor and released by Close. Run
 // does not close the client, so a caller that constructs a supervisor and never
-// runs it still has one obvious cleanup path. Run is single-use; Containers may
-// be called concurrently with it, and Close must be called after Run returns.
+// runs it still has one obvious cleanup path. Run is single-use; a second call
+// is ignored so it cannot close the stats channel twice. Containers may be
+// called concurrently with Run, and Close must be called after Run returns.
 type Supervisor struct {
 	client       *client.Client
 	acquirer     *statsAcquirer
@@ -53,6 +70,7 @@ type Supervisor struct {
 	exclude      *regexp.Regexp
 	rescan       time.Duration
 	streamStats  bool
+	idleTimeout  time.Duration
 	stats        chan rawStats
 	containersMu sync.RWMutex
 	containers   []Container
@@ -60,6 +78,11 @@ type Supervisor struct {
 	workersMu sync.Mutex
 	workers   map[string]*streamWorker
 	workersWG sync.WaitGroup
+
+	// runMu guards running, which makes Run single-use without resetting it:
+	// the supervisor and its stats channel have one lifecycle.
+	runMu   sync.Mutex
+	running bool
 
 	// discoveryErr is only touched by the single Run goroutine. It suppresses
 	// repeated warnings for the same persistent discovery failure.
@@ -70,9 +93,9 @@ type Supervisor struct {
 }
 
 // streamWorker is one container's stream loop and the signal that its goroutine
-// has exited. Removal waits on done before the new container snapshot becomes
-// visible, so a removed container's goroutine is gone before callers observe
-// the change.
+// has exited. Removal cancels the worker while the new container snapshot is
+// already published; the source filters buffered observations against that
+// snapshot, so no sample outlives the removed container's series.
 type streamWorker struct {
 	cancel context.CancelFunc
 	done   chan struct{}
@@ -119,6 +142,7 @@ func NewSupervisor(ctx context.Context, opts Options, logger *slog.Logger) (*Sup
 		exclude:     exclude,
 		rescan:      opts.RescanInterval,
 		streamStats: opts.StreamStats,
+		idleTimeout: streamIdleTimeout(opts.Interval),
 		containers:  containers,
 		workers:     make(map[string]*streamWorker),
 	}
@@ -146,7 +170,15 @@ func (s *Supervisor) Containers() []Container {
 // stream mode it also starts one reconnecting stats stream per container,
 // cancels streams for removed containers, and closes the stats channel after
 // every stream goroutine has exited. Run does not close the client.
+//
+// Run is single-use. A second call logs and returns without touching the stats
+// channel, which the first call closes exactly once.
 func (s *Supervisor) Run(ctx context.Context) {
+	if !s.beginRun() {
+		s.logger.Warn("supervisor Run called more than once; ignoring")
+		return
+	}
+
 	if s.streamStats {
 		s.syncStreams(ctx, s.Containers())
 		defer s.stopStreams()
@@ -169,15 +201,30 @@ func (s *Supervisor) Run(ctx context.Context) {
 				continue
 			}
 			s.clearDiscoveryWarning(len(containers))
+			// Publish before any worker starts. A new worker's first payload
+			// is labeled from the snapshot, so publishing afterwards would drop
+			// it.
+			s.setContainers(containers)
 			if s.streamStats {
 				s.syncStreams(ctx, containers)
 				if ctx.Err() != nil {
 					return
 				}
 			}
-			s.setContainers(containers)
 		}
 	}
+}
+
+// beginRun claims the single Run lifecycle, reporting whether this call owns
+// it.
+func (s *Supervisor) beginRun() bool {
+	s.runMu.Lock()
+	defer s.runMu.Unlock()
+	if s.running {
+		return false
+	}
+	s.running = true
+	return true
 }
 
 // Close releases the Docker client. It is idempotent.
@@ -279,9 +326,17 @@ func (s *Supervisor) stopStreams() {
 
 // runWorker keeps one container's stats stream open. It reuses the acquirer's
 // single decoder and drop policy: each iteration owns the channel returned by
-// stream and reopens it after a jittered backoff when it closes. Backoff is
-// reset only after a connection delivered a payload, so a daemon that accepts
-// connections and immediately closes them still backs off.
+// stream and reopens it after a jittered backoff when it closes or stalls.
+//
+// Backoff is reset only when a connection proved stable: it delivered at least
+// streamStablePayloads payloads or stayed open for streamStableLifetime. A
+// daemon that accepts a connection, emits one sample, and closes it therefore
+// backs off instead of reconnecting every 250-500ms and warning on every flap.
+//
+// A connection that stays open but delivers nothing is cancelled by an idle
+// watchdog after s.idleTimeout and treated as a closed stream. Without it a
+// daemon that accepts the request and then stalls would block this worker
+// forever.
 func (s *Supervisor) runWorker(ctx context.Context, id string) {
 	attempt := 0
 	for {
@@ -289,40 +344,74 @@ func (s *Supervisor) runWorker(ctx context.Context, id string) {
 			return
 		}
 
-		stream := s.acquirer.stream(ctx, []string{id})
-		delivered := false
-		for payload := range stream {
-			if !delivered {
-				delivered = true
-				if attempt > 0 {
+		streamCtx, cancelStream := context.WithCancel(ctx)
+		stream := s.acquirer.stream(streamCtx, []string{id})
+		openedAt := time.Now()
+		idle := time.NewTimer(s.idleTimeout)
+		payloads := 0
+		idleExpired := false
+
+	readLoop:
+		for {
+			select {
+			case payload, ok := <-stream:
+				if !ok {
+					break readLoop
+				}
+				if payloads == 0 && attempt > 0 {
 					s.logger.Info("container stats stream reconnected", "container", id)
 				}
-				attempt = 0
-			}
-			select {
-			case s.stats <- payload:
-			case <-ctx.Done():
-				// The acquirer's reader and channel closer must finish before
-				// this worker is considered stopped. Draining waits for the
-				// close, which happens after the reader observes cancellation.
-				for range stream {
+				payloads++
+				resetTimer(idle, s.idleTimeout)
+
+				select {
+				case s.stats <- payload:
+				case <-ctx.Done():
+					// The acquirer's reader and channel closer must finish
+					// before this worker is considered stopped. Draining waits
+					// for the close, which happens after the reader observes
+					// cancellation.
+					cancelStream()
+					for range stream {
+					}
+					idle.Stop()
+					return
 				}
-				return
+			case <-idle.C:
+				idleExpired = true
+				break readLoop
 			}
 		}
+
+		// Canceling releases the HTTP body and lets the fan-in channel close.
+		// Waiting for the close before reconnecting keeps at most one reader
+		// per worker.
+		cancelStream()
+		if idleExpired {
+			for range stream {
+			}
+		}
+		idle.Stop()
+
 		if ctx.Err() != nil {
 			return
 		}
 
-		if delivered {
+		stable := payloads >= streamStablePayloads ||
+			time.Since(openedAt) >= streamStableLifetime
+		if stable {
 			attempt = 0
 		}
 		attempt++
 		delay := streamJitter(streamBackoff(attempt), rand.Float64())
-		if attempt == 1 {
+		switch {
+		case idleExpired:
+			s.logger.Warn("container stats stream idle; reconnecting",
+				"container", id, "idle_for", s.idleTimeout, "retry_in", delay)
+		case attempt == 1:
 			s.logger.Warn("container stats stream ended; reconnecting",
 				"container", id, "retry_in", delay)
-		} else {
+		default:
 			s.logger.Debug("container stats stream still unavailable; retrying",
 				"container", id, "attempt", attempt, "retry_in", delay)
 		}
@@ -330,6 +419,27 @@ func (s *Supervisor) runWorker(ctx context.Context, id string) {
 			return
 		}
 	}
+}
+
+// streamIdleTimeout returns how long a stats stream may deliver nothing before
+// the watchdog restarts it.
+func streamIdleTimeout(interval time.Duration) time.Duration {
+	if interval <= 0 {
+		interval = defaultStreamInterval
+	}
+	return max(3*interval, streamIdleFloor)
+}
+
+// resetTimer restarts t for d, draining a pending fire so a payload that
+// arrives as the watchdog expires does not leave the timer expired.
+func resetTimer(t *time.Timer, d time.Duration) {
+	if !t.Stop() {
+		select {
+		case <-t.C:
+		default:
+		}
+	}
+	t.Reset(d)
 }
 
 // streamBackoff returns the capped exponential delay before the next attempt.

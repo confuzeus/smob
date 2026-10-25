@@ -1,0 +1,37 @@
+data_dir: /var/lib/smob
+proc_path: /proc
+host: golden-host
+log_level: info
+log_format: text
+sources:
+    system:
+        enabled: true
+        interval: 5s
+    process:
+        enabled: false
+        filter: ""
+        top_n: 20
+        interval: 30s
+        rescan_interval: 30s
+    docker:
+        enabled: false
+        socket: /var/run/docker.sock
+        exclude: ""
+        interval: 10s
+        rescan_interval: 30s
+        stream_stats: false
+storage:
+    primary: disk
+    chunk_interval: 5m0s
+    s3:
+        endpoint: ""
+        region: ""
+        bucket: ""
+        prefix: ""
+        path_style: false
+        spool_dir: /var/lib/smob/spool
+        spool_max_bytes: 1073741824
+retention:
+    disk:
+        max_age: 0s
+        max_bytes: 0

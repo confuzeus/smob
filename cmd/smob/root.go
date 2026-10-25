@@ -3,6 +3,8 @@ package main
 import (
 	"io"
 	"log/slog"
+	"strings"
+	"time"
 
 	"github.com/confuzeus/smob/internal/cli"
 	"github.com/confuzeus/smob/internal/config"
@@ -38,14 +40,22 @@ func newRootCommand(info buildInfo) *cobra.Command {
 		// Cobra's version template only sees .Version, so it holds the full
 		// banner built by buildInfo.String, the single format definition.
 		Version:       info.String(),
+		Args:          noArgs,
 		SilenceErrors: true,
 		SilenceUsage:  true,
 	}
 	root.CompletionOptions.DisableDefaultCmd = true
 	root.SetVersionTemplate("{{.Version}}\n")
+	// Without RunE cobra treats the root as not runnable and prints help before
+	// validating args, so an unknown subcommand would exit 0. RunE keeps args
+	// validation in play and preserves plain `smob` printing help.
+	root.RunE = func(cmd *cobra.Command, _ []string) error {
+		return cmd.Help()
+	}
 	root.SetFlagErrorFunc(func(_ *cobra.Command, err error) error {
 		return cli.UsageErrorf("%v", err)
 	})
+	root.SetHelpCommand(helpCommand())
 	root.PersistentFlags().StringVar(&a.configPath, "config", config.DefaultPath, "path to the YAML configuration file")
 	root.PersistentFlags().StringVar(&a.logLevel, "log-level", "", "log level override: debug, info, warn, error")
 	root.PersistentFlags().StringVar(&a.logFormat, "log-format", "", "log format override: text, json")
@@ -65,6 +75,41 @@ func newRootCommand(info buildInfo) *cobra.Command {
 	return root
 }
 
+// noArgs rejects positional arguments as a usage error. It mirrors cobra.NoArgs
+// but tags the error, because cobra reports argument rejections as plain errors
+// and cli.ExitCode would map them to 1. Used by every leaf command and by the
+// root, where a positional argument is an unknown subcommand.
+func noArgs(cmd *cobra.Command, args []string) error {
+	if err := cobra.NoArgs(cmd, args); err != nil {
+		return cli.UsageErrorf("%v", err)
+	}
+	return nil
+}
+
+// helpCommand replaces cobra's default help command so an unknown topic is a
+// usage error on stderr instead of a stdout message with exit 0. A known topic
+// still prints that command's help to stdout and exits 0.
+func helpCommand() *cobra.Command {
+	return &cobra.Command{
+		Use:   "help [command]",
+		Short: "Help about any command",
+		Long: `Help provides help for any command in the application.
+Simply type smob help [path to command] for full details.`,
+		Args: cobra.ArbitraryArgs,
+		RunE: func(cmd *cobra.Command, args []string) error {
+			target, rest, err := cmd.Root().Find(args)
+			if err != nil || len(rest) > 0 {
+				return cli.UsageErrorf("unknown help topic %q", strings.Join(args, " "))
+			}
+			// Cobra's default help command initializes these flags before
+			// rendering, so the help text matches `smob <cmd> --help`.
+			target.InitDefaultHelpFlag()
+			target.InitDefaultVersionFlag()
+			return target.Help()
+		},
+	}
+}
+
 // load resolves the configuration for cmd: file defaults, then the file, then
 // flag overrides, then validation. On success the effective config and logger
 // are available to the command.
@@ -79,7 +124,9 @@ func (a *app) load(cmd *cobra.Command) error {
 	if cmd.Flags().Changed("log-format") {
 		cfg.LogFormat = a.logFormat
 	}
-	if cmd.Flags().Changed("data-dir") {
+	// --data-dir is local to collect, query, and stats; config and version do
+	// not define it, so Changed on an absent flag is meaningless.
+	if flag := cmd.Flags().Lookup("data-dir"); flag != nil && flag.Changed {
 		cfg.DataDir = a.dataDir
 	}
 	cfg.Resolve()
@@ -104,7 +151,21 @@ func newLogger(w io.Writer, cfg config.Config) *slog.Logger {
 		level = slog.LevelError
 	}
 
-	opts := &slog.HandlerOptions{Level: level}
+	opts := &slog.HandlerOptions{
+		Level: level,
+		// All stored data is UTC, so log timestamps are too. Without this the
+		// handlers render the process's local zone and a log cannot be lined up
+		// with chunk keys without converting first.
+		ReplaceAttr: func(groups []string, a slog.Attr) slog.Attr {
+			if a.Key != slog.TimeKey || len(groups) != 0 {
+				return a
+			}
+			if t, ok := a.Value.Any().(time.Time); ok {
+				return slog.String(slog.TimeKey, t.UTC().Format(time.RFC3339Nano))
+			}
+			return a
+		},
+	}
 	if cfg.LogFormat == "json" {
 		return slog.New(slog.NewJSONHandler(w, opts))
 	}

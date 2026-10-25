@@ -2,8 +2,9 @@ Summarize samples per metric over a time range.
 
 The same range defaults and filters as query apply. Each metric produces one
 row with the number of matching samples, the minimum, the maximum, and the
-arithmetic mean. Metrics are sorted alphabetically. Mean is the unweighted
-arithmetic mean of sample values; interval_ms does not affect it.
+mean. Metrics are sorted alphabetically. Mean is interval-weighted for rate
+metrics and unweighted for gauges, so it equals query --agg avg for the same
+range and filters.
 
 --limit stops the scan after N matching samples (default 10000, 0 unlimited),
 so a limited run reports partial statistics over those samples. An empty result

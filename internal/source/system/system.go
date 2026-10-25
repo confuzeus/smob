@@ -99,6 +99,7 @@ func (s *Source) Collect(ctx context.Context, now time.Time) ([]model.Sample, er
 			samples = append(samples, s.rateSamples(cur, elapsed)...)
 		}
 	}
+	s.pruneResetWarnings(cur)
 	s.prev = cur
 	return samples, nil
 }
@@ -124,7 +125,7 @@ func (s *Source) rateSamples(cur *snapshot, elapsed time.Duration) []model.Sampl
 			Timestamp:  cur.at.UTC(),
 			Metric:     metricCPUPercent,
 			Value:      percent,
-			IntervalMS: elapsed.Milliseconds(),
+			IntervalMS: model.Millis(elapsed),
 			Labels:     labels,
 		})
 	}
@@ -163,7 +164,7 @@ func (s *Source) appendRate(samples []model.Sample, at time.Time, elapsed time.D
 		Timestamp:  at,
 		Metric:     metric,
 		Value:      value,
-		IntervalMS: elapsed.Milliseconds(),
+		IntervalMS: model.Millis(elapsed),
 		Labels:     labels,
 	})
 }
@@ -181,6 +182,33 @@ func (s *Source) warnReset(metric string, labels map[string]string) {
 // clearReset forgets a previously logged reset for the series.
 func (s *Source) clearReset(metric string, labels map[string]string) {
 	delete(s.warned, seriesKey(metric, labels))
+}
+
+// pruneResetWarnings bounds the reset-warning set to the series in cur, so
+// interface and CPU churn cannot leak entries or suppress the first warning for
+// a series that reappears later.
+func (s *Source) pruneResetWarnings(cur *snapshot) {
+	live := liveSeries(cur)
+	for key := range s.warned {
+		if _, ok := live[key]; !ok {
+			delete(s.warned, key)
+		}
+	}
+}
+
+// liveSeries returns the reset-warning keys for every series in snap.
+func liveSeries(snap *snapshot) map[string]struct{} {
+	keys := make(map[string]struct{}, 1+len(snap.stat.cpus)+2*len(snap.net))
+	keys[seriesKey(metricCPUPercent, map[string]string{"cpu": "all"})] = struct{}{}
+	for id := range snap.stat.cpus {
+		keys[seriesKey(metricCPUPercent, map[string]string{"cpu": strconv.Itoa(id)})] = struct{}{}
+	}
+	for name := range snap.net {
+		labels := map[string]string{"interface": name}
+		keys[seriesKey(metricNetworkRXBytesPerSecond, labels)] = struct{}{}
+		keys[seriesKey(metricNetworkTXBytesPerSecond, labels)] = struct{}{}
+	}
+	return keys
 }
 
 // seriesKey returns a stable identity for one metric and label set.
@@ -236,7 +264,9 @@ func (s *Source) snapshot(ctx context.Context, at time.Time) (*snapshot, error) 
 }
 
 // readBootID reads the kernel's boot identifier, which detects a reboot that
-// restarted the counters.
+// restarted the counters. It runs on every tick; docs/IMPLEMENTATION.md says
+// "at startup", which is weaker than what this does. Keep the per-tick read and
+// reconcile the doc separately.
 func readBootID(procPath string) (string, error) {
 	path := filepath.Join(procPath, "sys/kernel/random/boot_id")
 	data, err := os.ReadFile(path)

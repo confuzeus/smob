@@ -37,6 +37,48 @@ type tickResult struct {
 	err     error
 }
 
+// sourceErrLogInterval bounds how often one source's failures are logged. A
+// source that fails every tick, such as one reading a /proc file that vanished,
+// must not flood the log at the collection interval.
+const sourceErrLogInterval = time.Minute
+
+// shutdownFlushTimeout bounds the final flush when ctx has been canceled. The
+// flush stays detached from cancellation so SIGTERM persists buffered work, but
+// an unreachable store must not block exit: after this deadline the write is
+// abandoned, and the operator's second signal still exits immediately.
+const shutdownFlushTimeout = 30 * time.Second
+
+// sourceErrorLog rate-limits collection failure logs per scope. It is driven
+// only by the Run goroutine, so it needs no lock.
+type sourceErrorLog struct {
+	last       map[string]time.Time
+	suppressed map[string]int
+}
+
+func newSourceErrorLog() *sourceErrorLog {
+	return &sourceErrorLog{
+		last:       make(map[string]time.Time),
+		suppressed: make(map[string]int),
+	}
+}
+
+// log records err unless the source reported a failure within the rate-limit
+// window. The next logged failure reports how many were suppressed.
+func (l *sourceErrorLog) log(logger *slog.Logger, scope string, err error) {
+	now := time.Now()
+	if last, ok := l.last[scope]; ok && now.Sub(last) < sourceErrLogInterval {
+		l.suppressed[scope]++
+		return
+	}
+	attrs := []any{"scope", scope, "error", err}
+	if n := l.suppressed[scope]; n > 0 {
+		attrs = append(attrs, "suppressed", n)
+	}
+	logger.Warn("source collection failed; continuing", attrs...)
+	l.last[scope] = now
+	l.suppressed[scope] = 0
+}
+
 // Collector polls sources and writes closed chunks. It owns its store: Run and
 // RunOnce close it before returning, so callers must not close it separately.
 type Collector struct {
@@ -60,9 +102,11 @@ func New(cfg config.Config, sources []Source, st store.Store, logger *slog.Logge
 	}
 }
 
-// Run polls every source until ctx is canceled or a source or store fails. On
+// Run polls every source until ctx is canceled or a store write fails. A source
+// failure, such as an unreadable /proc file or a tick timeout, is logged
+// (rate-limited per source) and collection continues on the next tick. On
 // shutdown it flushes partial chunks and closes the store. A canceled ctx is a
-// clean stop; a source or store error is returned to the caller.
+// clean stop; a store error is returned to the caller.
 func (c *Collector) Run(ctx context.Context) error {
 	runCtx, cancel := context.WithCancelCause(ctx)
 	defer cancel(nil)
@@ -90,13 +134,13 @@ func (c *Collector) Run(ctx context.Context) error {
 	writeCtx := context.WithoutCancel(ctx)
 
 	var runErr error
+	errLog := newSourceErrorLog()
 	for res := range results {
 		if runErr != nil {
 			continue
 		}
 		if res.err != nil {
-			runErr = res.err
-			cancel(runErr)
+			errLog.log(c.logger, res.scope, res.err)
 			continue
 		}
 		if err := c.assembler.add(writeCtx, res.scope, res.samples); err != nil {
@@ -105,7 +149,9 @@ func (c *Collector) Run(ctx context.Context) error {
 		}
 	}
 
-	flushErr := c.assembler.flushAll(writeCtx, time.Now())
+	flushCtx, flushCancel := context.WithTimeout(writeCtx, shutdownFlushTimeout)
+	defer flushCancel()
+	flushErr := c.assembler.flushAll(flushCtx, time.Now())
 	closeErr := c.store.Close()
 	if closeErr != nil {
 		closeErr = fmt.Errorf("close store: %w", closeErr)
@@ -136,7 +182,9 @@ func (c *Collector) RunOnce(ctx context.Context) error {
 		}
 	}
 
-	if err := c.assembler.flushAll(writeCtx, time.Now()); err != nil {
+	flushCtx, flushCancel := context.WithTimeout(writeCtx, shutdownFlushTimeout)
+	defer flushCancel()
+	if err := c.assembler.flushAll(flushCtx, time.Now()); err != nil {
 		errs = append(errs, err)
 	}
 	if err := c.store.Close(); err != nil {
@@ -169,9 +217,6 @@ func (c *Collector) poll(ctx context.Context, src Source, out chan<- tickResult)
 		select {
 		case out <- res:
 		case <-ctx.Done():
-			return
-		}
-		if err != nil {
 			return
 		}
 	}
@@ -214,7 +259,7 @@ func jitter(d time.Duration) time.Duration {
 }
 
 // tickTimeout bounds one collection. A slow source cannot overlap its next
-// tick, and a hung read fails the collector instead of stalling forever.
+// tick, and a hung read fails that tick instead of stalling forever.
 func tickTimeout(interval time.Duration) time.Duration {
 	timeout := interval / 2
 	if timeout < 100*time.Millisecond {

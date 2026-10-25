@@ -2,6 +2,7 @@ package system
 
 import (
 	"bytes"
+	"fmt"
 	"reflect"
 	"strings"
 	"testing"
@@ -25,6 +26,17 @@ func TestParseStat(t *testing.T) {
 				cpus: map[int]cpuTimes{
 					0: {1, 2, 3, 4, 5, 6, 7, 8, 9, 10},
 					2: {11, 12, 13, 14, 15, 16, 17, 18, 19, 20},
+				},
+			},
+		},
+		{
+			name:  "non-contiguous cpu set",
+			input: "cpu 1 2 3 4\ncpu0 1 2 3 4\ncpu15 5 6 7 8\n",
+			want: statSnapshot{
+				all: cpuTimes{user: 1, nice: 2, system: 3, idle: 4},
+				cpus: map[int]cpuTimes{
+					0:  {user: 1, nice: 2, system: 3, idle: 4},
+					15: {user: 5, nice: 6, system: 7, idle: 8},
 				},
 			},
 		},
@@ -65,17 +77,30 @@ func TestParseStat(t *testing.T) {
 		{
 			name:    "too few fields",
 			input:   "cpu 1 2 3\n",
-			wantErr: "want 4 to 10",
+			wantErr: "want at least 4",
 		},
 		{
-			name:    "too many fields",
-			input:   "cpu 1 2 3 4 5 6 7 8 9 10 11\n",
-			wantErr: "want 4 to 10",
+			name:  "twelve fields ignore trailing counters",
+			input: "cpu 1 2 3 4 5 6 7 8 9 10 11 12\ncpu0 13 14 15 16 17 18 19 20 21 22 23 24\n",
+			want: statSnapshot{
+				all:  cpuTimes{1, 2, 3, 4, 5, 6, 7, 8, 9, 10},
+				cpus: map[int]cpuTimes{0: {13, 14, 15, 16, 17, 18, 19, 20, 21, 22}},
+			},
 		},
 		{
 			name:    "malformed counter",
 			input:   "cpu 1 2 x 4\n",
 			wantErr: "field 3",
+		},
+		{
+			name:    "malformed per-cpu counter names the line",
+			input:   "cpu 1 2 3 4\ncpu0 1 2 x 4\n",
+			wantErr: "line 2: cpu0: field 3",
+		},
+		{
+			name:    "counter above uint64 range",
+			input:   "cpu 18446744073709551616 2 3 4\n",
+			wantErr: "field 1",
 		},
 		{
 			name:    "negative counter",
@@ -130,6 +155,45 @@ func TestCPUTimesTotalExcludesGuest(t *testing.T) {
 	}
 	if got, want := base.busy(), uint64(270); got != want {
 		t.Errorf("busy() = %d, want %d", got, want)
+	}
+}
+
+// TestParseStatLongIntrLine covers hosts with thousands of IRQs, where the intr
+// line exceeds bufio.Scanner's 64 KiB default token limit.
+func TestParseStatLongIntrLine(t *testing.T) {
+	var b strings.Builder
+	b.WriteString("cpu 1 2 3 4 5 6 7 8 9 10\n")
+	b.WriteString("intr")
+	for i := range 13_000 {
+		fmt.Fprintf(&b, " %d", i)
+	}
+	b.WriteString("\nctxt 42\n")
+	if b.Len() <= 64*1024 {
+		t.Fatalf("intr line is %d bytes, want more than 64 KiB", b.Len())
+	}
+
+	got, err := parseStat(strings.NewReader(b.String()))
+	if err != nil {
+		t.Fatalf("parseStat() error = %v", err)
+	}
+	if want := (cpuTimes{1, 2, 3, 4, 5, 6, 7, 8, 9, 10}); got.all != want {
+		t.Errorf("aggregate = %+v, want %+v", got.all, want)
+	}
+}
+
+// TestParseStatOversizedLineError checks that a line beyond the raised limit
+// still fails loudly and names the line.
+func TestParseStatOversizedLineError(t *testing.T) {
+	input := "cpu 1 2 3 4\nintr " + strings.Repeat("1 ", 1<<20) + "\n"
+
+	_, err := parseStat(strings.NewReader(input))
+	if err == nil {
+		t.Fatal("parseStat() error = nil, want an oversized-line error")
+	}
+	for _, want := range []string{"line 2", "token too long"} {
+		if !strings.Contains(err.Error(), want) {
+			t.Errorf("parseStat() error = %q, want it to contain %q", err, want)
+		}
 	}
 }
 

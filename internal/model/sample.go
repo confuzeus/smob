@@ -23,6 +23,20 @@ type Sample struct {
 	Labels     map[string]string `json:"labels,omitempty"`
 }
 
+// Millis converts a rate measurement window to whole milliseconds, rounding to
+// the nearest millisecond and returning at least 1 for any positive duration so
+// a measured rate is never indistinguishable from a gauge. It returns 0 for a
+// non-positive duration, which means no window was measured.
+func Millis(d time.Duration) int64 {
+	if d <= 0 {
+		return 0
+	}
+	if ms := int64((d + time.Millisecond/2) / time.Millisecond); ms > 0 {
+		return ms
+	}
+	return 1
+}
+
 // Label returns the value of the named label, or the empty string when it is
 // absent.
 func (s Sample) Label(name string) string {

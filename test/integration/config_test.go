@@ -48,6 +48,30 @@ func TestConfigValidate(t *testing.T) {
 			wants: []string{"field disk"},
 		},
 		{
+			name:  "removed storage s3 enabled field",
+			body:  base + "storage:\n  s3:\n    enabled: true\n",
+			exit:  2,
+			wants: []string{"field enabled"},
+		},
+		{
+			name:  "removed storage s3 chunk interval",
+			body:  base + "storage:\n  s3:\n    chunk_interval: 5m\n",
+			exit:  2,
+			wants: []string{"chunk_interval"},
+		},
+		{
+			name:  "duplicate key",
+			body:  base + base,
+			exit:  2,
+			wants: []string{"data_dir", "already defined"},
+		},
+		{
+			name:  "second yaml document",
+			body:  base + "---\n" + base,
+			exit:  2,
+			wants: []string{"multiple YAML documents"},
+		},
+		{
 			name:  "invalid duration",
 			body:  base + "sources:\n  system:\n    interval: soon\n",
 			exit:  2,
@@ -58,6 +82,23 @@ func TestConfigValidate(t *testing.T) {
 			body:  base + "sources:\n  system:\n    interval: 0s\n",
 			exit:  2,
 			wants: []string{"sources.system.interval"},
+		},
+		{
+			name:  "system interval below one millisecond",
+			body:  base + "sources:\n  system:\n    interval: 500us\n",
+			exit:  2,
+			wants: []string{"sources.system.interval", "at least 1ms"},
+		},
+		{
+			name:  "system interval just below one millisecond",
+			body:  base + "sources:\n  system:\n    interval: 999us\n",
+			exit:  2,
+			wants: []string{"sources.system.interval", "at least 1ms"},
+		},
+		{
+			name: "one millisecond system interval",
+			body: base + "sources:\n  system:\n    interval: 1ms\n",
+			exit: 0,
 		},
 		{
 			name:  "chunk interval does not divide an hour",
@@ -111,6 +152,65 @@ func TestConfigValidate(t *testing.T) {
 			wants: []string{"host: must be a single path component"},
 		},
 		{
+			name:  "host contains a newline",
+			body:  base + "host: \"a\\nb\"\n",
+			exit:  2,
+			wants: []string{"host: must be a single path component"},
+		},
+		{
+			name:  "host has leading whitespace",
+			body:  base + "host: \" a\"\n",
+			exit:  2,
+			wants: []string{"host: must be a single path component"},
+		},
+		{
+			name:  "host has trailing whitespace",
+			body:  base + "host: \"a \"\n",
+			exit:  2,
+			wants: []string{"host: must be a single path component"},
+		},
+		{
+			name:  "host is a dot",
+			body:  base + "host: \".\"\n",
+			exit:  2,
+			wants: []string{"host: must be a single path component"},
+		},
+		{
+			name:  "host is a dot dot",
+			body:  base + "host: \"..\"\n",
+			exit:  2,
+			wants: []string{"host: must be a single path component"},
+		},
+		{
+			name:  "host is a slash",
+			body:  base + "host: \"/\"\n",
+			exit:  2,
+			wants: []string{"host: must be a single path component"},
+		},
+		{
+			name:  "host contains NUL",
+			body:  base + "host: \"a\\0b\"\n",
+			exit:  2,
+			wants: []string{"host: must be a single path component"},
+		},
+		{
+			name:  "host contains DEL",
+			body:  base + "host: \"a\\x7fb\"\n",
+			exit:  2,
+			wants: []string{"host: must be a single path component"},
+		},
+		{
+			name:  "host is longer than 255 bytes",
+			body:  base + "host: " + strings.Repeat("a", 300) + "\n",
+			exit:  2,
+			wants: []string{"host: must be a single path component"},
+		},
+		{
+			name: "normal hostname",
+			body: base + "host: web-1\n",
+			exit: 0,
+		},
+		{
 			name: "s3 primary without bucket",
 			body: base + "storage:\n  primary: s3\n",
 			exit: 2,
@@ -118,6 +218,12 @@ func TestConfigValidate(t *testing.T) {
 				"storage.s3.bucket",
 				"storage.s3.region",
 			},
+		},
+		{
+			name:  "disk primary without data dir",
+			body:  "data_dir: \"\"\nstorage:\n  primary: disk\n",
+			exit:  2,
+			wants: []string{"data_dir", "storage.primary is disk"},
 		},
 		{
 			name:  "s3 primary without data dir or spool dir",
@@ -141,6 +247,83 @@ func TestConfigValidate(t *testing.T) {
 			body:  base + "storage:\n  primary: s3\n  s3:\n    bucket: bucket\n    endpoint: 127.0.0.1:9000\n",
 			exit:  2,
 			wants: []string{"storage.s3.endpoint"},
+		},
+		{
+			name:  "s3 endpoint with userinfo",
+			body:  base + "storage:\n  primary: s3\n  s3:\n    bucket: bucket\n    endpoint: https://user:pass@127.0.0.1:9000\n",
+			exit:  2,
+			wants: []string{"storage.s3.endpoint", "userinfo"},
+		},
+		{
+			name:  "s3 endpoint with a query",
+			body:  base + "storage:\n  primary: s3\n  s3:\n    bucket: bucket\n    endpoint: http://127.0.0.1:9000?region=us-east-1\n",
+			exit:  2,
+			wants: []string{"storage.s3.endpoint", "query string"},
+		},
+		{
+			name:  "s3 endpoint with a fragment",
+			body:  base + "storage:\n  primary: s3\n  s3:\n    bucket: bucket\n    endpoint: http://127.0.0.1:9000/#minio\n",
+			exit:  2,
+			wants: []string{"storage.s3.endpoint", "fragment"},
+		},
+		{
+			name:  "s3 bucket is whitespace only",
+			body:  base + "storage:\n  primary: s3\n  s3:\n    bucket: \"  \"\n    region: us-east-1\n",
+			exit:  2,
+			wants: []string{"storage.s3.bucket"},
+		},
+		{
+			name:  "s3 bucket contains whitespace",
+			body:  base + "storage:\n  primary: s3\n  s3:\n    bucket: \"my bucket\"\n    region: us-east-1\n",
+			exit:  2,
+			wants: []string{"storage.s3.bucket", "whitespace"},
+		},
+		{
+			name:  "s3 bucket is longer than 255 bytes",
+			body:  base + "storage:\n  primary: s3\n  s3:\n    bucket: " + strings.Repeat("b", 256) + "\n    region: us-east-1\n",
+			exit:  2,
+			wants: []string{"storage.s3.bucket", "255"},
+		},
+		{
+			name:  "s3 region is whitespace only",
+			body:  base + "storage:\n  primary: s3\n  s3:\n    bucket: bucket\n    region: \"  \"\n",
+			exit:  2,
+			wants: []string{"storage.s3.region"},
+		},
+		{
+			name:  "s3 spool dir is whitespace only",
+			body:  "data_dir: \"\"\nstorage:\n  primary: s3\n  s3:\n    bucket: bucket\n    region: us-east-1\n    spool_dir: \"  \"\n",
+			exit:  2,
+			wants: []string{"storage.s3.spool_dir"},
+		},
+		{
+			name:  "s3 prefix with a parent segment",
+			body:  base + "storage:\n  primary: s3\n  s3:\n    bucket: bucket\n    region: us-east-1\n    prefix: prod/../other\n",
+			exit:  2,
+			wants: []string{"storage.s3.prefix", `".."`},
+		},
+		{
+			name:  "s3 prefix with a current segment",
+			body:  base + "storage:\n  primary: s3\n  s3:\n    bucket: bucket\n    region: us-east-1\n    prefix: ./prod\n",
+			exit:  2,
+			wants: []string{"storage.s3.prefix", `"."`},
+		},
+		{
+			name:  "s3 prefix with a repeated slash",
+			body:  base + "storage:\n  primary: s3\n  s3:\n    bucket: bucket\n    region: us-east-1\n    prefix: prod//smob\n",
+			exit:  2,
+			wants: []string{"storage.s3.prefix"},
+		},
+		{
+			name:  "s3 prefix is only a parent segment",
+			body:  base + "storage:\n  primary: s3\n  s3:\n    bucket: bucket\n    region: us-east-1\n    prefix: \"..\"\n",
+			exit:  2,
+			wants: []string{"storage.s3.prefix", `".."`},
+		},
+		{
+			name: "s3 endpoint with a normal prefix",
+			body: base + "storage:\n  primary: s3\n  s3:\n    bucket: bucket\n    endpoint: http://127.0.0.1:9000\n    prefix: prod/smob\n",
+			exit: 0,
 		},
 		{
 			name:  "zero spool size",
@@ -170,6 +353,29 @@ func TestConfigValidate(t *testing.T) {
 			body:  base + "sources:\n  process:\n    enabled: true\n    interval: 0s\n",
 			exit:  2,
 			wants: []string{"sources.process.interval"},
+		},
+		{
+			name:  "process interval below one millisecond",
+			body:  base + "sources:\n  process:\n    enabled: true\n    interval: 500us\n",
+			exit:  2,
+			wants: []string{"sources.process.interval", "at least 1ms"},
+		},
+		{
+			name:  "process interval just below one millisecond",
+			body:  base + "sources:\n  process:\n    enabled: true\n    interval: 999us\n",
+			exit:  2,
+			wants: []string{"sources.process.interval", "at least 1ms"},
+		},
+		{
+			name: "one millisecond process interval",
+			body: base + "sources:\n  process:\n    enabled: true\n    interval: 1ms\n",
+			exit: 0,
+		},
+		{
+			name:  "zero process rescan interval",
+			body:  base + "sources:\n  process:\n    enabled: true\n    rescan_interval: 0s\n",
+			exit:  2,
+			wants: []string{"sources.process.rescan_interval"},
 		},
 		{
 			name: "negative top_n",
@@ -203,6 +409,23 @@ func TestConfigValidate(t *testing.T) {
 			wants: []string{"sources.docker.interval"},
 		},
 		{
+			name:  "docker interval below one millisecond",
+			body:  base + "sources:\n  docker:\n    enabled: true\n    interval: 500us\n",
+			exit:  2,
+			wants: []string{"sources.docker.interval", "at least 1ms"},
+		},
+		{
+			name:  "docker interval just below one millisecond",
+			body:  base + "sources:\n  docker:\n    enabled: true\n    interval: 999us\n",
+			exit:  2,
+			wants: []string{"sources.docker.interval", "at least 1ms"},
+		},
+		{
+			name: "one millisecond docker interval",
+			body: base + "sources:\n  docker:\n    enabled: true\n    interval: 1ms\n",
+			exit: 0,
+		},
+		{
 			name:  "zero docker rescan interval",
 			body:  base + "sources:\n  docker:\n    enabled: true\n    rescan_interval: 0s\n",
 			exit:  2,
@@ -220,6 +443,13 @@ func TestConfigValidate(t *testing.T) {
 			args:  []string{"--log-level", "verbose"},
 			exit:  2,
 			wants: []string{"log_level"},
+		},
+		{
+			name:  "unknown flag",
+			body:  base,
+			args:  []string{"--bogus"},
+			exit:  2,
+			wants: []string{"unknown flag", "--bogus"},
 		},
 	}
 
@@ -247,6 +477,11 @@ func TestConfigValidate(t *testing.T) {
 			}
 			if tc.exit == 0 && !strings.Contains(res.Stdout, "config valid:") {
 				t.Errorf("stdout = %q, want a config valid line", res.Stdout)
+			}
+			// A rejected config is a usage error: the diagnostic belongs on
+			// stderr alone, so a redirect of stdout stays empty.
+			if tc.exit != 0 && res.Stdout != "" {
+				t.Errorf("rejected config wrote to stdout:\n%s", res.Stdout)
 			}
 		})
 	}
@@ -308,6 +543,47 @@ sources:
 	}
 }
 
+// TestConfigDumpGolden pins the effective-config shape and field order. The
+// fixture sets every value that would otherwise vary by machine — data_dir,
+// host, and proc_path — so the dump is deterministic; normaliseConfigDump is a
+// belt-and-braces guard against a future default that interpolates the checkout
+// or a temp directory.
+func TestConfigDumpGolden(t *testing.T) {
+	ctx, cancel := context.WithTimeout(context.Background(), time.Minute)
+	defer cancel()
+
+	path := writeConfig(t, `data_dir: /var/lib/smob
+host: golden-host
+proc_path: /proc
+sources:
+  system:
+    interval: 5s
+`)
+	res := runSmob(t, ctx, "config", "--config", path)
+	if res.ExitCode != 0 {
+		t.Fatalf("exit = %d\nstderr:\n%s", res.ExitCode, res.Stderr)
+	}
+	// The dump is pure stdout; a log line here would corrupt a redirect.
+	if res.Stderr != "" {
+		t.Fatalf("config dump wrote to stderr:\n%s", res.Stderr)
+	}
+
+	compareGolden(t, "config_dump.txt", normaliseConfigDump(res.Stdout))
+}
+
+// normaliseConfigDump strips anything that could still vary by machine.
+func normaliseConfigDump(out string) string {
+	for _, repl := range []struct{ from, to string }{
+		{moduleRoot(), "<module>"},
+		{os.TempDir(), "<tmp>"},
+	} {
+		if repl.from != "" {
+			out = strings.ReplaceAll(out, repl.from, repl.to)
+		}
+	}
+	return out
+}
+
 func TestConfigS3Resolution(t *testing.T) {
 	ctx, cancel := context.WithTimeout(context.Background(), time.Minute)
 	defer cancel()
@@ -348,6 +624,24 @@ storage:
 				"region: eu-west-1",
 				"path_style: false",
 				"spool_dir: " + filepath.Join(dataDir, "spool"),
+			},
+		},
+		{
+			name: "surrounding whitespace and prefix slashes are trimmed",
+			body: fmt.Sprintf(`data_dir: %s
+storage:
+  primary: s3
+  s3:
+    bucket: "  bucket  "
+    region: " us-east-1 "
+    endpoint: " http://127.0.0.1:9000 "
+    prefix: /prod/smob/
+`, dataDir),
+			wants: []string{
+				"region: us-east-1",
+				"bucket: bucket",
+				"endpoint: http://127.0.0.1:9000",
+				"prefix: prod/smob",
 			},
 		},
 	}
@@ -423,6 +717,56 @@ func countLines(out, line string) int {
 		}
 	}
 	return count
+}
+
+// TestConfigFileSizeLimit proves a misdirected --config cannot grow the read
+// without bound: a file just under the 4 MiB cap still loads, and a file just
+// over it is a usage error rather than a decode failure.
+func TestConfigFileSizeLimit(t *testing.T) {
+	const limit = 4 << 20
+
+	cases := []struct {
+		name string
+		size int
+		exit int
+	}{
+		{name: "just under the limit", size: limit - 1, exit: 0},
+		{name: "just over the limit", size: limit + 1, exit: 2},
+	}
+
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			ctx, cancel := context.WithTimeout(context.Background(), time.Minute)
+			defer cancel()
+
+			dataDir := filepath.Join(t.TempDir(), "data")
+			body := "data_dir: " + dataDir + "\n"
+			// Pad with a single comment line so the file is exactly tc.size bytes.
+			body += "#" + strings.Repeat("x", tc.size-len(body)-2) + "\n"
+			path := writeConfig(t, body)
+			if info, err := os.Stat(path); err != nil {
+				t.Fatalf("stat config: %v", err)
+			} else if got := int(info.Size()); got != tc.size {
+				t.Fatalf("config size = %d, want %d", got, tc.size)
+			}
+
+			res := runSmob(t, ctx, "config", "--validate", "--config", path)
+			if res.ExitCode != tc.exit {
+				t.Fatalf("exit = %d, want %d\nstderr:\n%s", res.ExitCode, tc.exit, res.Stderr)
+			}
+			if tc.exit == 2 {
+				for _, want := range []string{path, "config: file", "exceeds 4 MiB limit"} {
+					if !strings.Contains(res.Stderr, want) {
+						t.Errorf("stderr does not contain %q\nstderr:\n%s", want, res.Stderr)
+					}
+				}
+				return
+			}
+			if !strings.Contains(res.Stdout, "config valid:") {
+				t.Errorf("stdout = %q, want a config valid line", res.Stdout)
+			}
+		})
+	}
 }
 
 func TestMissingConfig(t *testing.T) {

@@ -6,7 +6,7 @@
 // drive the smob binary as a black box: exact disk/S3 write-path parity for
 // identical input is only observable at the store boundary, because the CLI
 // cannot replay the same /proc values and timestamps twice. The test feeds one
-// fixed store.Chunk through the real disk and S3 stores, against a real
+// fixed set of store.Chunks through the real disk and S3 stores, against a real
 // filesystem and a real S3-compatible endpoint. It uses no mocks and no fake
 // clock. The exception is limited to store parity; importing internals from
 // test/integration remains prohibited.
@@ -23,11 +23,13 @@ import (
 	"io/fs"
 	"log/slog"
 	"maps"
+	"math"
 	"os"
 	"os/exec"
 	"path"
 	"path/filepath"
 	"slices"
+	"sort"
 	"strings"
 	"testing"
 	"time"
@@ -47,6 +49,14 @@ import (
 const (
 	equivalenceHost  = "equivalence-host"
 	equivalenceScope = "system"
+	// secondHost and secondScope are deliberately different from the primary
+	// pair. Their chunks overlap the primary chunks in time, so the query merge
+	// must interleave three host/scope targets rather than concatenate them.
+	secondHost  = "equivalence-host-b"
+	secondScope = "process"
+	// rateMetric carries intervals and appears in every chunk, so a limited
+	// query proves the limit is applied to the globally merged stream.
+	rateMetric = "system.network.rx_bytes_per_second"
 )
 
 // smobBin is built once by TestMain so the CLI layer of the test exercises the
@@ -98,19 +108,25 @@ func moduleRoot() (string, error) {
 }
 
 // TestDiskS3ChunkEquivalence writes the same fixed chunks through the real disk
-// and S3 stores, then compares the stored objects, the store Query results, and
-// the CLI query output. Compressed bytes are deliberately not compared.
+// and S3 stores, then compares decoded samples, the store Query results, and the
+// CLI query output. Each backend receives a different permutation of every
+// chunk's samples, so a backend that skips chunk.Prepare stores a different
+// order. The fixture spans two hosts and two scopes with overlapping
+// timestamps, so key layout and the global merge are both exercised.
+// Compressed bytes are deliberately not compared.
 func TestDiskS3ChunkEquivalence(t *testing.T) {
 	env := requireS3(t)
 
 	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Minute)
 	defer cancel()
 
-	chunks := fixedChunks()
-	want := flattenChunks(chunks)
+	chunks := equivalenceChunks()
+	keys := chunkKeys(chunks)
+	assertFixtureShape(t, chunks, keys)
+	window := equivalenceWindow(chunks)
 
 	dataDir := filepath.Join(t.TempDir(), "data")
-	diskStore, err := disk.New(dataDir, slog.New(slog.DiscardHandler))
+	diskStore, err := disk.New(dataDir, filepath.Join(dataDir, "spool"), slog.New(slog.DiscardHandler))
 	if err != nil {
 		t.Fatalf("new disk store: %v", err)
 	}
@@ -131,61 +147,87 @@ func TestDiskS3ChunkEquivalence(t *testing.T) {
 	}
 	t.Cleanup(func() { _ = s3Store.Close() })
 
-	for _, c := range chunks {
-		if err := diskStore.Write(ctx, c); err != nil {
-			t.Fatalf("disk write %s: %v", c.Start.Format(time.RFC3339), err)
+	wantChunks := make([][]model.Sample, len(chunks))
+	for i, c := range chunks {
+		wantChunks[i] = canonicalOrder(c.Samples)
+
+		// encoding/json sorts map keys, so rebuilding label maps in another
+		// order proves nothing. Permuting the sample slice is what exercises
+		// the shared chunk.Prepare write path.
+		diskChunk := c
+		diskChunk.Samples = rotatedSamples(c.Samples, 1)
+		s3Chunk := c
+		s3Chunk.Samples = reversedSamples(c.Samples)
+		assertScrambled(t, "disk", diskChunk.Samples)
+		assertScrambled(t, "S3", s3Chunk.Samples)
+
+		if err := diskStore.Write(ctx, diskChunk); err != nil {
+			t.Fatalf("disk write %s: %v", keys[i], err)
 		}
-		// Rebuild the label maps in reverse key order. The samples are
-		// semantically identical, so JSON map ordering must not change them.
-		if err := s3Store.Write(ctx, withReversedLabelMaps(c)); err != nil {
-			t.Fatalf("S3 write %s: %v", c.Start.Format(time.RFC3339), err)
+		if err := s3Store.Write(ctx, s3Chunk); err != nil {
+			t.Fatalf("S3 write %s: %v", keys[i], err)
 		}
 	}
 
-	keys := fixedChunkKeys()
-	if got := diskChunkKeys(t, dataDir); !slices.Equal(got, keys) {
-		t.Fatalf("disk keys = %v, want %v", got, keys)
+	wantKeys := slices.Sorted(slices.Values(keys))
+	if got := diskChunkKeys(t, dataDir); !slices.Equal(got, wantKeys) {
+		t.Fatalf("disk keys = %v, want %v", got, wantKeys)
 	}
-	wantS3Keys := make([]string, len(keys))
-	for i, key := range keys {
+	wantS3Keys := make([]string, len(wantKeys))
+	for i, key := range wantKeys {
 		wantS3Keys[i] = env.prefix + "/" + key
 	}
 	if got := listS3Keys(t, ctx, env.client, env.bucket, env.prefix+"/"); !slices.Equal(got, wantS3Keys) {
 		t.Fatalf("S3 keys = %v, want %v", got, wantS3Keys)
 	}
 
-	for i, c := range chunks {
-		key := keys[i]
-
-		file, err := os.Open(filepath.Join(dataDir, filepath.FromSlash(key)))
-		if err != nil {
-			t.Fatalf("open disk chunk %s: %v", key, err)
-		}
-		diskSamples := decodeStoredSamples(t, file)
-		closeErr := file.Close()
-		if closeErr != nil {
-			t.Fatalf("close disk chunk %s: %v", key, closeErr)
-		}
-		assertSamplesEqual(t, diskSamples, c.Samples)
+	for i, key := range keys {
+		diskSamples := diskChunkSamples(t, dataDir, key)
+		assertSamplesEqual(t, diskSamples, wantChunks[i])
 
 		body := getS3Object(t, ctx, env.client, env.bucket, env.prefix+"/"+key)
 		s3Samples := decodeStoredSamples(t, bytes.NewReader(body))
-		assertSamplesEqual(t, s3Samples, c.Samples)
+		assertSamplesEqual(t, s3Samples, wantChunks[i])
 		assertSamplesEqual(t, s3Samples, diskSamples)
 	}
 
-	q := model.Query{
-		Range: model.TimeRange{Start: chunks[0].Start, End: chunks[len(chunks)-1].End},
-		Host:  equivalenceHost,
-		Scope: equivalenceScope,
+	var union []model.Sample
+	for _, samples := range wantChunks {
+		union = append(union, samples...)
 	}
-	assertSamplesEqual(t, queryStoreSamples(t, ctx, diskStore, q), want)
-	assertSamplesEqual(t, queryStoreSamples(t, ctx, s3Store, q), want)
+	wantAll := canonicalOrder(union)
+
+	q := model.Query{Range: window}
+	diskAll := queryStoreSamples(t, ctx, diskStore, q)
+	assertSamplesEqual(t, diskAll, wantAll)
+	assertGloballyOrdered(t, diskAll)
+
+	s3All := queryStoreSamples(t, ctx, s3Store, q)
+	assertSamplesEqual(t, s3All, wantAll)
+	assertGloballyOrdered(t, s3All)
+
+	scoped := q
+	scoped.Host = equivalenceHost
+	scoped.Scope = equivalenceScope
+	wantScoped := canonicalOrder(matchingSamples(wantAll, func(sample model.Sample) bool {
+		return sample.Labels["host"] == equivalenceHost && sample.Labels["scope"] == equivalenceScope
+	}))
+	if len(wantScoped) == 0 || len(wantScoped) == len(wantAll) {
+		t.Fatalf("host/scope filter matched %d of %d samples; the fixture must exercise the filter", len(wantScoped), len(wantAll))
+	}
+	assertSamplesEqual(t, queryStoreSamples(t, ctx, diskStore, scoped), wantScoped)
+	assertSamplesEqual(t, queryStoreSamples(t, ctx, s3Store, scoped), wantScoped)
 
 	limited := q
-	limited.Metric = "system.network.rx_bytes_per_second"
+	limited.Metric = rateMetric
 	limited.Limit = 2
-	wantLimited := []model.Sample{want[3], want[4]}
+	wantLimited := matchingSamples(wantAll, func(sample model.Sample) bool {
+		return sample.Metric == rateMetric
+	})
+	if len(wantLimited) <= limited.Limit {
+		t.Fatalf("metric %s matched %d samples; want more than the limit %d", rateMetric, len(wantLimited), limited.Limit)
+	}
+	wantLimited = wantLimited[:limited.Limit]
 	assertSamplesEqual(t, queryStoreSamples(t, ctx, diskStore, limited), wantLimited)
 	assertSamplesEqual(t, queryStoreSamples(t, ctx, s3Store, limited), wantLimited)
 
@@ -211,22 +253,79 @@ storage:
     spool_dir: %s
 `, s3DataDir, equivalenceHost, env.endpoint, env.bucket, env.prefix, filepath.Join(s3DataDir, "spool")))
 
-	since := chunks[0].Start.Format(time.RFC3339)
-	until := chunks[len(chunks)-1].End.Format(time.RFC3339)
-	args := []string{"--since", since, "--until", until, "--host", equivalenceHost, "--scope", equivalenceScope}
-	assertSamplesEqual(t, queryCLI(t, ctx, diskCfg, args...), want)
-	assertSamplesEqual(t, queryCLI(t, ctx, s3Cfg, args...), want)
+	rangeArgs := []string{
+		"--since", window.Start.Format(time.RFC3339),
+		"--until", window.End.Format(time.RFC3339),
+	}
+	assertSamplesEqual(t, queryCLI(t, ctx, diskCfg, rangeArgs...), wantAll)
+	assertSamplesEqual(t, queryCLI(t, ctx, s3Cfg, rangeArgs...), wantAll)
+
+	scopedArgs := slices.Concat(rangeArgs, []string{"--host", equivalenceHost, "--scope", equivalenceScope})
+	assertSamplesEqual(t, queryCLI(t, ctx, diskCfg, scopedArgs...), wantScoped)
+	assertSamplesEqual(t, queryCLI(t, ctx, s3Cfg, scopedArgs...), wantScoped)
+
+	limitedArgs := slices.Concat(rangeArgs, []string{"--metric", rateMetric, "--limit", "2"})
+	assertSamplesEqual(t, queryCLI(t, ctx, diskCfg, limitedArgs...), wantLimited)
+	assertSamplesEqual(t, queryCLI(t, ctx, s3Cfg, limitedArgs...), wantLimited)
+
+	t.Run("non-finite values are rejected", func(t *testing.T) {
+		start := window.End.Add(10 * time.Minute)
+		end := start.Add(5 * time.Minute)
+		key := testChunkKey(equivalenceHost, equivalenceScope, start, end)
+
+		// encoding/json cannot represent NaN or an infinity, and both stores
+		// encode through chunk.Encode before writing anything. Rejecting them
+		// is the documented behavior: a value with no JSON representation must
+		// not be silently dropped or rewritten.
+		cases := []struct {
+			name  string
+			value float64
+		}{
+			{name: "NaN", value: math.NaN()},
+			{name: "+Inf", value: math.Inf(1)},
+			{name: "-Inf", value: math.Inf(-1)},
+		}
+		for _, tc := range cases {
+			c := store.Chunk{
+				Host:  equivalenceHost,
+				Scope: equivalenceScope,
+				Start: start,
+				End:   end,
+				Samples: []model.Sample{{
+					Timestamp: start.Add(time.Second),
+					Metric:    "system.precision.non_finite",
+					Value:     tc.value,
+					Labels:    map[string]string{"host": equivalenceHost, "scope": equivalenceScope},
+				}},
+			}
+
+			if err := diskStore.Write(ctx, c); !errors.Is(err, store.ErrPersistent) {
+				t.Fatalf("disk write %s value = %v, want an error wrapping store.ErrPersistent", tc.name, err)
+			}
+			if err := s3Store.Write(ctx, c); !errors.Is(err, store.ErrPersistent) {
+				t.Fatalf("S3 write %s value = %v, want an error wrapping store.ErrPersistent", tc.name, err)
+			}
+			if _, err := os.Stat(filepath.Join(dataDir, filepath.FromSlash(key))); !errors.Is(err, fs.ErrNotExist) {
+				t.Fatalf("disk wrote %s after rejecting a %s value: %v", key, tc.name, err)
+			}
+			if slices.Contains(listS3Keys(t, ctx, env.client, env.bucket, env.prefix+"/"), env.prefix+"/"+key) {
+				t.Fatalf("S3 wrote %s after rejecting a %s value", key, tc.name)
+			}
+		}
+	})
 }
 
-// fixedChunks builds the input shared by both backends. Samples are in the
-// documented timestamp, metric, then canonical label order; two chunks in one
-// hour exercise the query merge.
-func fixedChunks() []store.Chunk {
+// equivalenceChunks builds the input shared by both backends. Each chunk's
+// samples are deliberately unsorted; every backend receives a different
+// permutation. The fixture covers the primary host and scope, a second host,
+// and a second scope, all sharing timestamps inside the same UTC hour.
+func equivalenceChunks() []store.Chunk {
 	first := time.Date(2026, 1, 2, 3, 0, 0, 0, time.UTC)
 	second := first.Add(5 * time.Minute)
+	third := second.Add(5 * time.Minute)
 
-	labels := func(extra map[string]string) map[string]string {
-		labels := map[string]string{"host": equivalenceHost, "scope": equivalenceScope}
+	labels := func(host, scope string, extra map[string]string) map[string]string {
+		labels := map[string]string{"host": host, "scope": scope}
 		maps.Copy(labels, extra)
 		return labels
 	}
@@ -239,51 +338,75 @@ func fixedChunks() []store.Chunk {
 			End:   second,
 			Samples: []model.Sample{
 				{
-					Timestamp:  first.Add(10 * time.Second),
-					Metric:     "system.cpu.percent",
-					Value:      3.5,
+					Timestamp:  first.Add(40 * time.Second),
+					Metric:     rateMetric,
+					Value:      1024.25,
 					IntervalMS: 10_000,
-					Labels:     labels(map[string]string{"cpu": "0"}),
+					Labels:     labels(equivalenceHost, equivalenceScope, map[string]string{"interface": "eth0"}),
 				},
 				{
-					Timestamp:  first.Add(10 * time.Second),
+					Timestamp:  first.Add(20 * time.Second),
 					Metric:     "system.cpu.percent",
 					Value:      7.25,
 					IntervalMS: 10_000,
-					Labels:     labels(map[string]string{"cpu": "all"}),
+					Labels:     labels(equivalenceHost, equivalenceScope, map[string]string{"cpu": "all"}),
+				},
+				{
+					Timestamp: first.Add(12 * time.Second),
+					Metric:    "system.precision.subnormal",
+					Value:     math.SmallestNonzeroFloat64,
+					Labels:    labels(equivalenceHost, equivalenceScope, nil),
+				},
+				{
+					Timestamp:  first.Add(20 * time.Second),
+					Metric:     "system.cpu.percent",
+					Value:      3.5,
+					IntervalMS: 10_000,
+					Labels:     labels(equivalenceHost, equivalenceScope, map[string]string{"cpu": "0"}),
+				},
+				{
+					Timestamp: first.Add(14 * time.Second),
+					Metric:    "system.precision.max",
+					Value:     math.MaxFloat64,
+					Labels:    labels(equivalenceHost, equivalenceScope, nil),
+				},
+				{
+					Timestamp:  first.Add(40 * time.Second),
+					Metric:     rateMetric,
+					Value:      0,
+					IntervalMS: 10_000,
+					Labels:     labels(equivalenceHost, equivalenceScope, map[string]string{"interface": "eth1"}),
 				},
 				{
 					Timestamp: first.Add(10 * time.Second),
-					Metric:    "system.memory.used_bytes",
-					Value:     4096,
-					Labels:    labels(nil),
+					Metric:    "system.precision.float32",
+					Value:     16777217,
+					Labels:    labels(equivalenceHost, equivalenceScope, nil),
 				},
 				{
 					Timestamp:  first.Add(20 * time.Second),
-					Metric:     "system.network.rx_bytes_per_second",
-					Value:      1024.25,
+					Metric:     "system.cpu.percent",
+					Value:      3.5,
 					IntervalMS: 10_000,
-					Labels:     labels(map[string]string{"interface": "eth0"}),
+					Labels:     labels(equivalenceHost, equivalenceScope, map[string]string{"cpu": "1"}),
 				},
 				{
-					Timestamp:  first.Add(20 * time.Second),
-					Metric:     "system.network.rx_bytes_per_second",
-					Value:      0,
-					IntervalMS: 10_000,
-					Labels:     labels(map[string]string{"interface": "eth1"}),
-				},
-				{
-					Timestamp:  first.Add(20 * time.Second),
-					Metric:     "system.network.tx_bytes_per_second",
-					Value:      512.125,
-					IntervalMS: 10_000,
-					Labels:     labels(map[string]string{"interface": "eth0"}),
+					Timestamp: first.Add(11 * time.Second),
+					Metric:    "system.precision.negative_zero",
+					Value:     math.Copysign(0, -1),
+					Labels:    labels(equivalenceHost, equivalenceScope, nil),
 				},
 				{
 					Timestamp: first.Add(30 * time.Second),
-					Metric:    "system.memory.total_bytes",
-					Value:     8_589_934_592,
-					Labels:    labels(nil),
+					Metric:    "system.memory.used_bytes",
+					Value:     4096,
+					Labels:    labels(equivalenceHost, equivalenceScope, nil),
+				},
+				{
+					Timestamp: first.Add(13 * time.Second),
+					Metric:    "system.precision.large",
+					Value:     1e300,
+					Labels:    labels(equivalenceHost, equivalenceScope, nil),
 				},
 			},
 		},
@@ -291,62 +414,347 @@ func fixedChunks() []store.Chunk {
 			Host:  equivalenceHost,
 			Scope: equivalenceScope,
 			Start: second,
-			End:   second.Add(5 * time.Minute),
+			End:   third,
 			Samples: []model.Sample{
+				{
+					Timestamp:  second.Add(2 * time.Second),
+					Metric:     rateMetric,
+					Value:      512.125,
+					IntervalMS: 10_000,
+					Labels:     labels(equivalenceHost, equivalenceScope, map[string]string{"interface": "eth0"}),
+				},
 				{
 					Timestamp:  second.Add(5 * time.Second),
 					Metric:     "system.cpu.percent",
 					Value:      50,
 					IntervalMS: 10_000,
-					Labels:     labels(map[string]string{"cpu": "all"}),
+					Labels:     labels(equivalenceHost, equivalenceScope, map[string]string{"cpu": "all"}),
+				},
+				{
+					Timestamp: second.Add(8 * time.Second),
+					Metric:    "system.precision.tiny",
+					Value:     1e-300,
+					Labels:    labels(equivalenceHost, equivalenceScope, nil),
 				},
 				{
 					Timestamp: second.Add(6 * time.Second),
 					Metric:    "system.memory.available_bytes",
 					Value:     1_073_741_824,
-					Labels:    labels(nil),
+					Labels:    labels(equivalenceHost, equivalenceScope, nil),
+				},
+			},
+		},
+		{
+			Host:  secondHost,
+			Scope: equivalenceScope,
+			Start: first,
+			End:   second,
+			Samples: []model.Sample{
+				{
+					Timestamp: first.Add(15 * time.Second),
+					Metric:    "system.memory.used_bytes",
+					Value:     8_589_934_592,
+					Labels:    labels(secondHost, equivalenceScope, nil),
+				},
+				{
+					Timestamp:  first.Add(10 * time.Second),
+					Metric:     "system.cpu.percent",
+					Value:      11.5,
+					IntervalMS: 10_000,
+					Labels:     labels(secondHost, equivalenceScope, map[string]string{"cpu": "all"}),
+				},
+				{
+					Timestamp: first.Add(11 * time.Second),
+					Metric:    "system.precision.negative_zero",
+					Value:     math.Copysign(0, -1),
+					Labels:    labels(secondHost, equivalenceScope, nil),
+				},
+				{
+					Timestamp:  first.Add(40 * time.Second),
+					Metric:     rateMetric,
+					Value:      2048.5,
+					IntervalMS: 10_000,
+					Labels:     labels(secondHost, equivalenceScope, map[string]string{"interface": "eth0"}),
+				},
+			},
+		},
+		{
+			Host:  equivalenceHost,
+			Scope: secondScope,
+			Start: first,
+			End:   second,
+			Samples: []model.Sample{
+				{
+					Timestamp: first.Add(11 * time.Second),
+					Metric:    "system.precision.negative_zero",
+					Value:     math.Copysign(0, -1),
+					Labels:    labels(equivalenceHost, secondScope, map[string]string{"pid": "1234", "comm": "smob"}),
+				},
+				{
+					Timestamp:  first.Add(10 * time.Second),
+					Metric:     "system.cpu.percent",
+					Value:      99.5,
+					IntervalMS: 10_000,
+					Labels:     labels(equivalenceHost, secondScope, map[string]string{"cpu": "all", "pid": "1234", "comm": "smob"}),
+				},
+				{
+					Timestamp: first.Add(25 * time.Second),
+					Metric:    "system.process.rss_bytes",
+					Value:     1_048_576,
+					Labels:    labels(equivalenceHost, secondScope, map[string]string{"pid": "1234", "comm": "smob"}),
+				},
+				{
+					Timestamp:  first.Add(40 * time.Second),
+					Metric:     rateMetric,
+					Value:      4096.75,
+					IntervalMS: 10_000,
+					Labels:     labels(equivalenceHost, secondScope, map[string]string{"interface": "eth0", "pid": "1234", "comm": "smob"}),
 				},
 			},
 		},
 	}
 }
 
-// fixedChunkKeys mirrors the documented key layout instead of deriving it from
-// the production key helper, so a layout change breaks this contract test.
-func fixedChunkKeys() []string {
-	return []string{
-		equivalenceHost + "/system/2026/01/02/03/20260102T030000Z-20260102T030500Z.jsonl.gz",
-		equivalenceHost + "/system/2026/01/02/03/20260102T030500Z-20260102T031000Z.jsonl.gz",
+// chunkKeys returns the expected key for each chunk in fixture order. The key
+// layout is mirrored here rather than derived from chunk.Key, so a layout
+// change breaks this contract test.
+func chunkKeys(chunks []store.Chunk) []string {
+	keys := make([]string, len(chunks))
+	for i, c := range chunks {
+		keys[i] = testChunkKey(c.Host, c.Scope, c.Start, c.End)
 	}
+	return keys
 }
 
-// withReversedLabelMaps returns a value-identical chunk whose label maps are
-// rebuilt in reverse key order.
-func withReversedLabelMaps(c store.Chunk) store.Chunk {
-	samples := make([]model.Sample, len(c.Samples))
-	for i, sample := range c.Samples {
-		keys := slices.Sorted(maps.Keys(sample.Labels))
-		slices.Reverse(keys)
+// testChunkKey mirrors the documented key layout:
+// <host>/<scope>/YYYY/MM/DD/HH/<start>-<end>.jsonl.gz.
+func testChunkKey(host, scope string, start, end time.Time) string {
+	start, end = start.UTC(), end.UTC()
+	return path.Join(
+		host,
+		scope,
+		start.Format("2006"),
+		start.Format("01"),
+		start.Format("02"),
+		start.Format("15"),
+		start.Format("20060102T150405Z")+"-"+end.Format("20060102T150405Z")+".jsonl.gz",
+	)
+}
 
-		labels := make(map[string]string, len(sample.Labels))
-		for _, key := range keys {
-			labels[key] = sample.Labels[key]
+// equivalenceWindow returns the half-open range covering every fixture chunk.
+func equivalenceWindow(chunks []store.Chunk) model.TimeRange {
+	window := model.TimeRange{Start: chunks[0].Start, End: chunks[0].End}
+	for _, c := range chunks[1:] {
+		if c.Start.Before(window.Start) {
+			window.Start = c.Start
 		}
-		sample.Labels = labels
-		samples[i] = sample
+		if c.End.After(window.End) {
+			window.End = c.End
+		}
 	}
-	c.Samples = samples
-	return c
+	return window
 }
 
-func flattenChunks(chunks []store.Chunk) []model.Sample {
-	var samples []model.Sample
-	for _, c := range chunks {
-		samples = append(samples, c.Samples...)
+// assertFixtureShape guards the arrangement so the test cannot quietly degrade
+// to a single-host, pre-sorted, single-value case.
+func assertFixtureShape(t *testing.T, chunks []store.Chunk, keys []string) {
+	t.Helper()
+
+	hosts := make(map[string]struct{}, len(chunks))
+	scopes := make(map[string]struct{}, len(chunks))
+	ownerByTimestamp := make(map[int64]string, len(chunks))
+	overlapping := false
+	for i, c := range chunks {
+		if len(c.Samples) < 3 {
+			t.Fatalf("chunk %d (%s/%s) has %d samples; want at least 3 so a permutation changes the order",
+				i, c.Host, c.Scope, len(c.Samples))
+		}
+		hosts[c.Host] = struct{}{}
+		scopes[c.Scope] = struct{}{}
+		owner := c.Host + "/" + c.Scope
+		for _, sample := range c.Samples {
+			nanos := sample.Timestamp.UTC().UnixNano()
+			if previous, ok := ownerByTimestamp[nanos]; ok && previous != owner {
+				overlapping = true
+			}
+			ownerByTimestamp[nanos] = owner
+		}
 	}
-	return samples
+	if len(hosts) < 2 {
+		t.Fatalf("fixture covers %d hosts, want at least 2", len(hosts))
+	}
+	if len(scopes) < 2 {
+		t.Fatalf("fixture covers %d scopes, want at least 2", len(scopes))
+	}
+	if !overlapping {
+		t.Fatal("fixture shares no timestamp between two host/scope targets")
+	}
+
+	if len(keys) != len(chunks) {
+		t.Fatalf("got %d keys for %d chunks", len(keys), len(chunks))
+	}
+	unique := make(map[string]struct{}, len(keys))
+	for _, key := range keys {
+		if _, ok := unique[key]; ok {
+			t.Fatalf("duplicate chunk key %s", key)
+		}
+		unique[key] = struct{}{}
+	}
+	secondHostPrefix := secondHost + "/"
+	secondScopePrefix := equivalenceHost + "/" + secondScope + "/"
+	if !slices.ContainsFunc(keys, func(key string) bool { return strings.HasPrefix(key, secondHostPrefix) }) {
+		t.Fatalf("no chunk key below %s: %v", secondHostPrefix, keys)
+	}
+	if !slices.ContainsFunc(keys, func(key string) bool { return strings.HasPrefix(key, secondScopePrefix) }) {
+		t.Fatalf("no chunk key below %s: %v", secondScopePrefix, keys)
+	}
 }
 
+// canonicalOrder returns samples in the documented chunk order: timestamp, then
+// metric, then label key/value pairs in sorted order. It is implemented here
+// rather than with model.SortSamples so a regression in the production ordering
+// rule fails this contract test instead of moving the expectation with it.
+func canonicalOrder(samples []model.Sample) []model.Sample {
+	ordered := slices.Clone(samples)
+	sort.SliceStable(ordered, func(i, j int) bool { return lessSample(ordered[i], ordered[j]) })
+	return ordered
+}
+
+// lessSample reports whether a sorts before b by timestamp, metric, then
+// canonical label order.
+func lessSample(a, b model.Sample) bool {
+	if !a.Timestamp.Equal(b.Timestamp) {
+		return a.Timestamp.Before(b.Timestamp)
+	}
+	if a.Metric != b.Metric {
+		return a.Metric < b.Metric
+	}
+	aKeys := slices.Sorted(maps.Keys(a.Labels))
+	bKeys := slices.Sorted(maps.Keys(b.Labels))
+	for i := 0; i < min(len(aKeys), len(bKeys)); i++ {
+		if aKeys[i] != bKeys[i] {
+			return aKeys[i] < bKeys[i]
+		}
+		if a.Labels[aKeys[i]] != b.Labels[bKeys[i]] {
+			return a.Labels[aKeys[i]] < b.Labels[bKeys[i]]
+		}
+	}
+	return len(aKeys) < len(bKeys)
+}
+
+// isCanonicallyOrdered reports whether samples are already in the order the
+// stores must write.
+func isCanonicallyOrdered(samples []model.Sample) bool {
+	for i := 1; i < len(samples); i++ {
+		if lessSample(samples[i], samples[i-1]) {
+			return false
+		}
+	}
+	return true
+}
+
+// rotatedSamples returns samples rotated by by positions.
+func rotatedSamples(samples []model.Sample, by int) []model.Sample {
+	if len(samples) == 0 {
+		return nil
+	}
+	by %= len(samples)
+	rotated := make([]model.Sample, len(samples))
+	for i := range samples {
+		rotated[i] = samples[(i+by)%len(samples)]
+	}
+	return rotated
+}
+
+// reversedSamples returns samples in reverse order.
+func reversedSamples(samples []model.Sample) []model.Sample {
+	reversed := slices.Clone(samples)
+	slices.Reverse(reversed)
+	return reversed
+}
+
+// assertScrambled fails when the input permutation is already canonical, which
+// would make the case pass without exercising chunk.Prepare.
+func assertScrambled(t *testing.T, backend string, samples []model.Sample) {
+	t.Helper()
+
+	if len(samples) > 1 && isCanonicallyOrdered(samples) {
+		t.Fatalf("%s input is already in canonical order; the case would not prove chunk.Prepare normalises it", backend)
+	}
+}
+
+// assertGloballyOrdered fails unless samples are in global canonical order and
+// the merge actually interleaves more than one host and scope.
+func assertGloballyOrdered(t *testing.T, samples []model.Sample) {
+	t.Helper()
+
+	for i := 1; i < len(samples); i++ {
+		if lessSample(samples[i], samples[i-1]) {
+			t.Fatalf("sample %d (%s at %s, labels %v) sorts before sample %d",
+				i, samples[i].Metric, samples[i].Timestamp.Format(time.RFC3339Nano), samples[i].Labels, i-1)
+		}
+	}
+
+	hosts := make(map[string]struct{})
+	scopes := make(map[string]struct{})
+	for _, sample := range samples {
+		hosts[sample.Labels["host"]] = struct{}{}
+		scopes[sample.Labels["scope"]] = struct{}{}
+	}
+	if len(hosts) < 2 {
+		t.Fatalf("global query covered %d hosts, want at least 2", len(hosts))
+	}
+	if len(scopes) < 2 {
+		t.Fatalf("global query covered %d scopes, want at least 2", len(scopes))
+	}
+
+	// A merge that concatenated host by host could still be ordered by
+	// accident. Require a second-host sample before the last primary-host
+	// sample, so the result is demonstrably interleaved.
+	other, lastPrimary := -1, -1
+	for i, sample := range samples {
+		if sample.Labels["host"] == secondHost && other < 0 {
+			other = i
+		}
+		if sample.Labels["host"] == equivalenceHost {
+			lastPrimary = i
+		}
+	}
+	if other < 0 || lastPrimary < 0 || other >= lastPrimary {
+		t.Fatalf("second-host sample index %d is not before the last primary-host sample index %d; the merge is not global", other, lastPrimary)
+	}
+}
+
+// matchingSamples returns the samples keep accepts, preserving order.
+func matchingSamples(samples []model.Sample, keep func(model.Sample) bool) []model.Sample {
+	var matched []model.Sample
+	for _, sample := range samples {
+		if keep(sample) {
+			matched = append(matched, sample)
+		}
+	}
+	return matched
+}
+
+// diskChunkSamples decodes one stored disk chunk.
+func diskChunkSamples(t *testing.T, dataDir, key string) []model.Sample {
+	t.Helper()
+
+	file, err := os.Open(filepath.Join(dataDir, filepath.FromSlash(key)))
+	if err != nil {
+		t.Fatalf("open disk chunk %s: %v", key, err)
+	}
+	defer func() {
+		if err := file.Close(); err != nil {
+			t.Errorf("close disk chunk %s: %v", key, err)
+		}
+	}()
+	return decodeStoredSamples(t, file)
+}
+
+// assertSamplesEqual compares every field of each decoded sample. Values are
+// compared by bit pattern so -0.0 stays distinct from 0.0; NaN never reaches
+// storage because chunk.Encode rejects it.
 func assertSamplesEqual(t *testing.T, got, want []model.Sample) {
 	t.Helper()
 
@@ -354,12 +762,22 @@ func assertSamplesEqual(t *testing.T, got, want []model.Sample) {
 		t.Fatalf("got %d samples, want %d\ngot: %+v\nwant: %+v", len(got), len(want), got, want)
 	}
 	for i := range got {
-		if !got[i].Timestamp.Equal(want[i].Timestamp) ||
-			got[i].Metric != want[i].Metric ||
-			got[i].Value != want[i].Value ||
-			got[i].IntervalMS != want[i].IntervalMS ||
-			!maps.Equal(got[i].Labels, want[i].Labels) {
-			t.Fatalf("sample %d = %+v, want %+v", i, got[i], want[i])
+		g, w := got[i], want[i]
+		at := g.Timestamp.Format(time.RFC3339Nano)
+		switch {
+		case !g.Timestamp.Equal(w.Timestamp):
+			t.Fatalf("sample %d (%s) timestamp = %s, want %s",
+				i, g.Metric, at, w.Timestamp.Format(time.RFC3339Nano))
+		case g.Metric != w.Metric:
+			t.Fatalf("sample %d timestamp %s metric = %q, want %q", i, at, g.Metric, w.Metric)
+		case math.Float64bits(g.Value) != math.Float64bits(w.Value):
+			t.Fatalf("sample %d (%s at %s) value bits = %#016x (%v), want %#016x (%v)",
+				i, g.Metric, at, math.Float64bits(g.Value), g.Value, math.Float64bits(w.Value), w.Value)
+		case g.IntervalMS != w.IntervalMS:
+			t.Fatalf("sample %d (%s at %s) interval_ms = %d, want %d",
+				i, g.Metric, at, g.IntervalMS, w.IntervalMS)
+		case !maps.Equal(g.Labels, w.Labels):
+			t.Fatalf("sample %d (%s at %s) labels = %v, want %v", i, g.Metric, at, g.Labels, w.Labels)
 		}
 	}
 }

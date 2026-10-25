@@ -175,7 +175,10 @@ func (s *Source) collectOneShot(ctx context.Context, now time.Time) ([]model.Sam
 		ids[i] = container.ID
 	}
 
-	payloads := s.acquirer.oneShot(ctx, ids)
+	payloads, err := s.acquirer.oneShot(ctx, ids)
+	if err != nil {
+		return nil, err
+	}
 	samples := make([]model.Sample, 0, 4*len(payloads))
 	for _, payload := range payloads {
 		container, ok := byID[payload.containerID]
@@ -215,7 +218,7 @@ func (s *Source) collectStream(ctx context.Context) ([]model.Sample, error) {
 	}
 	s.acc.prune(ids)
 
-	samples := s.rates.drain()
+	samples := s.drainRates()
 	for id, sample := range s.memory {
 		if _, ok := s.containers[id]; !ok {
 			continue
@@ -226,6 +229,33 @@ func (s *Source) collectStream(ctx context.Context) ([]model.Sample, error) {
 	s.bufferWarned = false
 	model.SortSamples(samples)
 	return samples, nil
+}
+
+// drainRates drains the buffered rate samples and drops any whose container is
+// absent from the current snapshot. Rates carry no container ID, so a container
+// removed between ticks can still have up to one tick of buffered rates; writing
+// them would extend a vanished container's series with stale labels. Memory
+// gauges are coalesced per ID and filtered by the caller. The caller must hold
+// s.mu.
+func (s *Source) drainRates() []model.Sample {
+	drained := s.rates.drain()
+	if len(drained) == 0 {
+		return nil
+	}
+
+	live := make(map[[2]string]struct{}, len(s.containers))
+	for _, container := range s.containers {
+		live[[2]string{container.Name, container.Image}] = struct{}{}
+	}
+
+	kept := drained[:0]
+	for _, sample := range drained {
+		key := [2]string{sample.Labels["container"], sample.Labels["image"]}
+		if _, ok := live[key]; ok {
+			kept = append(kept, sample)
+		}
+	}
+	return kept
 }
 
 // consume is the stream bridge. It runs for the life of the source, timestamps
@@ -278,7 +308,7 @@ func containerSamples(container Container, obs containerMetrics, at time.Time) (
 		Labels:    labels,
 	}
 
-	interval := obs.window.Milliseconds()
+	interval := model.Millis(obs.window)
 	rates := make([]model.Sample, 0, 1+2*len(obs.networks))
 	if obs.cpuKnown {
 		rates = append(rates, model.Sample{
@@ -318,7 +348,9 @@ func containerSamples(container Container, obs containerMetrics, at time.Time) (
 }
 
 // containersByID indexes a discovered container set. A container re-created
-// with the same name has a new ID and therefore a new series.
+// with the same name and image has a new ID, so its rate baseline is new, but
+// the series labels are unchanged and the samples continue the same series
+// after a gap.
 func containersByID(containers []Container) map[string]Container {
 	byID := make(map[string]Container, len(containers))
 	for _, container := range containers {

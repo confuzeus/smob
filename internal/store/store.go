@@ -36,6 +36,10 @@ type Checker interface {
 // drain them in the background. Only collect starts it; query reads the local
 // staging area directly.
 type Replayer interface {
+	// TrimSpool applies the staging size cap once. collect calls it
+	// synchronously before the first chunk can be written, so startup
+	// trimming cannot race a spool write.
+	TrimSpool(ctx context.Context)
 	Replay(ctx context.Context)
 }
 

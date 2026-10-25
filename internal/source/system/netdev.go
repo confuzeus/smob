@@ -19,14 +19,16 @@ type netCounters struct {
 // netDevSnapshot maps an interface name to its cumulative counters.
 type netDevSnapshot map[string]netCounters
 
-// parseNetDev parses /proc/net/dev. The two header lines have no colon and are
-// skipped; each data line has sixteen counters, with received bytes first and
-// transmitted bytes ninth.
+// parseNetDev parses /proc/net/dev. The two leading header lines have no colon
+// and are skipped; any later line without a colon is malformed, because it may
+// be a data line whose colon was lost. Each data line has sixteen counters, with
+// received bytes first and transmitted bytes ninth.
 func parseNetDev(r io.Reader) (netDevSnapshot, error) {
 	snapshot := make(netDevSnapshot)
 
 	scanner := bufio.NewScanner(r)
 	line := 0
+	headers := 2
 	for scanner.Scan() {
 		line++
 		text := strings.TrimSpace(scanner.Text())
@@ -36,8 +38,11 @@ func parseNetDev(r io.Reader) (netDevSnapshot, error) {
 
 		name, counters, ok := strings.Cut(text, ":")
 		if !ok {
-			// Header lines do not contain a colon.
-			continue
+			if headers > 0 {
+				headers--
+				continue
+			}
+			return nil, fmt.Errorf("line %d: missing ':' separator", line)
 		}
 		name = strings.TrimSpace(name)
 		if name == "" {

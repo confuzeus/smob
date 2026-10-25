@@ -4,20 +4,40 @@ on:
   push:
     branches: [master]
   pull_request:
+  workflow_dispatch:
 
 permissions:
   contents: read
 
+# A new push to a pull request supersedes the previous run. Pushes to master are
+# never cancelled so a landing commit always gets a complete result.
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+
+# Third-party and first-party actions are pinned to immutable commit SHAs with
+# the human-readable version in a trailing comment: a mutable major tag such as
+# `@v4` lets the upstream repository change the code CI runs without a commit
+# here. Bump a pin deliberately (checkout, then update the SHA and comment).
+env:
+  # Pinned so a new `just` release cannot change how the justfile executes.
+  # 1.59.0 is the release the justfile is verified against.
+  JUST_VERSION: "1.59.0"
+
 jobs:
   lint:
     runs-on: ubuntu-latest
+    timeout-minutes: 10
     steps:
-      - uses: actions/checkout@v4
-      - uses: actions/setup-go@v5
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+      - uses: actions/setup-go@40f1582b2485089dde7abd97c1529aa768e1baff # v5.6.0
         with:
-          go-version: "1.27.x"
+          # Read the toolchain from the module so CI cannot drift from go.mod.
+          go-version-file: go.mod
           cache: true
-      - uses: extractions/setup-just@v2
+      - uses: extractions/setup-just@53165ef7e734c5c07cb06b3c8e7b647c5aa16db3 # v4
+        with:
+          just-version: ${{ env.JUST_VERSION }}
       - name: gofmt
         run: test -z "$(gofmt -l .)"
       - name: vet
@@ -25,29 +45,81 @@ jobs:
       - name: staticcheck
         run: just lint
 
+  tidy:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+      - uses: actions/setup-go@40f1582b2485089dde7abd97c1529aa768e1baff # v5.6.0
+        with:
+          go-version-file: go.mod
+          cache: true
+      - name: go mod tidy is clean
+        run: |
+          go mod tidy
+          if ! git diff --exit-code -- go.mod go.sum; then
+            echo "::error::go mod tidy changed go.mod/go.sum; run 'go mod tidy' and commit the result" >&2
+            exit 1
+          fi
+
   test:
     runs-on: ubuntu-latest
+    timeout-minutes: 15
     env:
       # Docker-gated tests run when the runner daemon is reachable and skip
       # with a reason when it is not: this lane is not strict. The extended
       # job owns the hard Docker contract.
       SMOB_TEST_DOCKER_SOCKET: /var/run/docker.sock
     steps:
-      - uses: actions/checkout@v4
-      - uses: actions/setup-go@v5
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+      - uses: actions/setup-go@40f1582b2485089dde7abd97c1529aa768e1baff # v5.6.0
         with:
-          go-version: "1.27.x"
+          go-version-file: go.mod
           cache: true
-      - uses: extractions/setup-just@v2
+      - uses: extractions/setup-just@53165ef7e734c5c07cb06b3c8e7b647c5aa16db3 # v4
+        with:
+          just-version: ${{ env.JUST_VERSION }}
       - run: just test
       - run: just test-race
 
+  # Regenerating the goldens must reproduce the committed files. The test job
+  # only compares smob's output with the file in the tree, so a wrong snapshot
+  # committed by `just test-update` would agree with itself and pass. This job
+  # must stay separate: update mode rewrites tracked files, and no later step
+  # may depend on a workspace this one has touched.
+  goldens:
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    needs: test
+    env:
+      # `test-update` sets this inline; declaring it here too means a future
+      # edit that drops that assignment cannot silently turn the gate into a
+      # plain test run.
+      SMOB_TEST_UPDATE: "1"
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+      - uses: actions/setup-go@40f1582b2485089dde7abd97c1529aa768e1baff # v5.6.0
+        with:
+          go-version-file: go.mod
+          cache: true
+      - uses: extractions/setup-just@53165ef7e734c5c07cb06b3c8e7b647c5aa16db3 # v4
+        with:
+          just-version: ${{ env.JUST_VERSION }}
+      - name: regenerated goldens match the committed tree
+        run: just test-golden-check
+
   extended:
     runs-on: ubuntu-latest
-    # The Go suite has a 10m timeout; setup, image pulls, and runner variance
-    # need the remaining headroom. Keep one job: splitting adds coordination
-    # without improving reliability.
-    timeout-minutes: 20
+    # Two Go suites run here: the strict integration suite (six test binaries,
+    # each with the 10m budget from the justfile recipe) and the race run over
+    # the storage and Docker packages (five binaries, go test's default 10m).
+    # go test runs packages in parallel (4 vCPU here), so the worst case is two
+    # waves per suite -- about 40m of Go budgets -- plus setup, image pulls, and
+    # runner variance. The job cap must stay above that sum: if it fired first
+    # the run would be cancelled and Go's panic/timeout output, which is the
+    # actionable part of a hang, would never reach the log. Keep one job:
+    # splitting adds coordination without improving reliability.
+    timeout-minutes: 50
     env:
       # Ephemeral credentials for this job's local MinIO only.
       SMOB_TEST_S3_ENDPOINT: http://127.0.0.1:9000
@@ -57,13 +129,22 @@ jobs:
       AWS_EC2_METADATA_DISABLED: "true"
       SMOB_TEST_STRICT: "1"
       SMOB_TEST_DOCKER_SOCKET: /var/run/docker.sock
+      # The MinIO image is pinned by digest. Pulled explicitly below and reused
+      # by the start step so the pull and the run cannot drift apart.
+      MINIO_IMAGE: pgsty/minio@sha256:b6bfe7239bfc83fb90d31612d9704d86039dd714f7904b3f1ad68f211e602372
+      # Deliberately outside the `smob-` prefix: that prefix marks test-created
+      # containers, and the failure diagnostics treat anything matching it as a
+      # leaked test container to dump and remove.
+      MINIO_CONTAINER: ci-minio
     steps:
-      - uses: actions/checkout@v4
-      - uses: actions/setup-go@v5
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+      - uses: actions/setup-go@40f1582b2485089dde7abd97c1529aa768e1baff # v5.6.0
         with:
-          go-version: "1.27.x"
+          go-version-file: go.mod
           cache: true
-      - uses: extractions/setup-just@v2
+      - uses: extractions/setup-just@53165ef7e734c5c07cb06b3c8e7b647c5aa16db3 # v4
+        with:
+          just-version: ${{ env.JUST_VERSION }}
       - name: check Docker daemon
         run: |
           if ! command -v docker >/dev/null 2>&1; then
@@ -107,18 +188,54 @@ jobs:
           done
           echo "::error::could not pull busybox:1.36 after two attempts; the Docker CLI tests require the pre-pulled fixture image" >&2
           exit 1
+      - name: verify the test Docker socket runs a container
+        run: |
+          # The daemon checks above use the default endpoint. Prove the socket
+          # the tests are told to use is reachable and can actually start a
+          # container, so a bogus SMOB_TEST_DOCKER_SOCKET fails here with a
+          # clear message instead of inside an integration test.
+          if [ -z "$SMOB_TEST_DOCKER_SOCKET" ]; then
+            echo "::error::SMOB_TEST_DOCKER_SOCKET is empty; the extended suite requires the path of a working Docker socket" >&2
+            exit 1
+          fi
+          if ! out=$(DOCKER_HOST="unix://$SMOB_TEST_DOCKER_SOCKET" timeout 120 docker run --rm busybox:1.36 true 2>&1); then
+            printf '%s\n' "$out" >&2
+            echo "::error::cannot run a container through DOCKER_HOST=unix://$SMOB_TEST_DOCKER_SOCKET; the extended suite requires this socket to be a working Docker daemon" >&2
+            exit 1
+          fi
+          echo "ran a container through unix://$SMOB_TEST_DOCKER_SOCKET"
+      - name: pre-pull MinIO image
+        run: |
+          # `docker run` below would otherwise pull this image implicitly, with
+          # no retry and no timeout: a registry hiccup would surface as an
+          # opaque container-start failure. Pull the pinned digest here first.
+          if docker image inspect "$MINIO_IMAGE" >/dev/null 2>&1; then
+            echo "$MINIO_IMAGE is already cached"
+            exit 0
+          fi
+          for attempt in 1 2 3; do
+            if timeout 300 docker pull "$MINIO_IMAGE"; then
+              exit 0
+            fi
+            echo "MinIO pull attempt $attempt failed" >&2
+            if [ "$attempt" -lt 3 ]; then
+              sleep 5
+            fi
+          done
+          echo "::error::could not pull $MINIO_IMAGE after three attempts; the extended suite requires MinIO at $SMOB_TEST_S3_ENDPOINT" >&2
+          exit 1
       - name: start MinIO
         run: |
           # pgsty/minio:RELEASE.2026-08-04T00-00-00Z. The official MinIO image
           # is no longer published; pin its replacement by digest. The
           # entrypoint and /tmp/minio path are explicit so the image's wrapper
           # entrypoint and root-owned /data volume are not involved.
-          docker run -d --name smob-minio \
+          docker run -d --name "$MINIO_CONTAINER" \
             -p 127.0.0.1:9000:9000 \
             -e MINIO_ROOT_USER="$AWS_ACCESS_KEY_ID" \
             -e MINIO_ROOT_PASSWORD="$AWS_SECRET_ACCESS_KEY" \
             --entrypoint /usr/bin/minio \
-            pgsty/minio@sha256:b6bfe7239bfc83fb90d31612d9704d86039dd714f7904b3f1ad68f211e602372 \
+            "$MINIO_IMAGE" \
             server /tmp/minio --console-address :9001
       - name: wait for MinIO
         run: |
@@ -129,10 +246,15 @@ jobs:
             fi
             sleep 2
           done
-          echo "MinIO did not become ready within 60s" >&2
-          docker logs smob-minio >&2 || true
+          echo "::error::MinIO did not become ready within 60s" >&2
+          docker logs "$MINIO_CONTAINER" >&2 || true
           exit 1
       - run: just test-all
+      # The fast test-race lane only covers test/integration; the S3 and Docker
+      # packages are exercised under the race detector here, where the same
+      # MinIO/Docker env and strict mode already apply.
+      - name: race detector over storage and Docker sources
+        run: just test-race-extended
       - name: Docker diagnostics
         if: failure() || cancelled()
         run: |
@@ -148,6 +270,8 @@ jobs:
           echo "::group::docker ps -a"
           docker ps -a
           echo "::endgroup::"
+          # Only the test-created containers carry this prefix; the CI MinIO
+          # container is named outside it so it is left for the stop step.
           ids=$(docker ps -aq --filter 'name=smob-')
           while IFS= read -r id; do
             [ -n "$id" ] || continue
@@ -161,27 +285,121 @@ jobs:
           exit 0
       - name: stop MinIO
         if: always()
-        run: docker rm -f smob-minio || true
+        run: docker rm -f "$MINIO_CONTAINER" || true
 
   build:
     runs-on: ubuntu-latest
+    timeout-minutes: 10
     strategy:
       matrix:
         goarch: [amd64, arm64]
     steps:
-      - uses: actions/checkout@v4
-      - uses: actions/setup-go@v5
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+      - uses: actions/setup-go@40f1582b2485089dde7abd97c1529aa768e1baff # v5.6.0
         with:
-          go-version: "1.27.x"
+          go-version-file: go.mod
           cache: true
       - name: cross compile
         run: CGO_ENABLED=0 GOOS=linux GOARCH=${{ matrix.goarch }} go build -trimpath -o /dev/null ./cmd/smob
 
+  # Exercise the shipped artifacts, not just compilation: the injected build
+  # metadata, the static cross-build, and the scratch image's contract (version
+  # banner, non-root user, bundled licence) are user-visible behaviour. This job
+  # needs no MinIO, so it stays independent of the extended job.
+  artifacts:
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    env:
+      # Fixed values keep the assertions deterministic. VERSION is also the
+      # image tag, so it must stay a valid Docker tag.
+      VERSION: ci
+      COMMIT: "0000000"
+      DATE: "2026-01-01T00:00:00Z"
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+      - uses: actions/setup-go@40f1582b2485089dde7abd97c1529aa768e1baff # v5.6.0
+        with:
+          go-version-file: go.mod
+          cache: true
+      - uses: extractions/setup-just@53165ef7e734c5c07cb06b3c8e7b647c5aa16db3 # v4
+        with:
+          just-version: ${{ env.JUST_VERSION }}
+      - name: binary reports its build metadata
+        run: |
+          just build
+          banner=$(./smob --version)
+          printf '%s\n' "$banner"
+          # Substring checks rather than a pinned banner: the flag must surface
+          # the values it was built with without freezing the format here.
+          for value in "$VERSION" "$COMMIT" "$DATE"; do
+            if ! printf '%s' "$banner" | grep -Fq -- "$value"; then
+              echo "::error::./smob --version is missing '$value': $banner" >&2
+              exit 1
+            fi
+          done
+      - name: release binaries are static and runnable
+        run: |
+          just release
+          for arch in amd64 arm64; do
+            bin="dist/smob-linux-$arch"
+            if [ ! -x "$bin" ]; then
+              echo "::error::$bin is missing or not executable" >&2
+              exit 1
+            fi
+            if ! file "$bin" | grep -Fq 'statically linked'; then
+              file "$bin" >&2
+              echo "::error::$bin is not statically linked" >&2
+              exit 1
+            fi
+          done
+          # The arm64 artifact cannot execute on the amd64 runner; the amd64 one
+          # must still run and report the metadata it was built with.
+          banner=$(dist/smob-linux-amd64 --version)
+          printf '%s\n' "$banner"
+          for value in "$VERSION" "$COMMIT" "$DATE"; do
+            if ! printf '%s' "$banner" | grep -Fq -- "$value"; then
+              echo "::error::dist/smob-linux-amd64 --version is missing '$value': $banner" >&2
+              exit 1
+            fi
+          done
+      - name: build the image
+        run: VERSION=ci just docker
+      - name: image is runnable, non-root, and carries the licence
+        run: |
+          image="smob:$VERSION"
+          banner=$(docker run --rm --entrypoint /smob "$image" --version)
+          want="smob $VERSION (commit $COMMIT, built $DATE)"
+          printf '%s\n' "$banner"
+          if [ "$banner" != "$want" ]; then
+            echo "::error::image /smob --version printed '$banner'; expected '$want'" >&2
+            exit 1
+          fi
+          # The scratch image has no shell, so inspect the config instead of
+          # running `id` inside it.
+          user=$(docker image inspect --format '{{.Config.User}}' "$image")
+          if [ "$user" != "65532:65532" ]; then
+            echo "::error::image USER is '$user'; expected '65532:65532'" >&2
+            exit 1
+          fi
+          # /LICENSE cannot be executed, so copy it out and compare contents.
+          cid=$(docker create "$image")
+          trap 'docker rm -f "$cid" >/dev/null 2>&1 || true; rm -f LICENSE.image' EXIT
+          docker cp "$cid:/LICENSE" LICENSE.image
+          if ! cmp -s LICENSE LICENSE.image; then
+            echo "::error::image /LICENSE does not match the repository LICENSE" >&2
+            exit 1
+          fi
+
   alpine:
     runs-on: ubuntu-latest
+    timeout-minutes: 10
     steps:
-      - uses: actions/checkout@v4
-      - name: fast suite on an Alpine kernel
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+      - name: unit and fast suite on an Alpine kernel
+        # The image tag matches the go directive in go.mod, like setup-go's
+        # go-version-file, so this lane tests the module's own toolchain. The
+        # untagged run covers the pure-function tests that the tagged run skips,
+        # giving musl coverage of them as well.
         run: >
-          docker run --rm -v "$PWD:/src" -w /src golang:1.27-alpine
-          sh -c 'apk add --no-cache git && go test -tags=integration -count=1 ./test/integration/...'
+          docker run --rm -v "$PWD:/src" -w /src golang:1.27.3-alpine
+          sh -c 'apk add --no-cache git && go test -count=1 ./... && go test -tags=integration -count=1 ./test/integration/...'

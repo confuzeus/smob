@@ -26,13 +26,15 @@ description: Use when writing, running, reviewing, or debugging tests in smob. I
   reason; it does not silently pass.
 - Tests live in `test/integration` and carry `//go:build integration`. Run them
   with `go test -tags=integration ./test/integration/...`.
-- Store parity is the one permitted exception to the black-box rule.
-  `internal/store/equivalence_integration_test.go` imports the store packages
-  to feed one fixed `store.Chunk` through the real disk and S3 stores, because
-  the CLI cannot replay identical `/proc` values and timestamps. It carries
-  `//go:build integration`, runs under `just test-all` in strict mode, and
-  compares decoded samples, never compressed bytes. Importing internals from
-  `test/integration` remains prohibited.
+- Two package-level exceptions to the black-box rule are permitted. Store
+  parity: `internal/store/equivalence_integration_test.go` imports the store
+  packages to feed one fixed `store.Chunk` through the real disk and S3 stores,
+  because the CLI cannot replay identical `/proc` values and timestamps. Docker
+  internals: `internal/source/docker/*_integration_test.go` connects to the real
+  daemon beside the package. Both carry `//go:build integration`, run under
+  `just test-all` in strict mode, and use real dependencies; the store parity
+  test compares decoded samples, never compressed bytes. Importing internals
+  from `test/integration` remains prohibited.
 
 ## What counts
 
@@ -60,26 +62,46 @@ and force a deliberate update.
 test/integration/
   main_test.go       # TestMain: builds the binary once
   harness_test.go    # run/start/wait/read helpers
+  cli_test.go        # version, help, and config validation
+  collect_test.go    # system collection, --once, and --dry-run
   config_test.go
-  system_test.go
   process_test.go
-  s3_test.go
-  docker_test.go
+  query_test.go      # table, JSON, JSONL, and CSV output
+  stats_test.go
   retention_test.go
+  agg_test.go        # seeded-chunk aggregation and grouping
+  s3_test.go         # MinIO round-trip
+  s3_query_test.go
+  s3_spool_test.go
+  s3_terminal_test.go
+  docker_test.go
   testdata/
-    configs/         # valid and invalid config bodies
-    golden/          # stable CLI and chunk-format output
-  compose.yaml       # MinIO and any Docker fixtures
+    golden/          # stable help and version output
 ```
 
+`compose.yaml` lives at the repository root as the deployment example, not under
+`test/integration`. Config bodies are inline in the `writeConfig` calls; there is
+no `testdata/configs/`.
+
 Every Go file in this package starts with `//go:build integration` and declares
-`package integration`. The package uses the standard library only; no assertion
-library, no testcontainers, no mock framework.
+`package integration`. The package avoids assertion libraries, testcontainers, and
+mock frameworks; it uses the standard library except for the AWS SDK in the
+`s3_*_test.go` files, which only sets up and removes the test bucket and prefix
+while `smob` stays a black box.
 
 Pure-function tests live beside the code they test (for example
-`internal/source/system/parse_test.go`) and carry no build tag, so
+`internal/source/system/stat_test.go`) and carry no build tag, so
 `go test ./...` runs them quickly. They may not import the integration harness or
 start the binary.
+
+Tagged tests also live beside the packages that need a real service:
+`internal/store/equivalence_integration_test.go`, the `*_integration_test.go`
+files in `internal/source/docker/`, and the S3 store tests in
+`internal/store/s3/`. Those packages run under `just test-all` and
+`just test-race-extended`. The S3 store's `spool_test.go` and `client_test.go`
+must carry `//go:build integration` like their siblings: any test that
+constructs the S3 client or the spool is an integration test, so add the tag
+when you touch the file.
 
 ## Harness
 
@@ -96,7 +118,11 @@ func TestMain(m *testing.M) {
 	}
 	smobBin = filepath.Join(dir, "smob")
 
-	args := []string{"build", "-o", smobBin}
+	args := []string{
+		"build",
+		"-o", smobBin,
+		"-ldflags", "-X main.version=test-version -X main.commit=test-commit -X main.date=test-date",
+	}
 	if os.Getenv("SMOB_TEST_RACE") == "1" {
 		args = append(args, "-race")
 	}
@@ -133,8 +159,8 @@ func moduleRoot() string {
 }
 ```
 
-Build with the repository's normal `-ldflags` for version output. Build once per
-`go test` invocation; never rebuild inside a test.
+`TestMain` injects fixed version metadata so `version` and `--help` goldens stay
+deterministic. Build once per `go test` invocation; never rebuild inside a test.
 
 ### Run one-shot commands
 
@@ -264,22 +290,38 @@ Never sleep "long enough" for a flush.
 ### Optional services
 
 ```go
-func requireS3(t *testing.T) string {
+func requireDockerCLI(t *testing.T) string {
 	t.Helper()
-	endpoint := os.Getenv("SMOB_TEST_S3_ENDPOINT")
-	if endpoint == "" {
-		if os.Getenv("SMOB_TEST_STRICT") == "1" {
-			t.Fatal("SMOB_TEST_STRICT=1 but SMOB_TEST_S3_ENDPOINT is not set")
-		}
-		t.Skip("SMOB_TEST_S3_ENDPOINT not set; run `just test-all`")
+
+	socket := os.Getenv("SMOB_TEST_DOCKER_SOCKET")
+	if socket == "" {
+		socket = "/var/run/docker.sock"
 	}
-	return endpoint
+	if _, err := os.Stat(socket); err != nil {
+		reason := fmt.Sprintf("Docker socket %s is unavailable (%v); set SMOB_TEST_DOCKER_SOCKET or run `just test-all`", socket, err)
+		if os.Getenv("SMOB_TEST_STRICT") == "1" {
+			t.Fatal(reason)
+		}
+		t.Skip(reason)
+	}
+	if _, err := exec.LookPath("docker"); err != nil {
+		reason := fmt.Sprintf("docker CLI is unavailable (%v); it is required to arrange the container fixture", err)
+		if os.Getenv("SMOB_TEST_STRICT") == "1" {
+			t.Fatal(reason)
+		}
+		t.Skip(reason)
+	}
+	return socket
 }
 ```
 
-`requireDocker` does the same for the Docker socket. Skip messages must say how
-to provide the dependency. In strict mode a missing dependency is a failure, not
-a skip.
+`requireDockerCLI` lives in `docker_test.go`. `requireS3` (in `s3_test.go`) uses
+the same shape, requiring `SMOB_TEST_S3_ENDPOINT`, `SMOB_TEST_S3_BUCKET`,
+`AWS_ACCESS_KEY_ID`, and `AWS_SECRET_ACCESS_KEY`, then returns an `s3TestEnv`
+with a unique per-test prefix. Skip messages must say how to provide the
+dependency. Tagged tests skip with a reason when a service is absent, and
+`SMOB_TEST_STRICT=1` turns every skip into a failure; CI's `extended` job sets
+it.
 
 ## Writing a test
 
@@ -289,14 +331,14 @@ Arrange, act, assert:
 func TestSystemCollectThenQuery(t *testing.T) {
 	dir := t.TempDir()
 	dataDir := filepath.Join(dir, "data")
-	cfg := writeConfig(t, dir, fmt.Sprintf(`
-interval: 200ms
+	cfg := writeConfig(t, fmt.Sprintf(`
 data_dir: %s
 sources:
   system:
     enabled: true
+    interval: 200ms
 storage:
-  chunk_interval: 200ms
+  chunk_interval: 1s
   primary: disk
 `, dataDir))
 
@@ -313,13 +355,17 @@ storage:
 	if len(samples) == 0 {
 		t.Fatal("collect wrote no samples")
 	}
-	assertWellFormed(t, samples)
+	for _, s := range samples {
+		if s.Metric == "" || s.Timestamp.IsZero() {
+			t.Fatalf("malformed sample: %+v", s)
+		}
+	}
 
 	out := runSmob(t, ctx, "query", "--config", cfg, "--since", "1m", "--format", "json")
 	if out.ExitCode != 0 {
 		t.Fatalf("query failed: exit %d\n%s", out.ExitCode, out.Stderr)
 	}
-	var queried []sample
+	var queried []wireSample
 	if err := json.Unmarshal([]byte(out.Stdout), &queried); err != nil {
 		t.Fatalf("decode query output: %v\n%s", err, out.Stdout)
 	}
@@ -335,10 +381,16 @@ the schema changes; the friction is the point.
 Useful helpers to keep in `harness_test.go`:
 
 ```go
-func writeConfig(t *testing.T, dir, body string) string
+func writeConfig(t *testing.T, body string) string
+func validConfig(t *testing.T) string
+func collectConfig(t *testing.T, dataDir, procPath string) string
+func writeChunk(t *testing.T, dataDir, host, scope string, start, end time.Time, samples []wireSample)
+func chunkPaths(t *testing.T, dataDir string) []string
 func countChunks(t *testing.T, dataDir string) int
-func readSamples(t *testing.T, dataDir string) []sample
-func assertWellFormed(t *testing.T, samples []sample)
+func readSamples(t *testing.T, dataDir string) []wireSample
+func decodeJSONSamples(t *testing.T, out string) []wireSample
+func assertSameSamples(t *testing.T, got, want []wireSample)
+func compareGolden(t *testing.T, name, got string)
 ```
 
 ## Assertions that survive real data
@@ -358,8 +410,8 @@ func assertWellFormed(t *testing.T, samples []sample)
   ordering. Do not compare live values.
 - Golden files only for deterministic output: `--help`, table headers, config
   dumps, and parser output from fixtures. Live `/proc` samples are checked
-  structurally, never against a golden value. Update goldens with an explicit
-  flag and review the diff.
+  structurally, never against a golden value. Update goldens with
+  `just test-update` (`SMOB_TEST_UPDATE=1`) and review the diff.
 
 ## Failure paths
 
@@ -392,7 +444,8 @@ Cover these through the CLI wherever they are observable:
   network traffic, CPU load, or a pre-existing data dir.
 - Metric-sensitive tests run serially. Use `t.Parallel()` only for tests that
   share no service and assert structural output.
-- Run CI with `-count=1 -shuffle=on` to catch order dependence.
+- Run the suite with `-count=1`; the `test-all` and race recipes add
+  `-shuffle=on` to catch order dependence.
 - Set per-test contexts and a suite timeout. A hung daemon must fail fast with
   its stderr attached.
 - Never widen a bound or add a sleep to silence a flaky test. Find the race or
@@ -401,41 +454,55 @@ Cover these through the CLI wherever they are observable:
 ## CI and commands
 
 ```sh
-go vet -tags=integration ./...
-staticcheck -tags=integration ./...
-go test ./...                       # pure-function tests only
+just vet                            # go vet -tags=integration ./...
+just lint                           # staticcheck -tags=integration ./...
+
+# Pure-function tests, uncached.
+go test -count=1 ./...
+
+# Fast integration suite; `just test` runs test-unit first, so a unit failure
+# gates the suite.
 go test -tags=integration -count=1 ./test/integration/...
 
 # Race coverage for the binary under test, not just the test process.
 SMOB_TEST_RACE=1 go test -tags=integration -count=1 ./test/integration/...
 
-# Full suite with MinIO and Docker already running.
-SMOB_TEST_STRICT=1 SMOB_TEST_S3_ENDPOINT=http://127.0.0.1:9000 \
+# Full suite with MinIO and Docker already running. `just test-all` also covers
+# ./internal/store/... and ./internal/source/docker/...
+SMOB_TEST_STRICT=1 \
+  SMOB_TEST_S3_ENDPOINT=http://127.0.0.1:9000 \
+  SMOB_TEST_S3_BUCKET=smob-test \
+  AWS_ACCESS_KEY_ID=minioadmin \
+  AWS_SECRET_ACCESS_KEY=minioadmin \
+  AWS_EC2_METADATA_DISABLED=true \
   SMOB_TEST_DOCKER_SOCKET=/var/run/docker.sock \
-  go test -tags=integration -count=1 -timeout=10m ./test/integration/...
+  go test -tags=integration -count=1 -shuffle=on -timeout=10m \
+    ./test/integration/... ./internal/store/... ./internal/source/docker/...
 ```
 
-Required justfile recipes (Phase 0):
+Required justfile recipes:
 
-| Recipe        | Behavior                                              |
-| ------------- | ----------------------------------------------------- |
-| `test-unit`   | `go test ./...`; pure functions only                  |
-| `test`        | Fast integration suite; service tests skip with reason |
-| `test-all`    | MinIO and Docker running, strict mode, full suite     |
-| `test-race`   | Suite with `SMOB_TEST_RACE=1`                         |
-| `test-update` | Suite with the golden update flag                     |
+| Recipe               | Behavior                                                                |
+| -------------------- | ----------------------------------------------------------------------- |
+| `test-unit`          | `go test -count=1 ./...`; pure functions only                           |
+| `test`               | Runs `test-unit`, then the fast integration suite; service tests skip with a reason |
+| `test-all`           | MinIO and Docker running, strict mode, `-shuffle=on`; covers `./test/integration/...`, `./internal/store/...`, and `./internal/source/docker/...` |
+| `test-race`          | Fast suite with `SMOB_TEST_RACE=1`                                      |
+| `test-race-extended` | `CGO_ENABLED=1` race run over `./internal/store/...` and `./internal/source/docker/...` |
+| `test-update`        | Fast suite with `SMOB_TEST_UPDATE=1`; rewrites goldens                  |
 
-CI runs the fast and race suites on Debian and the fast suite on Alpine. The
-`extended` job starts pinned MinIO, checks the runner's Docker daemon, pre-pulls
-the `busybox:1.36` fixture image, and runs `just test-all` in strict mode with
-both `SMOB_TEST_S3_*` and `SMOB_TEST_DOCKER_SOCKET` set. A missing MinIO or
-Docker service fails that job; it never skips to a pass. The fast and race jobs
-set the same Docker socket but are not strict, so Docker-gated tests run when
-the daemon is reachable and skip with a reason when it is not.
-`go test -race` by itself only instruments the test binary; `SMOB_TEST_RACE=1` is
-what makes `TestMain` build `smob` with the race detector. The race build needs
-`CGO_ENABLED=1`, so run it on the Debian runner and keep release builds
-`CGO_ENABLED=0`.
+CI runs the fast and race suites on the Ubuntu (glibc) runner and the unit and
+fast suites in an Alpine container. The `extended` job starts pinned MinIO,
+checks the runner's Docker daemon, pre-pulls the `busybox:1.36` fixture image,
+and runs `just test-all` in strict mode with both `SMOB_TEST_S3_*` and
+`SMOB_TEST_DOCKER_SOCKET` set, then `just test-race-extended` over the storage
+and Docker packages. A missing MinIO or Docker service fails that job; it never
+skips to a pass. The fast/race job sets the same Docker socket but is not
+strict, so Docker-gated tests run when the daemon is reachable and skip with a
+reason when it is not. `go test -race` by itself only instruments the test
+binary; `SMOB_TEST_RACE=1` is what makes `TestMain` build `smob` with the race
+detector. The race build needs `CGO_ENABLED=1`, so run it on the glibc runner
+and keep release builds `CGO_ENABLED=0`.
 
 Do not gate on coverage percentages. The phase exit criteria in
 `docs/IMPLEMENTATION.md` are the gate.
@@ -517,7 +584,9 @@ Do not gate on coverage percentages. The phase exit criteria in
       dependency, signal, or fallback.
 - [ ] The test waits on observable state; no fixed sleeps or retries.
 - [ ] Temp dirs, buckets, containers, and processes are cleaned up.
-- [ ] `just test` passes; `just test-all` passes when services are available.
+- [ ] `just test` passes; it runs `just test-unit` first, so a unit failure gates
+      the integration suite.
+- [ ] `just test-all` passes with MinIO and Docker available.
 - [ ] `just test-unit` passes; any pure-function tests are table-driven and use
       fixtures or plain values only.
 - [ ] `SMOB_TEST_RACE=1` passes for collector or concurrency changes.

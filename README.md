@@ -69,6 +69,12 @@ Without `just`, the equivalent command is:
 CGO_ENABLED=0 go build -trimpath -o smob ./cmd/smob
 ```
 
+`just build`, `just release`, and `just docker` inject version metadata from the
+`VERSION`, `COMMIT`, and `DATE` environment variables. Their defaults are
+`git describe`, the short commit hash, and the current UTC timestamp. A plain
+`go build` without `-ldflags` injects nothing, so `smob version` reports
+`dev` (commit `none`, built `unknown`).
+
 Cross-compiled release binaries can be produced with `just release`. A minimal
 container image (`FROM scratch`, non-root user, CA bundle) can be built with
 `just docker`.
@@ -101,8 +107,8 @@ change meaning between versions.
 | `system.memory.total_bytes` | gauge | bytes | — | `MemTotal` |
 | `system.memory.available_bytes` | gauge | bytes | — | `MemAvailable` |
 | `system.memory.used_bytes` | gauge | bytes | — | `total − available` |
-| `system.network.rx_bytes_per_second` | rate | B/s | `interface` | Per interface |
-| `system.network.tx_bytes_per_second` | rate | B/s | `interface` | Per interface |
+| `system.network.rx_bytes_per_second` | rate | B/s | `interface` | Per interface, including `lo` |
+| `system.network.tx_bytes_per_second` | rate | B/s | `interface` | Per interface, including `lo` |
 | `process.cpu.percent` | rate | percent | `pid`, `comm` | 0–100 per core; two busy cores report 200 |
 | `process.memory.rss_bytes` | gauge | bytes | `pid`, `comm` | `VmRSS` |
 | `container.cpu.percent` | rate | percent | `container`, `image` | 0–100 per core, from consecutive observations |
@@ -117,6 +123,9 @@ change meaning between versions.
 - CPU percentages are per core. `100` means one core fully busy, so a
   multi-threaded process or container can exceed `100`. System CPU also reports
   an aggregate series with `cpu=all` alongside per-logical-CPU series.
+- A process seen for the first time on a tick has no previous CPU counter, so it
+  emits no `process.cpu.percent` until the next tick. `collect --once` takes one
+  snapshot, so it records only `process.memory.rss_bytes` for processes.
 - System CPU busy time is `total − (idle + iowait)`, following `/proc/stat`
   semantics. The aggregate `cpu=all` series comes from the kernel's aggregate
   line, not from summing individual CPUs.
@@ -127,6 +136,10 @@ change meaning between versions.
   so the first payload per container has no CPU sample. The CPU ratio and
   `interval_ms` cover the same measurement window in both one-shot and stream
   modes.
+- `container` is the container name without Docker's leading slash, or the full
+  container ID when the daemon reports no name. `image` is the reference used
+  when the container was created — a tag, digest, or image ID — not the image's
+  current tag.
 - Container memory subtracts `inactive_file` from `usage` and floors at zero. If
   the daemon reports neither `inactive_file` nor cgroup v1's
   `total_inactive_file`, smob reports `usage` unchanged; that estimate may
@@ -168,8 +181,13 @@ Commands:
   chunk per scope, and exits. This is intended for testing and automation.
 - `--data-dir DIR` overrides `data_dir` from the configuration.
 
-The collector runs until interrupted. A store failure stops collection rather
-than silently dropping data.
+The collector runs until interrupted. A source failure, such as an unreadable
+`/proc` root or a tick timeout, is logged at `warn` (rate-limited per source) and
+collection continues on the next tick. The process source treats a single
+unreadable, unparseable, or invalid process as a skipped PID: it logs once per
+rescan and keeps sampling the rest. A failed process rescan keeps the previously
+discovered PIDs and retries on the next rescan. A store failure stops collection
+rather than silently dropping data.
 
 ### Docker container metrics
 
@@ -188,6 +206,9 @@ sources:
 
 Every Docker field, its default, and its validation rule are in
 [docs/configuration.md#docker-source](docs/configuration.md#docker-source).
+The daemon is selected only by `sources.docker.socket`; `DOCKER_HOST` and
+`DOCKER_API_VERSION` are ignored, so the configuration file is the single source
+of truth.
 
 `collect` connects to and probes the socket at startup. If the source is
 enabled and the socket is missing or unreachable, collection fails with exit
@@ -202,7 +223,9 @@ one-shot stats for that run.
 
 Query defaults to the last hour when `--since` is omitted. `--until` defaults to
 now; `--until` without `--since` means the hour before `--until`. A duration
-given to `--since` is measured back from `--until`.
+given to `--since` is measured back from `--until`. The range is half-open,
+`[since, until)`: a sample stamped exactly at `until` is excluded, while one at
+`since` is included.
 
 | Flag | Description |
 | --- | --- |
@@ -211,20 +234,36 @@ given to `--since` is measured back from `--until`.
 | `--host NAME` | Restrict to one host. Omitting it merges hosts. |
 | `--scope SCOPE` | Restrict to `system`, `process`, or `container`. |
 | `--metric NAME` | Exact metric name. |
-| `--label MATCH` | Repeatable and ANDed. `name=value` is exact; `name~regex` is a regular expression. Quote shell metacharacters, for example `--label 'comm~nginx|postgres'`. |
+| `--label MATCH` | Repeatable and ANDed. `name=value` is exact; `name~regex` is a regular expression. Quote shell metacharacters, for example `--label 'comm~nginx|postgres'`. A label absent from a sample reads as the empty string. |
 | `--limit N` | Maximum samples returned. Defaults to 10,000; `0` means unlimited. |
 | `--format FORMAT` | `table` (default), `json`, `jsonl`, or `csv`. |
 | `--agg OP` | Aggregate matching samples instead of listing them: `avg`, `min`, `max`, or `sum`. |
 | `--group-by LABELS` | Comma-separated label names to group by. The metric is always included. Requires `--agg`. |
 | `--data-dir DIR` | Override `data_dir` from the configuration. |
 
-Output is UTC everywhere. Table columns are `TIME`, `METRIC`, `VALUE`, `UNIT`,
-and `LABELS`; units come from the metric suffix. JSON is one array; JSONL
-streams one object per line for large ranges; CSV has the columns `timestamp`,
-`metric`, `value`, `interval_ms`, and `labels`.
-Results are sorted by timestamp, then metric, then canonical labels. `--limit`
-is applied after filtering and sorting.
+A `--data-dir` (or `data_dir`) path that does not exist, or that is not a
+directory, is a runtime failure that names the path and exits 1. A directory
+that exists but holds no chunks is an empty result, not an error. `stats` and
+`--agg` follow the same rule.
 
+Output is UTC everywhere. Table columns are `TIME`, `METRIC`, `VALUE`, `UNIT`,
+and `LABELS`; units come from the metric suffix (`.bytes` and `_bytes` are `B`,
+`.bytes_per_second` is `B/s`, and `.percent` is `%`). Table cells escape
+backslashes and line breaks (`\\`, `\n`, `\r`, `\t`), so a label value such as
+a process `comm` cannot split a row or shift its columns; CSV uses the standard
+quoted form. A JSON sample result is one array and, like JSONL, is written as the
+scan proceeds rather than buffered; JSONL emits one object per line for large
+ranges; CSV has the columns `timestamp`, `metric`, `value`, `interval_ms`, and
+`labels`. Results are sorted by timestamp, then metric, then canonical labels.
+`--limit` is applied after filtering and sorting, so it bounds emitted samples,
+not scan work: to keep output ordered it may read the rest of a chunk window and
+open every chunk in the current UTC hour before it stops.
+
+A query that fails or is interrupted closes its output document first, then
+exits 1: a truncated result is never reported as success. A `SIGINT` during
+`query` is an interruption, not a successful partial result. A non-finite
+sample or aggregate value (`NaN`, `+Inf`, `-Inf`) is rejected with the metric
+named rather than written to the table or CSV.
 #### Aggregation
 
 `--agg` replaces the sample stream with one row per group. `--group-by` lists
@@ -283,9 +322,10 @@ unless a filter narrows the set. Metrics are sorted alphabetically.
 Table columns are `METRIC`, `COUNT`, `MIN`, `MAX`, `MEAN`, and `UNIT`. JSON is
 one array of flat objects with `metric`, `count`, `min`, `max`, and `mean`;
 JSONL emits one object per line; CSV has the columns `metric`, `count`, `min`,
-`max`, and `mean`. `COUNT` is the number of matching samples. `MEAN` is the
-unweighted arithmetic mean of their values: `interval_ms` does not change a
-sample's weight.
+`max`, and `mean`. `COUNT` is the number of matching samples. `MEAN` uses the
+same weighting as `--agg avg`: `Σ(value × interval_ms) / Σinterval_ms` for rate
+metrics and the unweighted arithmetic mean for gauges. For the same range and
+filters it therefore equals `query --agg avg`.
 
 `--limit` behaves as in `query`: it stops the scan after the first N matching
 samples (default 10,000; `0` means unlimited). A limited run therefore reports
@@ -295,16 +335,20 @@ the header (or `[]` for JSON).
 Use the `query` flags above (`--since`, `--until`, `--host`, `--scope`,
 `--metric`, `--label`, `--limit`, `--format`, and `--data-dir`) with `stats`.
 `stats` does not accept `--agg` or `--group-by`; use `query` for grouped
-aggregation.
+aggregation. An interrupted `stats` scan exits 1 with no rows, so partial
+statistics are never presented as a complete summary.
 
 ### Exit codes
 
 | Code | Meaning |
 | --- | --- |
 | `0` | Success |
-| `1` | Runtime failure |
-| `2` | Usage or configuration error |
+| `1` | Runtime failure, including a `SIGINT` or `SIGTERM` during `query` or `stats` |
+| `2` | Usage or configuration error: an unknown command or flag, an invalid flag value, an unreadable or invalid configuration file, or a configuration validation failure |
 | `3` | Persistent store failure (including `ENOSPC`) |
+
+A second `SIGINT` or `SIGTERM` received while the first is being handled exits 1
+immediately without flushing the active chunk.
 
 ## Storage
 
@@ -313,17 +357,26 @@ no mirroring or dual-write. The field-by-field reference, including the S3 and
 retention defaults, is in
 [docs/configuration.md#storage](docs/configuration.md#storage).
 
-- **Disk** writes under `data_dir` and is the default. A retention sweep runs
-  at startup and then hourly. It deletes closed chunks older than
+- **Disk** writes under `data_dir` and is the default. New chunk files are
+  `0640` inside directories created `0750`; existing files and directories are
+  never chmodded. The data directory must not be world-writable: a
+  world-writable parent lets another local user replace chunk paths. A retention
+  sweep runs at startup and then hourly. It deletes closed chunks older than
   `retention.disk.max_age` or beyond `retention.disk.max_bytes`; `0` disables
   either limit, and both may be set. Age is measured from the chunk's end
   timestamp, the moment the window is complete, so it is wall-clock based: a
   backward clock step delays deletion and a forward step can delete chunks
-  early. Age is applied before size, and size is the total on-disk size of
-  chunk files. Only files in the documented chunk layout are eligible, so
-  `.tmp` files, a `spool` directory, and stray files are never touched. The
-  hourly tick calls the same sweep as the startup pass. Deletions are logged at
-  `info`; sweep failures are logged at `warn` and never stop collection. The
+  early. A chunk whose end lies in the future is measured from its start
+  instead, so a clock jump or a planted filename cannot exempt it forever. Age
+  is applied before size, and size is the total on-disk size of chunk files.
+  Only files in the documented chunk layout are eligible, and the configured
+  `storage.s3.spool_dir` subtree is always skipped — even when it is `data_dir`
+  itself — so `.tmp` files, spooled chunks, and stray files are never touched by
+  retention. The store check that runs before retention removes crash leftovers
+  instead — `.smob-*.tmp`, legacy `<chunk>.tmp`, and `.check-*` files — and logs
+  one `info` line with the count; chunk files and directories are never removed.
+  The hourly tick calls the same sweep as the startup pass. Deletions are logged
+  at `info`; sweep failures are logged at `warn` and never stop collection. The
   startup pass runs before the free-space warning. When the size cap is smaller
   than a single chunk, every deletable chunk is removed, including one just
   written, until nothing eligible remains; the S3 spool is never part of this
@@ -333,15 +386,26 @@ retention defaults, is in
   are never stored in `smob.yaml`. Transient failures are retried with
   exponential backoff and jitter. A chunk that still cannot be uploaded is
   written atomically to a local spool (`storage.s3.spool_dir`, default
-  `<data_dir>/spool`), and a background replayer uploads it in key order. Replay
-  uses the exact chunk key: an object already present with identical bytes is
-  treated as stored and the spool copy is deleted, so a failed delete cannot
-  create a duplicate. Only a failed spool write is a persistent store failure
-  (exit code 3). The spool is capped by `storage.s3.spool_max_bytes`; when it
-  stays full, the oldest chunks are dropped with an `error` log. `query` merges
-  readable spool entries with the bucket, so chunks not yet uploaded are still
-  visible on the collecting host. See [docs/s3.md](docs/s3.md) for the IAM
-  policy, credential chain, and a local MinIO recipe.
+  `<data_dir>/spool`) under the key the failed attempt was using — the base key
+  or its `-1`, `-2`, … suffix — so replay targets a name the bucket did not
+  already occupy; if every suffix is taken, the base key is the last resort and
+  a `warn` names it. A background replayer uploads spooled chunks in key order.
+  A terminal rejection — `400`, `401`, `403`, or a `404` that absence does not
+  explain — is never spooled: `collect` fails immediately with exit code 3,
+  because replay could not fix a revoked credential or a denied permission.
+  Replay uses the exact chunk key: an object already present with identical
+  bytes is treated as stored and the spool copy is deleted, so a failed delete
+  cannot create a duplicate. Before uploading, replay verifies that each spool
+  file still decodes as a chunk; a truncated or bit-rotted file is left in place
+  with an `error` and is not retried in that process. Transient replay failures
+  back off from 30s to 5m with jitter, so hosts do not retry in lockstep. A
+  failed spool write is a persistent store failure
+  (exit code 3) too. The spool is capped by `storage.s3.spool_max_bytes`; the
+  cap is applied at startup before collection writes and again after each
+  spooled chunk, and the oldest chunks are dropped with an `error` log. `query`
+  merges readable spool entries with the bucket, so chunks not yet uploaded are
+  still visible on the collecting host. See [docs/s3.md](docs/s3.md) for the
+  IAM policy, credential chain, and a local MinIO recipe.
 
 Both backends use the same keys and sample format, so migrating from disk to S3
 is a copy followed by a configuration change. The complete procedure — stopping
@@ -352,6 +416,33 @@ Completed chunks are immutable. A collector crash loses at most the chunk
 currently being assembled, and `SIGINT`/`SIGTERM` flushes that chunk before
 exit. Concurrent collectors must not write the same host and prefix. Multiple
 hosts may share a bucket; every sample is labelled with its host.
+
+### Data-directory trust
+
+`data_dir` and `spool_dir` are part of the trust boundary, not inputs. Both must
+be writable only by the user that runs `collect`. smob does not defend against a
+local user who can write inside them: chunk writes create and follow directory
+components, and the containment check runs only after the directory exists; the
+check rejects a path that resolves outside `data_dir`; retention deletes chunk
+files; spool eviction deletes the oldest spool entries. The precise rules are in
+[configuration.md#trust-boundary](docs/configuration.md#trust-boundary).
+
+What an attacker with write access can do:
+
+- Forge chunk files that `query` and `stats` then report as real samples.
+- Delete retention candidates before their age or size limit is reached.
+- Plant symlinks in the layout; a write that resolves outside `data_dir` fails
+  rather than escaping, so this is a denial of service, not an escape.
+- Fill the disk with chunks or spool entries and stop collection.
+
+Metrics are not secret-free: process samples carry `pid` and `comm`, container
+samples carry names and image references, and system network samples carry host
+interface names. New files are `0640` inside `0750` directories, and existing
+files keep their old modes. Group read access is the supported sharing
+mechanism; group write is not. Run the collector under a dedicated service
+user, keep the parent of `data_dir` and `spool_dir` owned by root or that user
+and not group- or world-writable, and do not add other users to the service
+group unless they may read every recorded metric.
 
 ## Development
 

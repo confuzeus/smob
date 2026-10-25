@@ -5,7 +5,10 @@ package integration
 import (
 	"context"
 	"fmt"
+	"io"
 	"math"
+	"net"
+	"net/http"
 	"os"
 	"os/exec"
 	"path/filepath"
@@ -410,10 +413,58 @@ func TestDockerRecreateResetsRateSeries(t *testing.T) {
 	// exist before this instant, so any target sample in between is fabricated
 	// or belongs to the removed incarnation after the grace period.
 	recreateIssuedAt := time.Now()
-	runDocker(t, ctx, socket, "run", "-d", "--name", name, dockerTestImage, "sleep", "120")
+	script := `mkdir -p /www
+dd if=/dev/zero of=/www/blob bs=1024 count=64 2>/dev/null
+exec httpd -f -p 8080 -h /www`
+	runDocker(t, ctx, socket, "run", "-d", "--name", name, dockerTestImage, "sh", "-c", script)
 
-	waitFor(t, 30*time.Second, "post-recreation memory and CPU samples in closed chunks", func() bool {
-		var memory, cpu bool
+	// The re-created container serves HTTP so its network series is exercised
+	// with real traffic rather than asserted only by presence.
+	var ip string
+	waitFor(t, 20*time.Second, "the re-created container IP address", func() bool {
+		ip = runDocker(t, ctx, socket, "inspect", "-f",
+			"{{range .NetworkSettings.Networks}}{{.IPAddress}}{{end}}", name)
+		return ip != ""
+	})
+	url := "http://" + net.JoinHostPort(ip, "8080") + "/blob"
+	httpClient := &http.Client{Timeout: time.Second}
+	waitFor(t, 30*time.Second, "the re-created container HTTP server", func() bool {
+		resp, err := httpClient.Get(url)
+		if err != nil {
+			return false
+		}
+		_, _ = io.Copy(io.Discard, resp.Body)
+		_ = resp.Body.Close()
+		return resp.StatusCode == http.StatusOK
+	})
+
+	// Continuous traffic makes a non-zero rate likely in every post-recreation
+	// interval, not just the one after a single burst.
+	trafficStart := time.Now()
+	trafficCtx, stopTraffic := context.WithCancel(ctx)
+	trafficDone := make(chan struct{})
+	go func() {
+		defer close(trafficDone)
+		for {
+			select {
+			case <-trafficCtx.Done():
+				return
+			default:
+			}
+			resp, err := httpClient.Get(url)
+			if err == nil {
+				_, _ = io.Copy(io.Discard, resp.Body)
+				_ = resp.Body.Close()
+			}
+		}
+	}()
+	t.Cleanup(func() {
+		stopTraffic()
+		<-trafficDone
+	})
+
+	waitFor(t, 60*time.Second, "post-recreation memory, CPU, and non-zero network rates in closed chunks", func() bool {
+		var memory, cpu, network bool
 		for _, sample := range samplesForContainer(readSamples(t, dataDir), name) {
 			if sample.Timestamp.Before(recreateIssuedAt) {
 				continue
@@ -423,9 +474,13 @@ func TestDockerRecreateResetsRateSeries(t *testing.T) {
 				memory = true
 			case "container.cpu.percent":
 				cpu = true
+			case "container.network.rx_bytes_per_second", "container.network.tx_bytes_per_second":
+				if sample.Timestamp.After(trafficStart) && sample.Value > 0 {
+					network = true
+				}
 			}
 		}
-		return memory && cpu
+		return memory && cpu && network
 	})
 	d.stop(t, 15*time.Second)
 
@@ -478,14 +533,18 @@ func TestDockerRecreateResetsRateSeries(t *testing.T) {
 	if first[0].Value <= 0 {
 		t.Fatalf("first post-recreation memory gauge = %v, want greater than zero", first[0].Value)
 	}
+	if got := first[0].Labels["image"]; got != dockerTestImage {
+		t.Fatalf("post-recreation image label = %q, want the exact fixture reference %q", got, dockerTestImage)
+	}
 	assertContainerLabels(t, first[0], name)
 
 	// A corrupted delta from the old container ID would either be rejected as a
 	// counter decrease (leaving no rates at all) or, if it survived, be far
-	// outside these sanity bounds. An idle busybox cannot plausibly move a
-	// gibibyte per second, and CPU stays within the documented per-core bound.
+	// outside these sanity bounds. The traffic generator cannot plausibly move a
+	// gibibyte per second out of a 64 KiB loopback file, and CPU stays within the
+	// documented per-core bound.
 	const maxPlausibleNetworkRate = 1 << 30
-	var cpu, network int
+	var cpu, network, networkWithTraffic int
 	for _, sample := range post {
 		if !sample.Timestamp.After(firstAt) {
 			continue
@@ -509,11 +568,14 @@ func TestDockerRecreateResetsRateSeries(t *testing.T) {
 			network++
 			assertRate(t, sample)
 			if sample.Value > maxPlausibleNetworkRate {
-				t.Fatalf("%s = %v, want at most %d for an idle container",
+				t.Fatalf("%s = %v, want at most %d for a 64 KiB HTTP fixture",
 					sample.Metric, sample.Value, maxPlausibleNetworkRate)
 			}
 			if sample.Labels["interface"] == "" {
 				t.Fatalf("%s has no interface label", sample.Metric)
+			}
+			if sample.Timestamp.After(trafficStart) && sample.Value > 0 {
+				networkWithTraffic++
 			}
 		default:
 			t.Fatalf("unexpected container metric %q after recreation", sample.Metric)
@@ -524,6 +586,10 @@ func TestDockerRecreateResetsRateSeries(t *testing.T) {
 	}
 	if network == 0 {
 		t.Fatalf("no network rate for %s after the fresh baseline", name)
+	}
+	if networkWithTraffic == 0 {
+		t.Fatalf("no non-zero network rate for %s after traffic began at %s; the re-created container's network series was not exercised",
+			name, trafficStart)
 	}
 }
 
@@ -745,8 +811,8 @@ func assertContainerLabels(t *testing.T, sample wireSample, name string) {
 	if got := sample.Labels["container"]; got != name {
 		t.Fatalf("%s container label = %q, want %q", sample.Metric, got, name)
 	}
-	if image := sample.Labels["image"]; !strings.Contains(image, "busybox") {
-		t.Fatalf("%s image label = %q, want the busybox image", sample.Metric, image)
+	if image := sample.Labels["image"]; image != dockerTestImage {
+		t.Fatalf("%s image label = %q, want the exact fixture reference %q", sample.Metric, image, dockerTestImage)
 	}
 	for label := range sample.Labels {
 		switch label {

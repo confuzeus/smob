@@ -1,12 +1,16 @@
 package s3
 
 import (
+	"compress/gzip"
 	"container/heap"
 	"context"
+	"encoding/json"
 	"errors"
 	"fmt"
+	"io"
 	"io/fs"
 	"log/slog"
+	"math/rand/v2"
 	"os"
 	"path/filepath"
 	"sort"
@@ -19,8 +23,12 @@ import (
 )
 
 const (
-	spoolDirPerm  = 0o755
-	spoolFilePerm = 0o644
+	// Spooled chunks carry the same process and container names as disk chunks,
+	// so they are group-readable only and never accessible to "other". Existing
+	// spool entries keep their modes; the explicit chmod defeats a permissive
+	// umask.
+	spoolDirPerm  = 0o750
+	spoolFilePerm = 0o640
 	// maxSpoolCollisions bounds the suffix search so a writer bug cannot spin.
 	maxSpoolCollisions = 1000
 
@@ -238,6 +246,46 @@ func (s *spool) read(key string) ([]byte, error) {
 		return nil, err
 	}
 	return os.ReadFile(path)
+}
+
+// verify streams key through the chunk decoder without retaining the samples.
+// A truncated or bit-rotted file must be caught before replay uploads it: the
+// object would outlive the local copy and could never be repaired. The stream
+// is drained to io.Discard so gzip verifies its checksum and trailer.
+func (s *spool) verify(key string) error {
+	path, err := s.path(key)
+	if err != nil {
+		return err
+	}
+	f, err := os.Open(path)
+	if err != nil {
+		return err
+	}
+	defer f.Close()
+
+	gz, err := gzip.NewReader(f)
+	if err != nil {
+		return fmt.Errorf("gzip: %w", err)
+	}
+	defer gz.Close()
+
+	dec := json.NewDecoder(gz)
+	for {
+		var sample model.Sample
+		err := dec.Decode(&sample)
+		if errors.Is(err, io.EOF) {
+			break
+		}
+		if err != nil {
+			return fmt.Errorf("decode: %w", err)
+		}
+	}
+	// Drain the rest of the compressed stream to io.Discard so gzip reports a
+	// bad checksum or a short trailer even if the decoder stopped early.
+	if _, err := io.Copy(io.Discard, gz); err != nil {
+		return fmt.Errorf("gzip: %w", err)
+	}
+	return nil
 }
 
 // remove deletes one spool entry and updates the size index.
@@ -614,14 +662,23 @@ func (s *spool) enforceCap(ctx context.Context, protect string) {
 	}
 }
 
+// TrimSpool implements store.Replayer. It applies spool_max_bytes once and is
+// called by collect synchronously before collection starts, so startup
+// enforcement cannot race the first spool write. Enforcement is best effort and
+// logs its own failures.
+func (s *Store) TrimSpool(ctx context.Context) {
+	s.spool.enforceCap(ctx, "")
+}
+
 // Replay drains the spool in key order until ctx is canceled. It is started by
-// collect only. A transient upload failure leaves the file in place and backs
-// off; a permanent conflict is logged at error and left for an operator.
+// collect only, after TrimSpool has applied the size cap, so it never races the
+// startup trim against the first Write. A transient upload failure leaves the
+// file in place and backs off; a corrupt file or a permanent conflict is logged
+// at error and left for an operator.
 func (s *Store) Replay(ctx context.Context) {
 	if ctx.Err() != nil {
 		return
 	}
-	s.spool.enforceCap(ctx, "")
 	blocked := make(map[string]struct{})
 	var backoff time.Duration
 
@@ -629,71 +686,96 @@ func (s *Store) Replay(ctx context.Context) {
 		if ctx.Err() != nil {
 			return
 		}
-		entries, err := s.spool.entries(ctx)
+		failed, progressed, err := s.replayPass(ctx, blocked)
 		if err != nil {
+			if ctx.Err() != nil {
+				return
+			}
 			s.logger.Warn("scan spool", "spool_dir", s.spool.dir, "error", err)
 			if !sleepContext(ctx, nextReplayDelay(&backoff)) {
 				return
 			}
 			continue
 		}
-
-		failed := false
-		for _, entry := range entries {
-			if ctx.Err() != nil {
-				return
-			}
-			if _, ok := blocked[entry.key]; ok {
-				continue
-			}
-
-			replayed, err := func() (bool, error) {
-				if !s.spool.acquire(entry.key) {
-					return false, nil
-				}
-				defer s.spool.release(entry.key)
-				return s.replayEntry(ctx, entry.key)
-			}()
-			if err != nil {
-				if ctx.Err() != nil {
-					return
-				}
-				if errors.Is(err, errSpoolConflict) {
-					blocked[entry.key] = struct{}{}
-					s.logger.Error("spooled chunk conflicts with an existing object; leaving it for an operator",
-						"key", entry.key, "error", err)
-					continue
-				}
-				failed = true
-				s.logger.Warn("replay spooled chunk", "key", entry.key, "error", err)
-				break
-			}
-			if !replayed {
-				// Evicted or already handled between listing and acquiring.
-				continue
-			}
-
+		if progressed {
 			backoff = 0
-			s.logger.Info("replayed spooled chunk", "key", entry.key)
 		}
-
 		if failed {
 			if !sleepContext(ctx, nextReplayDelay(&backoff)) {
 				return
 			}
 			continue
 		}
-		backoff = 0
 		if !sleepContext(ctx, replayInterval) {
 			return
 		}
 	}
 }
 
-// replayEntry uploads one spool file at its exact key and deletes it after a
-// successful (or already-present) upload. It reports false when the file
-// disappeared before it could be read.
+// replayPass attempts every unblocked spool entry once. It reports whether a
+// transient failure ended the pass early and whether any entry made progress,
+// so Replay can choose between backoff and the idle interval. A corrupt file is
+// blocked for the rest of the process: its bytes stay on disk for an operator,
+// but replay does not retry it every cycle.
+func (s *Store) replayPass(ctx context.Context, blocked map[string]struct{}) (failed, progressed bool, err error) {
+	entries, err := s.spool.entries(ctx)
+	if err != nil {
+		return false, false, err
+	}
+
+	for _, entry := range entries {
+		if ctx.Err() != nil {
+			return failed, progressed, ctx.Err()
+		}
+		if _, ok := blocked[entry.key]; ok {
+			continue
+		}
+
+		replayed, replayErr := func() (bool, error) {
+			if !s.spool.acquire(entry.key) {
+				return false, nil
+			}
+			defer s.spool.release(entry.key)
+			return s.replayEntry(ctx, entry.key)
+		}()
+		switch {
+		case replayErr == nil:
+			if replayed {
+				progressed = true
+				s.logger.Info("replayed spooled chunk", "key", entry.key)
+			}
+		case ctx.Err() != nil:
+			return failed, progressed, ctx.Err()
+		case errors.Is(replayErr, errSpoolCorrupt):
+			blocked[entry.key] = struct{}{}
+			progressed = true
+			s.logger.Error("spooled chunk failed verification; leaving it for an operator",
+				"key", entry.key, "error", replayErr)
+		case errors.Is(replayErr, errSpoolConflict):
+			blocked[entry.key] = struct{}{}
+			progressed = true
+			s.logger.Error("spooled chunk conflicts with an existing object; leaving it for an operator",
+				"key", entry.key, "error", replayErr)
+		default:
+			s.logger.Warn("replay spooled chunk", "key", entry.key, "error", replayErr)
+			return true, progressed, nil
+		}
+	}
+	return false, progressed, nil
+}
+
+// replayEntry verifies then uploads one spool file at its exact key and deletes
+// it after a successful (or already-present) upload. It reports false when the
+// file disappeared before it could be read. A file that does not decode as a
+// chunk is never uploaded: the error wraps errSpoolCorrupt and the bytes stay
+// on disk.
 func (s *Store) replayEntry(ctx context.Context, key string) (bool, error) {
+	if err := s.spool.verify(key); err != nil {
+		if errors.Is(err, fs.ErrNotExist) {
+			return false, nil
+		}
+		return false, fmt.Errorf("%s: %w: %w", key, errSpoolCorrupt, err)
+	}
 	body, err := s.spool.read(key)
 	if err != nil {
 		if errors.Is(err, fs.ErrNotExist) {
@@ -710,6 +792,9 @@ func (s *Store) replayEntry(ctx context.Context, key string) (bool, error) {
 	return true, nil
 }
 
+// nextReplayDelay advances backoff and returns the delay before the next replay
+// attempt. Equal jitter keeps half the fixed delay and randomizes the rest, so
+// hosts that shared an outage do not resynchronise their retries.
 func nextReplayDelay(backoff *time.Duration) time.Duration {
 	if *backoff == 0 {
 		*backoff = replayBackoffBase
@@ -719,7 +804,8 @@ func nextReplayDelay(backoff *time.Duration) time.Duration {
 			*backoff = replayBackoffMax
 		}
 	}
-	return *backoff
+	half := *backoff / 2
+	return half + rand.N(half+1)
 }
 
 func sleepContext(ctx context.Context, d time.Duration) bool {

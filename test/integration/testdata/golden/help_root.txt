@@ -1,6 +1,7 @@
 Record CPU, memory, and network usage over time on Linux and store it on local disk or in S3-compatible object storage.
 
 Usage:
+  smob [flags]
   smob [command]
 
 Available Commands:

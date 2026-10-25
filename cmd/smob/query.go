@@ -12,6 +12,8 @@ import (
 	"github.com/confuzeus/smob/internal/cli"
 	"github.com/confuzeus/smob/internal/model"
 	"github.com/confuzeus/smob/internal/query"
+	"github.com/confuzeus/smob/internal/store"
+	"github.com/confuzeus/smob/internal/store/chunk"
 	"github.com/spf13/cobra"
 )
 
@@ -35,7 +37,7 @@ func (a *app) queryCommand() *cobra.Command {
 	cmd := &cobra.Command{
 		Use:   "query",
 		Short: "Query recorded samples",
-		Args:  cobra.NoArgs,
+		Args:  noArgs,
 		RunE: func(cmd *cobra.Command, _ []string) error {
 			if err := a.load(cmd); err != nil {
 				return err
@@ -125,6 +127,9 @@ func (o queryOptions) query(now time.Time) (model.Query, error) {
 	default:
 		return model.Query{}, fmt.Errorf("format: must be one of table, json, jsonl, csv; got %q", o.format)
 	}
+	if o.scope != "" && !chunk.IsComponent(o.scope) {
+		return model.Query{}, fmt.Errorf("scope: must be a single path component; got %q", o.scope)
+	}
 	switch o.scope {
 	case "", "system", "process", "container":
 	default:
@@ -133,7 +138,7 @@ func (o queryOptions) query(now time.Time) (model.Query, error) {
 	if o.limit < 0 {
 		return model.Query{}, fmt.Errorf("limit: must not be negative; got %d", o.limit)
 	}
-	if o.host != "" && !validComponent(o.host) {
+	if o.host != "" && !chunk.IsComponent(o.host) {
 		return model.Query{}, fmt.Errorf("host: must be a single path component; got %q", o.host)
 	}
 
@@ -204,6 +209,11 @@ func parseLabelMatcher(raw string) (model.LabelMatcher, error) {
 	if name == "" {
 		return model.LabelMatcher{}, fmt.Errorf("label: name must not be empty; got %q", raw)
 	}
+	// Only = and ~ are supported. Reject the negated forms explicitly rather
+	// than silently reading "comm!~x" as a label named "comm!".
+	if strings.HasSuffix(name, "!") {
+		return model.LabelMatcher{}, fmt.Errorf("label %s: only name=value and name~regex are supported", raw[:index+1])
+	}
 	if op == model.LabelRegex {
 		if _, err := regexp.Compile(value); err != nil {
 			return model.LabelMatcher{}, fmt.Errorf("label %s: %w", name, err)
@@ -212,74 +222,104 @@ func parseLabelMatcher(raw string) (model.LabelMatcher, error) {
 	return model.LabelMatcher{Name: name, Op: op, Value: value}, nil
 }
 
-// validComponent reports whether value can be used as one host or scope path
-// component.
-func validComponent(value string) bool {
-	return value != "" && value != "." && value != ".." && !strings.ContainsRune(value, '/')
+// queryRootChecker is implemented by stores that can validate their query root
+// up front, such as disk. The query command checks it before opening the output
+// document, so a bad --data-dir path fails without printing an empty result.
+type queryRootChecker interface {
+	CheckQuery() error
 }
 
-func (a *app) runQuery(cmd *cobra.Command, q model.Query, format string, agg *query.Aggregation, groupBy []string) error {
+func (a *app) runQuery(cmd *cobra.Command, q model.Query, format string, agg *query.Aggregation, groupBy []string) (err error) {
 	st, err := newStore(cmd.Context(), a.cfg, a.logger)
 	if err != nil {
 		return err
 	}
 	defer func() { _ = st.Close() }()
 
-	if agg != nil {
-		out, err := query.NewAggregateWriter(cmd.OutOrStdout(), format)
-		if err != nil {
-			if errors.Is(err, syscall.EPIPE) {
-				return nil
-			}
+	// Fail before the output document is opened: a data directory that cannot be
+	// read is not an empty result, and must not print one.
+	if checker, ok := st.(queryRootChecker); ok {
+		if err := checker.CheckQuery(); err != nil {
 			return err
 		}
+	} else if checker, ok := st.(store.Checker); ok {
+		// S3: prove the bucket is reachable before emitting an empty document,
+		// so a missing bucket is an error rather than "no data".
+		if err := checker.Check(cmd.Context()); err != nil {
+			return err
+		}
+	}
 
-		aggregator := query.NewAggregator(*agg, groupBy)
-		if err := st.Query(cmd.Context(), q, func(sample model.Sample) error {
-			aggregator.Add(sample)
-			return nil
-		}); err != nil {
-			if errors.Is(err, context.Canceled) || errors.Is(err, syscall.EPIPE) {
-				return nil
-			}
-			return err
-		}
-		for _, aggregate := range aggregator.Aggregates() {
-			if err := out.Write(aggregate); err != nil {
-				if errors.Is(err, syscall.EPIPE) {
-					return nil
-				}
-				return err
-			}
-		}
-		if err := out.Close(); err != nil {
-			if errors.Is(err, syscall.EPIPE) {
-				return nil
-			}
-			return err
-		}
-		return nil
+	if agg != nil {
+		return runAggregateQuery(cmd, st, q, format, *agg, groupBy)
 	}
 
 	out, err := query.NewWriter(cmd.OutOrStdout(), format)
 	if err != nil {
-		if errors.Is(err, syscall.EPIPE) {
-			return nil
-		}
-		return err
+		return ignoreBrokenPipe(err)
 	}
+	// Close on every path, including a failed scan, so JSON is a complete
+	// document rather than an unterminated array.
+	defer func() {
+		if closeErr := out.Close(); err == nil {
+			err = ignoreBrokenPipe(closeErr)
+		}
+	}()
 
-	if err := st.Query(cmd.Context(), q, out.Write); err != nil {
-		if errors.Is(err, context.Canceled) || errors.Is(err, syscall.EPIPE) {
-			return nil
-		}
-		return err
-	}
-	if err := out.Close(); err != nil {
-		if errors.Is(err, syscall.EPIPE) {
-			return nil
-		}
-		return err
+	if scanErr := st.Query(cmd.Context(), q, out.Write); scanErr != nil {
+		return queryError(scanErr)
 	}
 	return nil
+}
+
+// runAggregateQuery folds the matching samples and writes one row per group.
+// The writer closes on every path so a failed scan or a rejected aggregate
+// still leaves a valid document.
+func runAggregateQuery(cmd *cobra.Command, st store.Store, q model.Query, format string, agg query.Aggregation, groupBy []string) (err error) {
+	out, err := query.NewAggregateWriter(cmd.OutOrStdout(), format)
+	if err != nil {
+		return ignoreBrokenPipe(err)
+	}
+	defer func() {
+		if closeErr := out.Close(); err == nil {
+			err = ignoreBrokenPipe(closeErr)
+		}
+	}()
+
+	aggregator := query.NewAggregator(agg, groupBy)
+	if scanErr := st.Query(cmd.Context(), q, func(sample model.Sample) error {
+		aggregator.Add(sample)
+		return nil
+	}); scanErr != nil {
+		return queryError(scanErr)
+	}
+	for _, aggregate := range aggregator.Aggregates() {
+		if writeErr := out.Write(aggregate); writeErr != nil {
+			return ignoreBrokenPipe(writeErr)
+		}
+	}
+	return nil
+}
+
+// ignoreBrokenPipe treats a closed stdout as a successful run, matching the
+// convention of command-line filters in a pipeline. Every other write failure
+// is reported.
+func ignoreBrokenPipe(err error) error {
+	if errors.Is(err, syscall.EPIPE) {
+		return nil
+	}
+	return err
+}
+
+// queryError classifies a scan failure. A canceled context is a runtime error:
+// the result is truncated, so exiting 0 would present it as complete. A broken
+// pipe stays a clean exit.
+func queryError(err error) error {
+	if errors.Is(err, syscall.EPIPE) {
+		return nil
+	}
+	if errors.Is(err, context.Canceled) {
+		return fmt.Errorf("query interrupted: %w", err)
+	}
+	return err
 }

@@ -19,6 +19,8 @@ import (
 	"slices"
 	"strconv"
 	"strings"
+	"sync"
+	"syscall"
 	"testing"
 	"time"
 )
@@ -47,10 +49,30 @@ func runSmob(t *testing.T, ctx context.Context, args ...string) result {
 	return res
 }
 
+// syncBuffer is a bytes.Buffer that a test goroutine may read while the child
+// process writes to it.
+type syncBuffer struct {
+	mu  sync.Mutex
+	buf bytes.Buffer
+}
+
+func (b *syncBuffer) Write(p []byte) (int, error) {
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	return b.buf.Write(p)
+}
+
+func (b *syncBuffer) String() string {
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	return b.buf.String()
+}
+
 // daemon is a running smob process.
 type daemon struct {
 	cmd     *exec.Cmd
-	stderr  bytes.Buffer
+	stdout  *syncBuffer
+	stderr  *syncBuffer
 	done    chan struct{}
 	waitErr error
 }
@@ -61,8 +83,13 @@ func startSmob(t *testing.T, ctx context.Context, args ...string) *daemon {
 	cmd.WaitDelay = 5 * time.Second
 	cmd.Cancel = func() error { return cmd.Process.Signal(os.Interrupt) }
 
-	d := &daemon{cmd: cmd, done: make(chan struct{})}
-	cmd.Stderr = &d.stderr
+	d := &daemon{
+		cmd:    cmd,
+		stdout: new(syncBuffer),
+		stderr: new(syncBuffer),
+		done:   make(chan struct{}),
+	}
+	cmd.Stdout, cmd.Stderr = d.stdout, d.stderr
 	if err := cmd.Start(); err != nil {
 		t.Fatalf("start smob: %v", err)
 	}
@@ -85,19 +112,52 @@ func startSmob(t *testing.T, ctx context.Context, args ...string) *daemon {
 	return d
 }
 
+// stop sends SIGINT and requires a clean exit.
 func (d *daemon) stop(t *testing.T, timeout time.Duration) {
 	t.Helper()
-	if err := d.cmd.Process.Signal(os.Interrupt); err != nil {
+	d.stopWith(t, os.Interrupt, timeout)
+}
+
+// stopTerm sends SIGTERM and requires a clean exit. SIGTERM shares the SIGINT
+// contract: the active chunk is flushed before the process exits 0.
+func (d *daemon) stopTerm(t *testing.T, timeout time.Duration) {
+	t.Helper()
+	d.stopWith(t, syscall.SIGTERM, timeout)
+}
+
+func (d *daemon) stopWith(t *testing.T, sig os.Signal, timeout time.Duration) {
+	t.Helper()
+	d.signal(t, sig)
+	if code := d.waitExit(t, timeout); code != 0 {
+		t.Fatalf("smob exited %d after %v, want 0\n%s", code, sig, d.stderr.String())
+	}
+}
+
+// signal sends sig to the process without waiting for it to exit.
+func (d *daemon) signal(t *testing.T, sig os.Signal) {
+	t.Helper()
+	if err := d.cmd.Process.Signal(sig); err != nil {
 		t.Fatalf("signal smob: %v", err)
 	}
+}
+
+// waitExit waits for the process to exit and returns its exit code.
+func (d *daemon) waitExit(t *testing.T, timeout time.Duration) int {
+	t.Helper()
 	select {
 	case <-d.done:
-		if d.waitErr != nil {
-			t.Fatalf("smob did not exit cleanly: %v\n%s", d.waitErr, d.stderr.String())
-		}
 	case <-time.After(timeout):
 		t.Fatalf("smob did not exit within %s\n%s", timeout, d.stderr.String())
 	}
+	if d.waitErr == nil {
+		return 0
+	}
+	var exitErr *exec.ExitError
+	if errors.As(d.waitErr, &exitErr) {
+		return exitErr.ExitCode()
+	}
+	t.Fatalf("wait smob: %v", d.waitErr)
+	return -1
 }
 
 // waitFor polls an observable condition. It is the only permitted sleep.
@@ -179,6 +239,21 @@ func countChunks(t *testing.T, dataDir string) int {
 	return len(chunkPaths(t, dataDir))
 }
 
+// newPaths returns the paths in after that are absent from before, in order.
+func newPaths(before, after []string) []string {
+	seen := make(map[string]bool, len(before))
+	for _, path := range before {
+		seen[path] = true
+	}
+	var added []string
+	for _, path := range after {
+		if !seen[path] {
+			added = append(added, path)
+		}
+	}
+	return added
+}
+
 func countTmpFiles(t *testing.T, dataDir string) int {
 	t.Helper()
 	var count int
@@ -200,33 +275,43 @@ func countTmpFiles(t *testing.T, dataDir string) int {
 	return count
 }
 
+// readChunkSamples decodes one chunk file.
+func readChunkSamples(t *testing.T, path string) []wireSample {
+	t.Helper()
+	f, err := os.Open(path)
+	if err != nil {
+		t.Fatalf("open %s: %v", path, err)
+	}
+	defer func() { _ = f.Close() }()
+
+	gz, err := gzip.NewReader(f)
+	if err != nil {
+		t.Fatalf("open gzip %s: %v", path, err)
+	}
+	defer func() { _ = gz.Close() }()
+
+	var samples []wireSample
+	dec := json.NewDecoder(gz)
+	for {
+		var sample wireSample
+		err := dec.Decode(&sample)
+		if errors.Is(err, io.EOF) {
+			break
+		}
+		if err != nil {
+			t.Fatalf("decode %s: %v", path, err)
+		}
+		samples = append(samples, sample)
+	}
+	return samples
+}
+
 // readSamples decodes every chunk below dataDir in path order.
 func readSamples(t *testing.T, dataDir string) []wireSample {
 	t.Helper()
 	var samples []wireSample
 	for _, path := range chunkPaths(t, dataDir) {
-		f, err := os.Open(path)
-		if err != nil {
-			t.Fatalf("open %s: %v", path, err)
-		}
-		gz, err := gzip.NewReader(f)
-		if err != nil {
-			t.Fatalf("open gzip %s: %v", path, err)
-		}
-		dec := json.NewDecoder(gz)
-		for {
-			var sample wireSample
-			err := dec.Decode(&sample)
-			if errors.Is(err, io.EOF) {
-				break
-			}
-			if err != nil {
-				t.Fatalf("decode %s: %v", path, err)
-			}
-			samples = append(samples, sample)
-		}
-		_ = gz.Close()
-		_ = f.Close()
+		samples = append(samples, readChunkSamples(t, path)...)
 	}
 	return samples
 }

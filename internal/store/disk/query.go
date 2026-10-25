@@ -12,6 +12,7 @@ import (
 	"os"
 	"path/filepath"
 	"sort"
+	"strconv"
 	"strings"
 	"time"
 
@@ -28,6 +29,9 @@ const ctxCheckInterval = 1024
 // order. It merges one UTC hour at a time, so memory and open file descriptors
 // stay proportional to the chunks in one hour rather than the whole range.
 func (s *Store) Query(ctx context.Context, q model.Query, yield func(model.Sample) error) error {
+	if err := s.CheckQuery(); err != nil {
+		return err
+	}
 	filter, err := store.NewFilter(q)
 	if err != nil {
 		return err
@@ -63,6 +67,25 @@ func (s *Store) Query(ctx context.Context, q model.Query, yield func(model.Sampl
 	return nil
 }
 
+// CheckQuery verifies that the data directory exists and is a directory. A
+// mistyped root would otherwise be indistinguishable from an empty store, so
+// the query fails with the path named instead. The check runs once, before the
+// walk: a directory or chunk that disappears while the query runs is still
+// treated as empty. Query calls it, and the query command calls it before
+// opening the output document so a bad path prints nothing.
+func (s *Store) CheckQuery() error {
+	info, err := os.Stat(s.root)
+	switch {
+	case errors.Is(err, fs.ErrNotExist):
+		return fmt.Errorf("data directory %s does not exist; set data_dir or pass --data-dir", s.root)
+	case err != nil:
+		return fmt.Errorf("data directory %s: %w", s.root, err)
+	case !info.IsDir():
+		return fmt.Errorf("data directory %s is not a directory; set data_dir or pass --data-dir", s.root)
+	}
+	return nil
+}
+
 // hourGroup is one UTC hour and the host/scope directories that may contain
 // chunks for it. Processing groups in hour order keeps output globally sorted.
 type hourGroup struct {
@@ -70,11 +93,14 @@ type hourGroup struct {
 	dirs []string
 }
 
-// hourGroups resolves the hour directories to scan. A bounded range is walked
-// hour by hour; an unbounded range needs a full tree walk because the model
-// treats a zero range boundary as unbounded.
+// hourGroups resolves the hour directories to scan. Host and scope are applied
+// first, so a filtered query never touches another host's or scope's chunks. A
+// bounded range then yields its hour paths directly. A one-sided range descends
+// only the date levels that can still contain in-range data instead of walking
+// the whole tree. Only when neither host nor scope is set does an unbounded
+// range keep the full-tree walk.
 func (s *Store) hourGroups(ctx context.Context, q model.Query) ([]hourGroup, error) {
-	if q.Range.Start.IsZero() || q.Range.End.IsZero() {
+	if q.Host == "" && q.Scope == "" && (q.Range.Start.IsZero() || q.Range.End.IsZero()) {
 		return s.walkHourGroups(ctx)
 	}
 
@@ -82,48 +108,201 @@ func (s *Store) hourGroups(ctx context.Context, q model.Query) ([]hourGroup, err
 	if err != nil {
 		return nil, err
 	}
-	type target struct{ host, scope string }
-	var targets []target
+
+	var groups []hourGroup
 	for _, host := range hosts {
 		scopes, err := s.scopes(host, q.Scope)
 		if err != nil {
 			return nil, err
 		}
 		for _, scope := range scopes {
-			targets = append(targets, target{host: host, scope: scope})
+			if err := ctx.Err(); err != nil {
+				return nil, err
+			}
+			dir := filepath.Join(s.root, host, scope)
+			var found []hourGroup
+			if q.Range.Start.IsZero() || q.Range.End.IsZero() {
+				found, err = scanHourGroups(ctx, dir, q.Range)
+			} else {
+				found = rangeHourGroups(dir, q.Range)
+			}
+			if err != nil {
+				return nil, err
+			}
+			groups = append(groups, found...)
 		}
 	}
-	if len(targets) == 0 {
-		return nil, nil
+	return mergeHourGroups(groups), nil
+}
+
+// rangeHourGroups returns one group per hour in r below one host/scope
+// directory. Both bounds are set, so the paths are built directly.
+func rangeHourGroups(dir string, r model.TimeRange) []hourGroup {
+	start := r.Start.UTC().Truncate(time.Hour)
+	last := lastHour(r.End)
+	// A pathological or inverted range can yield a non-positive or huge count,
+	// so clamp the capacity hint instead of reserving it blindly.
+	hours := int(last.Sub(start)/time.Hour) + 1
+	capacity := min(max(hours, 0), ctxCheckInterval)
+	groups := make([]hourGroup, 0, capacity)
+	for h := start; !h.After(last); h = h.Add(time.Hour) {
+		groups = append(groups, hourGroup{
+			hour: h,
+			dirs: []string{filepath.Join(dir,
+				h.Format("2006"), h.Format("01"), h.Format("02"), h.Format("15"))},
+		})
+	}
+	return groups
+}
+
+// scanHourGroups resolves the hour directories below one host/scope directory
+// when one range boundary is zero. It descends year, month, day, and hour and
+// skips any directory whose whole span is outside r, so the missing bound costs
+// only the levels that can still contain data. A directory that disappeared
+// between levels is treated as empty.
+func scanHourGroups(ctx context.Context, dir string, r model.TimeRange) ([]hourGroup, error) {
+	years, err := readComponents(dir)
+	if err != nil {
+		return nil, err
 	}
 
-	start := q.Range.Start.UTC().Truncate(time.Hour)
-	last := q.Range.End.UTC().Add(-time.Nanosecond).Truncate(time.Hour)
-
 	var groups []hourGroup
-	for h := start; !h.After(last); h = h.Add(time.Hour) {
+	for _, yearName := range years {
 		if err := ctx.Err(); err != nil {
 			return nil, err
 		}
-		dirs := make([]string, 0, len(targets))
-		for _, t := range targets {
-			dirs = append(dirs, filepath.Join(
-				s.root,
-				t.host,
-				t.scope,
-				h.Format("2006"),
-				h.Format("01"),
-				h.Format("02"),
-				h.Format("15"),
-			))
+		year, ok := pathNumber(yearName, 4)
+		if !ok {
+			continue
 		}
-		groups = append(groups, hourGroup{hour: h, dirs: dirs})
+		yearFirst := time.Date(year, time.January, 1, 0, 0, 0, 0, time.UTC)
+		yearDir := filepath.Join(dir, yearName)
+		if !hoursOverlap(yearFirst, yearFirst.AddDate(1, 0, 0).Add(-time.Hour), r) {
+			continue
+		}
+
+		months, err := readComponents(yearDir)
+		if err != nil {
+			return nil, err
+		}
+		for _, monthName := range months {
+			if err := ctx.Err(); err != nil {
+				return nil, err
+			}
+			month, ok := pathNumber(monthName, 2)
+			if !ok || month < 1 || month > 12 {
+				continue
+			}
+			monthFirst := time.Date(year, time.Month(month), 1, 0, 0, 0, 0, time.UTC)
+			monthDir := filepath.Join(yearDir, monthName)
+			if !hoursOverlap(monthFirst, monthFirst.AddDate(0, 1, 0).Add(-time.Hour), r) {
+				continue
+			}
+
+			days, err := readComponents(monthDir)
+			if err != nil {
+				return nil, err
+			}
+			for _, dayName := range days {
+				if err := ctx.Err(); err != nil {
+					return nil, err
+				}
+				day, ok := pathNumber(dayName, 2)
+				if !ok {
+					continue
+				}
+				dayFirst := time.Date(year, time.Month(month), day, 0, 0, 0, 0, time.UTC)
+				if dayFirst.Day() != day {
+					continue
+				}
+				dayDir := filepath.Join(monthDir, dayName)
+				if !hoursOverlap(dayFirst, dayFirst.AddDate(0, 0, 1).Add(-time.Hour), r) {
+					continue
+				}
+
+				hours, err := readComponents(dayDir)
+				if err != nil {
+					return nil, err
+				}
+				for _, hourName := range hours {
+					hour, ok := pathNumber(hourName, 2)
+					if !ok || hour > 23 {
+						continue
+					}
+					at := time.Date(year, time.Month(month), day, hour, 0, 0, 0, time.UTC)
+					if at.Hour() != hour || !hoursOverlap(at, at, r) {
+						continue
+					}
+					groups = append(groups, hourGroup{
+						hour: at,
+						dirs: []string{filepath.Join(dayDir, hourName)},
+					})
+				}
+			}
+		}
 	}
 	return groups, nil
 }
 
+// pathNumber parses a fixed-width numeric path component, so a stray directory
+// is not read as a date.
+func pathNumber(name string, width int) (int, bool) {
+	if len(name) != width {
+		return 0, false
+	}
+	for i := 0; i < len(name); i++ {
+		if name[i] < '0' || name[i] > '9' {
+			return 0, false
+		}
+	}
+	n, err := strconv.Atoi(name)
+	if err != nil {
+		return 0, false
+	}
+	return n, true
+}
+
+// hoursOverlap reports whether the inclusive hour span [first, last] intersects
+// r. A zero range boundary is unbounded.
+func hoursOverlap(first, last time.Time, r model.TimeRange) bool {
+	if !r.Start.IsZero() && last.Before(r.Start.UTC().Truncate(time.Hour)) {
+		return false
+	}
+	if !r.End.IsZero() && first.After(lastHour(r.End)) {
+		return false
+	}
+	return true
+}
+
+// lastHour returns the hour containing the last instant before end.
+func lastHour(end time.Time) time.Time {
+	return end.UTC().Add(-time.Nanosecond).Truncate(time.Hour)
+}
+
+// mergeHourGroups orders groups by hour and joins groups for the same hour, so
+// one merge reads every chunk in that hour at once.
+func mergeHourGroups(groups []hourGroup) []hourGroup {
+	sort.Slice(groups, func(i, j int) bool {
+		if !groups[i].hour.Equal(groups[j].hour) {
+			return groups[i].hour.Before(groups[j].hour)
+		}
+		return groups[i].dirs[0] < groups[j].dirs[0]
+	})
+
+	merged := groups[:0]
+	for _, group := range groups {
+		if n := len(merged); n > 0 && merged[n-1].hour.Equal(group.hour) {
+			merged[n-1].dirs = append(merged[n-1].dirs, group.dirs...)
+			continue
+		}
+		merged = append(merged, group)
+	}
+	return merged
+}
+
 // walkHourGroups discovers hour directories at any depth and groups them by
-// hour. It is the fallback for an unbounded start or end.
+// hour. It is the fallback for an unbounded start or end when the query selects
+// no host or scope.
 func (s *Store) walkHourGroups(ctx context.Context) ([]hourGroup, error) {
 	var groups []hourGroup
 	err := filepath.WalkDir(s.root, func(path string, d fs.DirEntry, walkErr error) error {
@@ -154,22 +333,7 @@ func (s *Store) walkHourGroups(ctx context.Context) ([]hourGroup, error) {
 		return nil, err
 	}
 
-	sort.Slice(groups, func(i, j int) bool {
-		if !groups[i].hour.Equal(groups[j].hour) {
-			return groups[i].hour.Before(groups[j].hour)
-		}
-		return groups[i].dirs[0] < groups[j].dirs[0]
-	})
-
-	merged := groups[:0]
-	for _, group := range groups {
-		if n := len(merged); n > 0 && merged[n-1].hour.Equal(group.hour) {
-			merged[n-1].dirs = append(merged[n-1].dirs, group.dirs...)
-			continue
-		}
-		merged = append(merged, group)
-	}
-	return merged, nil
+	return mergeHourGroups(groups), nil
 }
 
 // hosts returns the host directories to scan. An explicit host is trusted as a

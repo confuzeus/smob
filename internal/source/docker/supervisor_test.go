@@ -27,6 +27,25 @@ func TestStreamBackoff(t *testing.T) {
 	}
 }
 
+func TestStreamIdleTimeout(t *testing.T) {
+	tests := []struct {
+		interval time.Duration
+		want     time.Duration
+	}{
+		{0, 30 * time.Second},
+		{time.Second, 30 * time.Second},
+		{5 * time.Second, 30 * time.Second},
+		{10 * time.Second, 30 * time.Second},
+		{20 * time.Second, 60 * time.Second},
+		{time.Minute, 3 * time.Minute},
+	}
+	for _, tc := range tests {
+		if got := streamIdleTimeout(tc.interval); got != tc.want {
+			t.Errorf("streamIdleTimeout(%s) = %s, want %s", tc.interval, got, tc.want)
+		}
+	}
+}
+
 func TestStreamJitter(t *testing.T) {
 	tests := []struct {
 		d    time.Duration

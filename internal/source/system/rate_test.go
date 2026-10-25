@@ -1,6 +1,7 @@
 package system
 
 import (
+	"log/slog"
 	"math"
 	"testing"
 	"time"
@@ -76,6 +77,40 @@ func TestCPUPercent(t *testing.T) {
 				t.Errorf("percent = %v, want %v", got, tc.want)
 			}
 		})
+	}
+}
+
+func TestRateSamplesDropsOnlyDecreasedDirection(t *testing.T) {
+	// A wrapped counter restarts low on one direction only; the other direction
+	// still has a valid delta and must be emitted for this tick.
+	s := &Source{
+		logger: slog.New(slog.DiscardHandler),
+		warned: make(map[string]bool),
+		prev: &snapshot{net: netDevSnapshot{
+			"eth0": {rxBytes: 1000, txBytes: 1000},
+		}},
+	}
+	cur := &snapshot{
+		at:  time.Unix(0, 0).UTC(),
+		net: netDevSnapshot{"eth0": {rxBytes: 500, txBytes: 3000}},
+	}
+
+	samples := s.rateSamples(cur, time.Second)
+	if len(samples) != 1 {
+		t.Fatalf("rateSamples() = %+v, want only the tx sample", samples)
+	}
+	got := samples[0]
+	if got.Metric != metricNetworkTXBytesPerSecond {
+		t.Errorf("metric = %q, want %q", got.Metric, metricNetworkTXBytesPerSecond)
+	}
+	if got.Labels["interface"] != "eth0" {
+		t.Errorf("interface label = %q, want eth0", got.Labels["interface"])
+	}
+	if math.Abs(got.Value-2000) > 1e-9 {
+		t.Errorf("tx rate = %v, want 2000", got.Value)
+	}
+	if !s.warned[netWarningKey(metricNetworkRXBytesPerSecond, "eth0")] {
+		t.Error("rx reset was not recorded")
 	}
 }
 

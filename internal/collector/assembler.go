@@ -11,6 +11,7 @@ import (
 
 	"github.com/confuzeus/smob/internal/model"
 	"github.com/confuzeus/smob/internal/store"
+	"github.com/confuzeus/smob/internal/store/chunk"
 )
 
 // pendingChunk is the chunk currently being assembled for one scope. Its
@@ -108,22 +109,29 @@ func (a *assembler) write(ctx context.Context, scope string, cur *pendingChunk, 
 	}
 
 	model.SortSamples(cur.samples)
-	chunk := store.Chunk{
+	c := store.Chunk{
 		Host:    a.host,
 		Scope:   scope,
 		Start:   cur.start,
 		End:     end,
 		Samples: cur.samples,
 	}
-	if err := a.store.Write(ctx, chunk); err != nil {
+	key, err := chunk.Key(c.Host, c.Scope, c.Start, c.End)
+	if err != nil {
+		return fmt.Errorf("chunk key for %s starting %s: %w", scope, cur.start.Format(time.RFC3339), err)
+	}
+	if err := a.store.Write(ctx, c); err != nil {
 		return fmt.Errorf("write %s chunk starting %s: %w", scope, cur.start.Format(time.RFC3339), err)
 	}
+	a.logger.Info("chunk written", "key", key, "samples", len(c.Samples))
 	return nil
 }
 
 // partialEnd returns a second-aligned end that is after every sample in cur and
-// after the flush time. A partial chunk therefore stays a valid half-open
-// window without spilling into the next chunk's filename.
+// after the flush time, clamped to the chunk window end so a partial chunk stays
+// a valid half-open window. A flush inside the window keeps its actual end. A
+// stalled scope, or SIGTERM after a long stall, would otherwise report an end
+// beyond start+interval and spill into the next hour directory.
 func partialEnd(cur *pendingChunk, at time.Time) time.Time {
 	end := at.UTC().Truncate(time.Second).Add(time.Second)
 	for _, sample := range cur.samples {
@@ -134,6 +142,10 @@ func partialEnd(cur *pendingChunk, at time.Time) time.Time {
 	}
 	if !end.After(cur.start) {
 		end = cur.start.Add(time.Second)
+	}
+	// cur.end is the window end, start+interval; never report past it.
+	if end.After(cur.end) {
+		end = cur.end
 	}
 	return end
 }
