@@ -14,6 +14,7 @@ apply across the codebase.
 | [docs/IMPLEMENTATION.md](docs/IMPLEMENTATION.md) | Internal design: principles, sample schema, chunk/storage layout, delivery phases, risks, testing strategy, repository layout, and TODO list. |
 | [.agents/skills/go-best-practices/SKILL.md](.agents/skills/go-best-practices/SKILL.md) | Go conventions, dependency policy, error handling, concurrency, and the definition of done. |
 | [.agents/skills/integration-testing/SKILL.md](.agents/skills/integration-testing/SKILL.md) | Test contract, harness rules, and what may be tested as a pure function. |
+| [.agents/skills/release/SKILL.md](.agents/skills/release/SKILL.md) | Commit, SEMVER tag, and `RELEASE_NOTES.md` workflow for every completed change. |
 | [justfile](justfile) | Authoritative development commands. |
 
 `README.md` is canonical for user-visible behavior. `docs/IMPLEMENTATION.md` is
@@ -72,6 +73,10 @@ See `docs/IMPLEMENTATION.md` for the full repository layout.
 
 - Load `go-best-practices` before writing or reviewing Go, and
   `integration-testing` before writing or changing tests.
+- Load `release` before landing a completed change: every change is committed,
+  tagged with a SEMVER version, and recorded in `RELEASE_NOTES.md`. The tag is
+  the only version source; do not hand-edit a version constant. Do not push or
+  publish releases unless the user asks.
 - User-visible changes update `README.md`. Internal design changes update
   `docs/IMPLEMENTATION.md` and its TODO list.
 - The metric catalogue and CLI reference live in `README.md`. Do not duplicate
@@ -99,4 +104,8 @@ See `docs/IMPLEMENTATION.md` for the full repository layout.
 - [ ] New configuration fields are validated with field-named errors.
 - [ ] `README.md` and `docs/IMPLEMENTATION.md` reflect the change, including
       the TODO list when a phase item is completed.
+- [ ] `RELEASE_NOTES.md` has a section for the new version and the release
+      history list names it.
+- [ ] One conventional commit contains the change and the notes, and an
+      annotated `vX.Y.Z` tag points at it. Nothing was pushed.
 - [ ] Release builds remain `CGO_ENABLED=0`.

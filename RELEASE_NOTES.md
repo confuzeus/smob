@@ -1,3 +1,35 @@
+# smob v0.2.2 — Release Workflow
+
+v0.2.2 adds a repository-level release workflow for agents and contributors. It
+is a process and documentation release: the `smob` binary, its configuration,
+its metrics, and its storage formats are unchanged from v0.2.1.
+
+## Highlights
+
+- **Release skill.** `.agents/skills/release/SKILL.md` defines the workflow every
+  completed change follows: verify the tree, choose the next SEMVER version from
+  the latest tag, prepend a section to this file, commit the change and the notes
+  together, and create an annotated `vX.Y.Z` tag on that commit.
+- **Version source is the tag.** The skill records that `justfile` derives
+  `VERSION` from `git describe`, so there is no version constant to edit and no
+  second place for the version to drift.
+- **Project rules.** `AGENTS.md` lists the skill in its reading table, makes the
+  workflow a working rule, and checks the notes, commit, and tag in its
+  definition of done.
+
+## Upgrade notes
+
+- None. No configuration field, CLI flag, metric, chunk format, or storage key
+  changed. Existing data directories and buckets remain readable.
+
+## Known limitations
+
+- The workflow is local only. This repository has no configured remote, so the
+  skill stops after creating the commit and tag; publishing the release, its
+  binaries, and its image remains a maintainer action.
+
+---
+
 # smob v0.2.1 — Initial Release
 
 **smob** (Simple Monitoring Observability Tool) is a lightweight observability
@@ -20,6 +52,8 @@ local `v0.2.0` tag.
   retention, `stats`, and aggregation.
 - **v0.2.1** — first release prepared for publication; includes everything
   above and the storage, source, CLI, documentation, and CI audit fixes.
+- **v0.2.2** — release workflow skill for commits, SEMVER tags, and release
+  notes; process and documentation only, with no runtime changes.
 
 ## Highlights
 
