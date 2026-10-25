@@ -1,3 +1,20 @@
+# smob v0.2.5 — Workflow Lint Fix
+
+This release is a CI-only fix. The `smob` binary, its configuration, its
+metrics, and its storage formats are unchanged from v0.2.4, so there is no
+upgrade action.
+
+## Highlights
+
+- **None.** The only change is to the CI workflow, which now passes the
+  workflow lint gate.
+
+## Upgrade notes
+
+- None.
+
+---
+
 # smob v0.2.4 — Release Automation and CI Hardening
 
 Every annotated `vX.Y.Z` tag now publishes a GitHub release and a multi-arch

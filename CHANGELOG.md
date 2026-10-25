@@ -5,6 +5,15 @@ documentation, and process. User-visible features, behavior changes, bug fixes,
 and upgrade notes live in [RELEASE_NOTES.md](RELEASE_NOTES.md). Every tagged
 release has one entry here, newest first, and the version matches the git tag.
 
+## v0.2.5 — Workflow Lint Fix
+
+Nothing user-visible changed; the binary is identical to v0.2.4. See
+[RELEASE_NOTES.md](RELEASE_NOTES.md).
+
+- CI: the `wait for MinIO` step used `for i in $(seq 1 30)` without reading `i`,
+  which shellcheck reported as SC2034 and actionlint treated as an error, so
+  `just lint-workflows` failed. The counter is now the throwaway name `_`.
+
 ## v0.2.4 — Release Automation and CI Hardening
 
 User-visible distribution changed: every annotated tag now publishes the release

@@ -270,7 +270,7 @@ jobs:
             server /tmp/minio --console-address :9001
       - name: wait for MinIO
         run: |
-          for i in $(seq 1 30); do
+          for _ in $(seq 1 30); do
             if curl -fsS -o /dev/null http://127.0.0.1:9000/minio/health/ready 2>/dev/null; then
               echo "MinIO is ready"
               exit 0
