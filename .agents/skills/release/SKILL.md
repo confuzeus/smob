@@ -1,6 +1,6 @@
 ---
 name: release
-description: Use when a change to smob is complete and ready to land. Runs the commit, SEMVER tag, and RELEASE_NOTES.md workflow so every completed change ships as a tagged release.
+description: Use when a change to smob is complete and ready to land. Runs the commit, SEMVER tag, and release-record workflow (RELEASE_NOTES.md and CHANGELOG.md) so every completed change ships as a tagged release.
 ---
 
 # Release Workflow for smob
@@ -8,7 +8,10 @@ description: Use when a change to smob is complete and ready to land. Runs the c
 ## Stance
 
 - Every completed change is a release. One coherent change becomes one commit,
-  one `RELEASE_NOTES.md` section, and one annotated SEMVER tag.
+  one release-record update, and one annotated SEMVER tag.
+- The release record has two audiences. `RELEASE_NOTES.md` describes changes a
+  user can observe; `CHANGELOG.md` records the developer-facing history of
+  every release.
 - The version lives in git tags only. The `justfile` derives `VERSION` from
   `git describe --tags`, so there is no version constant to edit in source.
 - The tag points at the commit that contains both the change and its release
@@ -79,16 +82,25 @@ git describe --tags --abbrev=0 --match 'v*'
 - Tag format is always `vMAJOR.MINOR.PATCH`, lowercase `v`, no suffix, no build
   metadata.
 
-## Update RELEASE_NOTES.md
+## Update the release record
 
-`RELEASE_NOTES.md` is the cumulative release record. Add the new release at the
-top; never rewrite or delete an older section.
+Two files record a release, split by audience:
+
+- `RELEASE_NOTES.md` — what changed for someone running smob.
+- `CHANGELOG.md` — what changed inside the repository, for contributors.
+
+Every release gets exactly one `CHANGELOG.md` entry. A release with user-visible
+changes also gets a `RELEASE_NOTES.md` section; a release without them gets a
+short stub there instead. Both files are cumulative and newest first: prepend to
+both, and never rewrite or delete an older entry.
+
+### `RELEASE_NOTES.md`
 
 ```markdown
 # smob vX.Y.Z — <Short Title>
 
-<One short paragraph: what changed and why it matters. Name the user-visible
-effect, or say plainly that there is none.>
+<One short paragraph: what changed for a user of the binary and why it matters.
+Say plainly when nothing user-visible changed.>
 
 ## Highlights
 
@@ -111,19 +123,41 @@ Omit the section entirely otherwise.>
 Rules for the section:
 
 - Prepend it above the existing `# smob …` heading, separated by a `---` rule.
-- Add one line for the new version to the existing `## Release history` list.
-  That list is chronological, oldest first, so append; it is the only part of
-  an older section you may touch.
 - Write for an operator: name the new or changed command, flag, config field,
   metric, or storage behavior. "Various improvements" is not a release note.
-- Keep it accurate and small. A documentation-only or tooling-only release says
-  so and records that the binary is unchanged.
-- Do not repeat the metric catalogue or CLI reference from `README.md`; link to
-  it when a reader needs it.
+- Include only what a user can observe: features, behavior changes, bug fixes,
+  breaking changes, upgrade actions, and new or removed limitations.
+- Exclude repository internals: skills, `AGENTS.md`, CI, tests, internal
+  refactors with no behavior change, commit hashes, development tags, and build
+  instructions already in `README.md` or `docs/quickstart.md`.
+- Do not repeat the metric catalogue, CLI reference, quick start, storage
+  layout, documentation index, or license from `README.md`; link to it when a
+  reader needs it.
+- Keep it accurate and small. An internal-only release gets a two- or three-line
+  section saying the binary is unchanged and there is no upgrade action; do not
+  list the tooling changes there.
+
+### `CHANGELOG.md`
+
+```markdown
+## vX.Y.Z — <Short Title>
+
+<Whether anything user-visible changed, and a link to `RELEASE_NOTES.md` when
+it did.>
+
+- <Developer-facing change: tooling, tests, CI, build, docs, or repository
+  process.>
+```
+
+- Add one entry for every release, including internal-only and documentation
+  releases, above the previous entry.
+- Record what a contributor needs: the changed package or area, a new
+  dependency or test service, a migration of internal layout, or a change to
+  the release process. Do not restate the user-facing highlights.
 
 ## Commit
 
-Stage only the files in this change, including `RELEASE_NOTES.md`:
+Stage only the files in this change, including both release-record files:
 
 ```sh
 git add <changed files>
@@ -185,10 +219,10 @@ just test
 git describe --tags --abbrev=0 --match 'v*'      # v0.2.1
 
 # feat -> minor -> v0.3.0
-# Edit RELEASE_NOTES.md: prepend "# smob v0.3.0 — Sorted Query Output" and
-# append the v0.3.0 line to "## Release history".
+# Edit RELEASE_NOTES.md: prepend "# smob v0.3.0 — Sorted Query Output".
+# Edit CHANGELOG.md: prepend the v0.3.0 entry.
 
-git add internal/query docs/README-links README.md RELEASE_NOTES.md
+git add internal/query docs/README-links README.md RELEASE_NOTES.md CHANGELOG.md
 git commit -m "feat(query): add --sort for deterministic output" \
   -m "Sort samples by timestamp, metric, or label so scripts can diff query output."
 git tag -a v0.3.0 -m "smob v0.3.0: query --sort and release notes"
@@ -205,7 +239,7 @@ git status --short
 - **A tag exists but the notes section is missing.** The tag is immutable. Add
   the missing section under the next patch version and say what happened; do
   not rewrite history.
-- **The change is only `RELEASE_NOTES.md`.** Still commit and tag it; the
+- **The change is only the release record.** Still commit and tag it; the
   release record is part of the contract.
 - **The tree is dirty with unrelated work.** Commit nothing until the user says
   what to do with it.
@@ -220,14 +254,17 @@ git status --short
 - `git add -A` or `git commit -am` in a tree with unrelated changes.
 - Pushing, opening a GitHub release, or publishing artifacts and images.
 - Writing "misc fixes" or a changelog that just repeats commit subjects.
+- Putting repository, tooling, or process detail in `RELEASE_NOTES.md`.
+- Listing user-facing highlights in `CHANGELOG.md`, or leaving a release out of
+  it because nothing was user-visible.
 - Tagging a tree whose tests fail because "the tag is only local".
 
 ## Definition of done
 
 - [ ] `gofmt -l .` is empty and the applicable `just` checks pass.
 - [ ] The version is the correct SEMVER bump from the latest tag.
-- [ ] `RELEASE_NOTES.md` has a new top section and a history line for the
-      version; older sections are unchanged except that list.
+- [ ] `CHANGELOG.md` has one entry for the version, and `RELEASE_NOTES.md` has
+      a section for it, including the stub when nothing user-visible changed.
 - [ ] One conventional commit contains the change and the notes.
 - [ ] An annotated `vX.Y.Z` tag points at that commit.
 - [ ] `git status` is clean and nothing was pushed.
