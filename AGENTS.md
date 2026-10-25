@@ -31,7 +31,9 @@ is registered with the collector but disabled by default; enabling it fails
 startup when the socket is unreachable. `tail` remains a stub; live tail, chunk
 indexing, and multi-host aggregation are v0.3 items. The README describes the
 user-facing contract, and `docs/quickstart.md` and `docs/configuration.md` are
-the operator entry points.
+the operator entry points. Pushing an annotated tag publishes the GitHub release
+(binaries, checksums, and notes) and the GHCR image through
+`.github/workflows/release.yml`; release notes come from `RELEASE_NOTES.md`.
 
 ## Commands
 
@@ -41,12 +43,15 @@ the operator entry points.
 | --- | --- |
 | Build the static binary | `just build` (`CGO_ENABLED=0`) |
 | Format Go source | `just fmt` |
+| Check formatting without writing | `just fmt-check` |
 | Vet and static analysis | `just vet`, `just lint` |
+| Lint the workflow files | `just lint-workflows` (actionlint) |
 | Pure-function tests | `just test-unit` |
 | Fast integration suite | `just test` |
 | Extended suite (MinIO and Docker, strict mode) | `just test-all` |
 | Race-enabled integration suite | `just test-race` (requires cgo) |
 | Build the container image | `just docker` |
+| Preview one release's notes | `just release-notes vX.Y.Z` (prints its title and body) |
 | Cross-compile release binaries | `just release` |
 
 Release binaries stay `CGO_ENABLED=0`. The race build is a CI/testing artifact
@@ -57,16 +62,19 @@ only.
 | Path | Purpose |
 | --- | --- |
 | `cmd/smob/` | Cobra root and subcommand wiring. |
+| `cmd/release-notes/` | Release-notes extractor command used by the release workflow. |
 | `internal/model/` | Samples, queries, label matchers, and time ranges. |
 | `internal/config/` | Strict YAML configuration and validation. |
 | `internal/store/` | `Store`/`Chunk` contract, chunk encoding, and disk/S3 backends. |
 | `internal/source/` | System, process, and Docker metric sources. |
 | `internal/collector/` | Scheduler and chunk assembler. |
 | `internal/query/` | Filtering, aggregation, and output formatting. |
+| `internal/releasenotes/` | Release-notes section extraction and its tests. |
 | `test/integration/` | Black-box CLI tests against real dependencies. |
 | `docs/` | Design docs and operator guides (quickstart, configuration, S3, Docker). |
 | `compose.yaml` | Docker Compose deployment example. |
 | `contrib/systemd/smob.service` | systemd unit for a host install. |
+| `.github/workflows/release.yml` | Tag-triggered release and GHCR image publish. |
 
 See `docs/IMPLEMENTATION.md` for the full repository layout.
 
@@ -78,7 +86,12 @@ See `docs/IMPLEMENTATION.md` for the full repository layout.
   tagged with a SEMVER version, and recorded in `CHANGELOG.md`. A change users
   can observe also updates `RELEASE_NOTES.md`; repository and process detail
   stays in `CHANGELOG.md`. The tag is the only version source; do not hand-edit
-  a version constant. Do not push or publish releases unless the user asks.
+  a version constant. Do not push or publish; that is the maintainer's action.
+- Pushing the annotated tag is the publish action and a maintainer decision; the
+  agent never pushes. The release body and the image both derive from the tagged
+  tree, and `RELEASE_NOTES.md` is the single source for the release body. Do not
+  create or edit a GitHub release or image tag by hand; re-run the workflow
+  instead.
 - User-visible changes update `README.md`. Internal design changes update
   `docs/IMPLEMENTATION.md` and its TODO list.
 - The metric catalogue and CLI reference live in `README.md`. Do not duplicate
@@ -108,6 +121,8 @@ See `docs/IMPLEMENTATION.md` for the full repository layout.
       the TODO list when a phase item is completed.
 - [ ] `CHANGELOG.md` has an entry for the new version, and `RELEASE_NOTES.md`
       has a section for it (a short stub when nothing user-visible changed).
+- [ ] `just release-notes vX.Y.Z` prints the new section's title and body.
 - [ ] One conventional commit contains the change and the notes, and an
-      annotated `vX.Y.Z` tag points at it. Nothing was pushed.
+      annotated `vX.Y.Z` tag points at it. Nothing was pushed; the maintainer's
+      push publishes the release and image automatically.
 - [ ] Release builds remain `CGO_ENABLED=0`.

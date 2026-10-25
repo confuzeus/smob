@@ -1,3 +1,28 @@
+# smob v0.2.4 — Release Automation and CI Hardening
+
+Every annotated `vX.Y.Z` tag now publishes a GitHub release and a multi-arch
+container image built from that tag. The `smob` binary, its configuration, its
+metrics, and its storage formats are unchanged from v0.2.3, so there is no
+upgrade action.
+
+## Highlights
+
+- **Downloadable release binaries.** Each release carries `smob-linux-amd64` and
+  `smob-linux-arm64`, both static (`CGO_ENABLED=0`), with `SHA256SUMS` and
+  `LICENSE` on the [Releases page](https://github.com/confuzeus/smob/releases).
+  Verify the download with `sha256sum -c SHA256SUMS`, run from the directory
+  that holds the binary and the checksum file.
+- **Multi-arch container image.** `ghcr.io/confuzeus/smob:vX.Y.Z` and
+  `ghcr.io/confuzeus/smob:latest` are published for linux/amd64 and linux/arm64
+  and run as UID 65532. Required mounts and permissions are in
+  [docs/docker.md](docs/docker.md).
+
+## Upgrade notes
+
+- None. The binary, configuration, metrics, and storage formats are unchanged.
+
+---
+
 # smob v0.2.3 — Release Notes Maintenance
 
 This release is documentation only. The `smob` binary, its configuration, its

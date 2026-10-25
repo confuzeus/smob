@@ -305,7 +305,8 @@ A narrow exception is allowed for pure functions whose edge cases cannot be reac
 - **Assertions** cover schema, labels, ordering, chunk boundaries, and plausible ranges — not exact live values. Use wide tolerances for rates and never require nonzero traffic on an idle runner.
 - **Golden files** cover stable output: help text, config dumps, and parser output from fixtures. Live `/proc` samples are validated structurally, not compared byte-for-byte.
 - **Race detector** applies to the `smob` binary under test (`SMOB_TEST_RACE=1`), not only to the Go test process. The race binary requires cgo/gcc and is a CI artifact only; release binaries remain `CGO_ENABLED=0`.
-- **CI**: lint, fast suite, race suite, and cross-builds on linux/amd64 and linux/arm64. The Alpine job runs the unit and fast suites in an Alpine container: a musl userland on the host's kernel, not a different kernel. The `extended` job starts pinned MinIO, asserts the runner's Docker daemon and pre-pulls the `busybox:1.36` fixture image, then runs the whole extended suite with `SMOB_TEST_STRICT=1`, `SMOB_TEST_S3_*`, and `SMOB_TEST_DOCKER_SOCKET` set. It covers the S3 suite including the network-partition spool drain and disk/S3 equivalence, plus the Docker CLI and package suites. A missing or unreachable MinIO or Docker service fails the job rather than skipping; failure and cancellation dump container logs and remove leftover `smob-*` containers. The fast and race jobs set the same Docker socket but stay non-strict, so Docker-gated tests run when the runner daemon is reachable and skip with a reason when it is not. Arm64 is build-only; integration runs on amd64. Actions are pinned to immutable commit SHAs (version in a trailing comment) and `just` to a fixed release, every job has a timeout, `setup-go` reads its toolchain from `go.mod`, pull-request runs supersede earlier ones, and a `tidy` job fails when `go mod tidy` would change `go.mod`/`go.sum`.
+- **CI**: lint, fast suite, race suite, and cross-builds on linux/amd64 and linux/arm64. The Alpine job runs the unit and fast suites in an Alpine container as the invoking user — not root, so permission tests such as the read-only-parent-directory case still run rather than skip — and first guards that its pinned toolchain image matches `go.mod`; the container is a musl userland on the host's kernel, not a different kernel. The `extended` job starts digest-pinned MinIO, asserts the runner's Docker daemon and pre-pulls the digest-pinned `busybox:1.36` fixture image, then runs the whole extended suite with `SMOB_TEST_STRICT=1`, `SMOB_TEST_S3_*`, and `SMOB_TEST_DOCKER_SOCKET` set. It covers the S3 suite including the network-partition spool drain and disk/S3 equivalence, plus the Docker CLI and package suites. A missing or unreachable MinIO or Docker service fails the job rather than skipping; failure and cancellation dump container logs and remove leftover `smob-*` containers. The fast and race jobs set the same Docker socket but stay non-strict, so Docker-gated tests run when the runner daemon is reachable and skip with a reason when it is not. Arm64 is build-only; integration runs on amd64. Actions, MinIO, BuildKit, and the busybox fixture are pinned to immutable references: actions to commit SHAs (version in a trailing comment), the images to digests, and `just` to a fixed release. `just` is also the single source of the lint commands — CI runs `just fmt-check`, `just vet`, `just lint`, and `just lint-workflows`, so actionlint (pinned by version in the justfile) is the workflow linter. Every job has a timeout, `setup-go` reads its toolchain from `go.mod`, pull-request runs supersede earlier ones, and a `tidy` job fails when `go mod tidy` would change `go.mod`/`go.sum`.
+- **Release lane** (`.github/workflows/release.yml`): publication is automated from a pushed annotated `v*` tag, or from a manual dispatch naming an existing tag. Before anything is published the workflow proves the tag is annotated and that its commit is an ancestor of `master`, re-runs the fast gate (`just fmt-check`, `just vet`, `just test`), and extracts that tag's section from `RELEASE_NOTES.md` with `cmd/release-notes` (the same extraction `just release-notes <tag>` previews locally). It then cross-builds the static binaries with fixed metadata — `VERSION` is the tag, `COMMIT` the tagged commit's short hash, and `DATE` that commit's committer time in UTC — writes `SHA256SUMS`, pushes the `linux/amd64` and `linux/arm64` image to GHCR as `:<tag>` and `:latest`, and creates the GitHub release with the two binaries, `SHA256SUMS`, and `LICENSE` only after that push succeeds. Re-runs converge: an existing release is edited and its assets re-uploaded with `--clobber`, so a failure after publication is repaired rather than worked around.
 
 ## 9. Repository Layout
 
@@ -314,9 +315,11 @@ cmd/smob/main.go               # entry point, process signal handling
 cmd/smob/root.go               # cobra root, shared flags, subcommand wiring
 cmd/smob/collect.go            # collect command, source registry, retention loop
 cmd/smob/store.go              # storage backend factory shared by collect, query, and stats
+cmd/release-notes/             # release-notes section extractor used by the release workflow
 internal/model/                # Sample, Query, LabelMatcher, TimeRange
 internal/config/               # config parsing + validation
 internal/collector/            # scheduler, chunk assembler
+internal/releasenotes/         # release-notes section extraction and its tests
 internal/source/system/        # /proc/stat, meminfo, net/dev
 internal/source/process/       # /proc/[pid]/...
 internal/source/docker/        # Engine client, discovery supervisor, stats acquisition
@@ -335,6 +338,7 @@ docs/s3.md, docs/docker.md     # S3/MinIO and container deployment guides
 contrib/systemd/smob.service   # systemd unit
 compose.yaml                   # Docker Compose deployment
 Dockerfile                     # FROM scratch, static binary, CA bundle
+.github/workflows/             # ci.yml lint/test/extended/artifact lanes, release.yml tag publication
 ```
 
 ---
@@ -431,29 +435,52 @@ Dockerfile                     # FROM scratch, static binary, CA bundle
 - [x] Run the extended suite in CI with MinIO and Docker; keep strict mode.
 - [ ] Tag `v0.2.0`; publish binaries and the Docker image.
 
-  **Blocked on a remote and publication credentials.** The annotated `v0.2.0`
-  tag exists locally on commit `85ff05e`, the release-preparation commit. The
-  documentation-only commit that added the v0.3 scoping draft is later than the
-  tag and is not part of `v0.2.0`. The ignored `dist/`
-  directory holds `smob-linux-amd64` and `smob-linux-arm64`, and the local
-  `smob:v0.2.0` image was built and verified. This checkout has no `origin`
-  remote, no `gh`, and no registry login, so no tag, asset, or image has been
-  pushed or published. To finish, a maintainer must run:
+  **Publication is automated; the remaining steps are a maintainer's.**
+  Pushing an annotated `v*` tag now runs
+  [`.github/workflows/release.yml`](../.github/workflows/release.yml), which
+  publishes the GitHub release (binaries, `SHA256SUMS`, `LICENSE`) and the
+  multi-arch GHCR image from that tag. The `gh release create` and
+  `docker tag`/`docker push` commands this item used to spell out are CI's job
+  now. A maintainer must add `origin`, push `master`, then push the tag:
 
   ```sh
   git remote add origin <repository-url>
   git push origin master
-  git push origin v0.2.0
-  gh release create v0.2.0 dist/smob-linux-amd64 dist/smob-linux-arm64 \
-    --title "smob v0.2.0" --notes-file docs/releases/v0.2.0.md
-  docker tag smob:v0.2.0 <registry>/smob:v0.2.0
-  docker push <registry>/smob:v0.2.0
+  git push origin <newest-tag>
   ```
 
-  Rebuild the ignored artifacts with `VERSION=v0.2.0 just release` and the
-  image with `VERSION=v0.2.0 just docker` if they are no longer present. Mark
-  this item complete only after the push, release, and image publication
-  commands succeed. Release notes are in
+  Four one-time repository settings must already hold, or a correct tag still
+  fails:
+
+  - Settings → Actions → General → Workflow permissions must allow the
+    workflow token to write, matching the declared `contents: write` and
+    `packages: write`; a repository or organization that caps the token at
+    read-only fails at the GHCR push or the release step.
+  - Tag protection for `v*`, if enabled, must allow the maintainer's tag push:
+    the workflow publishes a tag, it never creates one.
+  - After the first image push, the `smob` GHCR package must be made public
+    once (Package settings → visibility), or an anonymous
+    `docker pull ghcr.io/confuzeus/smob:vX.Y.Z` fails though the push
+    succeeded.
+  - The remote must be named `origin`, with `master` pushed before the tag,
+    because the workflow fetches `origin master` to prove the tag commit is an
+    ancestor of it.
+
+  The tag to push is not `v0.2.0`: it predates the per-release sections in
+  `RELEASE_NOTES.md`, so the workflow refuses it by design, because it extracts
+  the pushed tag's section and fails when the section is missing or empty.
+  Publish the next tag instead, cut after that tag's section exists.
+
+  The annotated `v0.2.0` tag exists locally on commit `85ff05e`, the
+  release-preparation commit. The documentation-only commit that added the v0.3
+  scoping draft is later than the tag and is not part of `v0.2.0`. This
+  checkout still has no `origin` remote, no `gh`, and no registry login, so no
+  tag, asset, or image has been pushed or published. The ignored `dist/`
+  directory holds `smob-linux-amd64` and `smob-linux-arm64`, and the local
+  `smob:v0.2.0` image was built and verified; rebuild them with
+  `VERSION=v0.2.0 just release` and `VERSION=v0.2.0 just docker` if they are no
+  longer present. Mark this item complete only after the workflow publishes the
+  release and image. Release notes are in
   [`docs/releases/v0.2.0.md`](releases/v0.2.0.md).
 
 - [ ] Post-release: collect feedback and scope v0.3 (live tail, chunk index, multi-host query).

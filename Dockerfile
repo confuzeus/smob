@@ -1,10 +1,16 @@
 # Pinned to the toolchain in go.mod (go 1.27.3): the floating 1.27-alpine tag
 # moves with each patch release, so a rebuild could silently change compilers.
-FROM golang:1.27.3-alpine AS build
+# The stage always runs on the build platform and cross-compiles to
+# TARGETOS/TARGETARCH, so a multi-arch build needs no emulation.
+FROM --platform=$BUILDPLATFORM golang:1.27.3-alpine AS build
 
 ARG VERSION=dev
 ARG COMMIT=none
 ARG DATE=unknown
+# Supplied by buildx for a multi-platform build; a plain docker build sets them
+# to the daemon's platform.
+ARG TARGETOS
+ARG TARGETARCH
 
 RUN apk add --no-cache ca-certificates
 
@@ -13,7 +19,7 @@ COPY go.mod go.sum ./
 RUN go mod download
 COPY . .
 
-RUN CGO_ENABLED=0 go build -trimpath \
+RUN CGO_ENABLED=0 GOOS=${TARGETOS} GOARCH=${TARGETARCH} go build -trimpath \
     -ldflags "-s -w -X main.version=${VERSION} -X main.commit=${COMMIT} -X main.date=${DATE}" \
     -o /smob ./cmd/smob
 

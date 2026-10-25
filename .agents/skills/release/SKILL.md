@@ -16,10 +16,15 @@ description: Use when a change to smob is complete and ready to land. Runs the c
   `git describe --tags`, so there is no version constant to edit in source.
 - The tag points at the commit that contains both the change and its release
   notes. Never tag a tree that does not describe itself.
-- Do not move, reuse, or delete a tag. A published tag is immutable; fix forward
-  with the next patch version.
-- Do not push. No remote is configured, and publishing commits, tags, release
-  artifacts, and images is a maintainer decision.
+- Do not move, reuse, or delete a tag. A release is immutable in practice: fix
+  forward with the next patch version and never re-tag. Re-running the workflow
+  updates the existing release in place, so a broken run is repaired, not
+  re-released.
+- Do not push. No remote is configured, and pushing is the maintainer's action.
+  It is also the publish step: pushing `vX.Y.Z` triggers
+  `.github/workflows/release.yml`, which creates the GitHub release from that
+  tag's `RELEASE_NOTES.md` section and pushes the container image. Nobody
+  creates a release by hand.
 - An explicit user instruction wins: "commit but do not tag yet" or "this is
   WIP" means commit without notes and without a tag, and finish the workflow
   when the change is green. Never invent an exception yourself.
@@ -46,9 +51,13 @@ gofmt -l .                              # must print nothing
 just vet                                # go vet -tags=integration ./...
 just lint                               # staticcheck -tags=integration ./...
 just test                               # unit tests, then the fast integration suite
+just release-notes vX.Y.Z               # prints the section's title and body
 go mod tidy && git diff --exit-code -- go.mod go.sum
 ```
 
+- `just release-notes vX.Y.Z` must print the section's title and body; it exits
+  non-zero when `RELEASE_NOTES.md` has no section for the tag, so a passing gate
+  proves the section exists.
 - Storage, Docker, collector, or concurrency changes also need
   `just test-all` with MinIO and Docker available, and `just test-race` when the
   change touches concurrency. If the services are unavailable, say so and let
@@ -185,16 +194,38 @@ style (`smob vX.Y.Z: <summary>`):
 git tag -a vX.Y.Z -m "smob vX.Y.Z: <one-line summary>"
 ```
 
-Then verify before reporting:
+Then preview and verify before reporting:
 
 ```sh
+just release-notes vX.Y.Z              # title and body the release will publish
 git tag -n1 -l vX.Y.Z                  # tag exists and points at the new commit
 git describe --tags --abbrev=0         # reports vX.Y.Z
 git status --short                     # clean
 ```
 
-`git describe` may later report a suffix such as `v0.2.2-1-gabc1234` for commits
-after the tag. That is expected: the tag marks the release, not the branch tip.
+The preview must succeed before the tag is pushed. `git describe` may later
+report a suffix such as `v0.2.2-1-gabc1234` for commits after the tag. That is
+expected: the tag marks the release, not the branch tip.
+
+Pushing the tag is the maintainer's call. The agent reports the tag and never
+pushes it.
+
+### What the tag publishes
+
+A push of `vX.Y.Z` starts `.github/workflows/release.yml`, which verifies the
+tag is annotated and on `master`, re-runs the fast gate, then publishes two
+artifacts derived from the tagged tree:
+
+- **GitHub release.** Title and body come from that tag's `RELEASE_NOTES.md`
+  section. The release is titled `smob vX.Y.Z — <Title>` and carries
+  `smob-linux-amd64`, `smob-linux-arm64`, `SHA256SUMS`, and `LICENSE`.
+- **Container image.** `ghcr.io/confuzeus/smob:vX.Y.Z` and
+  `ghcr.io/confuzeus/smob:latest`, for `linux/amd64` and `linux/arm64`, built
+  with the tag's version, commit, and date.
+
+Both come from the tagged commit, so the notes, binaries, and image describe one
+release. Publication is repeatable: a re-run reads the same inputs and converges
+on the same release instead of creating another.
 
 ## Report
 
@@ -203,6 +234,8 @@ Tell the user, in one short block:
 - The version and tag message.
 - The commit subject and short hash.
 - That the working tree is clean and nothing was pushed.
+- That pushing `vX.Y.Z` will publish the GitHub release and the container image,
+  so the maintainer has the exact tag to push.
 - Any check that was skipped and why (`test-all` without MinIO/Docker, for
   example).
 
@@ -226,6 +259,7 @@ git add internal/query docs/README-links README.md RELEASE_NOTES.md CHANGELOG.md
 git commit -m "feat(query): add --sort for deterministic output" \
   -m "Sort samples by timestamp, metric, or label so scripts can diff query output."
 git tag -a v0.3.0 -m "smob v0.3.0: query --sort and release notes"
+just release-notes v0.3.0
 git tag -n1 -l v0.3.0
 git describe --tags --abbrev=0
 git status --short
@@ -236,9 +270,16 @@ git status --short
 - **The user asks for several unrelated changes in one task.** Land them as
   separate commits, each with its own tag and notes section, in the order they
   were completed.
-- **A tag exists but the notes section is missing.** The tag is immutable. Add
-  the missing section under the next patch version and say what happened; do
-  not rewrite history.
+- **A tag exists but the notes section is missing.** The tag is immutable, and
+  the release workflow refuses to publish a tag with no section. Add the missing
+  section under the next patch version and say what happened; do not rewrite
+  history.
+- **A tag predates the per-release `RELEASE_NOTES.md` sections.** `v0.1.0` and
+  `v0.2.0` are such tags: their notes live in `CHANGELOG.md` and
+  `docs/releases/v0.2.0.md`. The workflow extracts the pushed tag's section and
+  refuses a missing or empty one, so the job fails before it publishes anything.
+  Publish the next tag that carries a section; never backfill a section into an
+  immutable tag or hand-create a release for an old tag.
 - **The change is only the release record.** Still commit and tag it; the
   release record is part of the contract.
 - **The tree is dirty with unrelated work.** Commit nothing until the user says
@@ -252,7 +293,10 @@ git status --short
 - Using `git tag -f`, deleting a tag, or reusing a version.
 - Hand-editing a version constant; the tag is the only source of truth.
 - `git add -A` or `git commit -am` in a tree with unrelated changes.
-- Pushing, opening a GitHub release, or publishing artifacts and images.
+- Creating or editing a GitHub release or image tag by hand. The workflow does
+  it; re-run the workflow instead.
+- Pushing a tag whose `RELEASE_NOTES.md` section is missing, or whose commit is
+  not on `master`.
 - Writing "misc fixes" or a changelog that just repeats commit subjects.
 - Putting repository, tooling, or process detail in `RELEASE_NOTES.md`.
 - Listing user-facing highlights in `CHANGELOG.md`, or leaving a release out of
@@ -266,6 +310,8 @@ git status --short
 - [ ] `CHANGELOG.md` has one entry for the version, and `RELEASE_NOTES.md` has
       a section for it, including the stub when nothing user-visible changed.
 - [ ] One conventional commit contains the change and the notes.
-- [ ] An annotated `vX.Y.Z` tag points at that commit.
-- [ ] `git status` is clean and nothing was pushed.
+- [ ] An annotated `vX.Y.Z` tag points at that commit, and
+      `just release-notes vX.Y.Z` prints its section.
+- [ ] `git status` is clean and nothing was pushed. The release and image are
+      published by CI after the maintainer pushes the tag, not by the agent.
 - [ ] The user knows the version, commit, tag, and any skipped check.

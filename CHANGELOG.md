@@ -5,6 +5,38 @@ documentation, and process. User-visible features, behavior changes, bug fixes,
 and upgrade notes live in [RELEASE_NOTES.md](RELEASE_NOTES.md). Every tagged
 release has one entry here, newest first, and the version matches the git tag.
 
+## v0.2.4 — Release Automation and CI Hardening
+
+User-visible distribution changed: every annotated tag now publishes the release
+binaries and a multi-arch container image. See
+[RELEASE_NOTES.md](RELEASE_NOTES.md).
+
+- Added `.github/workflows/release.yml`. A `v*` tag push, or a manual dispatch
+  naming a tag, verifies the tag is annotated and that its commit is on
+  `master`, runs the fast gate, extracts the notes, resolves
+  `VERSION`/`COMMIT`/`DATE` from the tagged commit, writes `SHA256SUMS`, and
+  pushes the GHCR multi-arch image before it creates the release. A re-run edits
+  the existing release and re-uploads its assets with `--clobber`, so a failed
+  run converges instead of duplicating.
+- Added `cmd/release-notes` and `internal/releasenotes` for extracting one
+  release section, with table tests; `just release-notes <tag>` previews the
+  same title and body locally.
+- `Dockerfile` now builds on `$BUILDPLATFORM` and cross-compiles with
+  `$TARGETOS`/`$TARGETARCH`, so the arm64 image is produced without emulation.
+- CI: corrected the master concurrency comment; raised the test job cap to 30m
+  and gave `test` and `test-race` an explicit 10m timeout; raised the extended
+  cap to 60m. The Alpine lane runs as the invoking user, so the read-only parent
+  directory permission test no longer skips, derives and pins its toolchain
+  image with a `go.mod` guard, and the process RSS floor now accepts busybox
+  `yes`. The busybox fixture is pinned by digest in the workflow and both test
+  packages. The image test asserts `/data` ownership and the CA bundle, the
+  build matrix no longer fails fast, and the image banner checks use substring
+  matching. `just fmt-check` and `just lint-workflows` (actionlint v1.7.12) are
+  the lint sources; the golden gate detects untracked files and the goldens job
+  gets the Docker socket; the `setup-just` pin comment names v4.0.0.
+- Docs: the release skill, `AGENTS.md`, the README install and download path,
+  quickstart, implementation doc, and integration-testing skill wording.
+
 ## v0.2.3 — Split User-Facing Release Notes
 
 No user-visible changes; the binary, configuration, metrics, and storage formats

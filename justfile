@@ -2,6 +2,7 @@
 
 binary := "smob"
 staticcheck_version := "v0.8.2"
+actionlint_version := "v1.7.12"
 version := env_var_or_default("VERSION", `git describe --tags --always --dirty 2>/dev/null || echo dev`)
 commit := env_var_or_default("COMMIT", `git rev-parse --short HEAD 2>/dev/null || echo none`)
 date := env_var_or_default("DATE", `date -u +%Y-%m-%dT%H:%M:%SZ`)
@@ -37,6 +38,10 @@ build:
 fmt:
     gofmt -l -w .
 
+# Fail when any Go file is not gofmt-formatted.
+fmt-check:
+    test -z "$(gofmt -l .)" || { gofmt -l . >&2; echo "gofmt required; run 'just fmt'" >&2; exit 1; }
+
 # Run go vet with integration tags.
 vet:
     go vet -tags=integration ./...
@@ -45,13 +50,17 @@ vet:
 lint:
     go run honnef.co/go/tools/cmd/staticcheck@{{staticcheck_version}} -tags=integration ./...
 
+# Lint the GitHub Actions workflow files.
+lint-workflows:
+    go run github.com/rhysd/actionlint/cmd/actionlint@{{actionlint_version}} .github/workflows/*.yml
+
 # Run pure-function tests (no build tag).
 test-unit:
     go test -count=1 ./...
 
 # Run the fast integration suite.
 test: test-unit
-    go test -tags=integration -count=1 ./test/integration/...
+    go test -tags=integration -count=1 -timeout=10m ./test/integration/...
 
 # Run the extended integration suite in strict mode.
 test-all:
@@ -59,7 +68,7 @@ test-all:
 
 # Run integration tests with a race-enabled smob binary.
 test-race:
-    SMOB_TEST_RACE=1 go test -tags=integration -count=1 -shuffle=on ./test/integration/...
+    SMOB_TEST_RACE=1 go test -tags=integration -count=1 -shuffle=on -timeout=10m ./test/integration/...
 
 # Run the storage and Docker source integration tests under the race detector.
 # CI runs this in the extended job, where MinIO and Docker are required.
@@ -71,13 +80,19 @@ test-update:
     SMOB_TEST_UPDATE=1 go test -tags=integration -count=1 ./test/integration/...
 
 # Scoped to testdata/golden, the only fixture tree update mode writes.
+# git diff alone ignores untracked files, so a brand-new golden would pass the
+# gate uncommitted. The check below also covers newly created golden files.
 # Regenerate goldens and fail if the committed snapshots change; CI runs this.
 test-golden-check: test-update
-    git diff --exit-code -- test/integration/testdata/golden
+    test -z "$(git status --porcelain -- test/integration/testdata/golden)" || { git status --short -- test/integration/testdata/golden >&2; echo "goldens changed; review the regenerated files and commit them" >&2; exit 1; }
 
 # Build the Docker image.
 docker:
     docker build --build-arg VERSION={{quote(version)}} --build-arg COMMIT={{quote(commit)}} --build-arg DATE={{quote(date)}} -t {{quote(binary + ":" + version)}} . {{metadata_guard}}
+
+# Print one release's section from RELEASE_NOTES.md (local dry run before tagging).
+release-notes tag:
+    go run ./cmd/release-notes -tag {{quote(tag)}}
 
 # Cross-compile release binaries into dist/.
 release:

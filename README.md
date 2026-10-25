@@ -56,6 +56,29 @@ interchangeable and existing data can be copied between them with
 
 ## Install
 
+### Download a release
+
+Each annotated `vX.Y.Z` tag publishes a GitHub release. The
+[releases page](https://github.com/confuzeus/smob/releases) lists them newest
+first, and each release carries `smob-linux-amd64`, `smob-linux-arm64`,
+`SHA256SUMS`, and `LICENSE`. Download the binary for your architecture and
+verify it in the directory that holds the binary and the checksum file:
+
+```sh
+sha256sum -c SHA256SUMS
+```
+
+The checksum file lists both architectures, so a run with only one binary
+downloaded reports the missing one as failed; add `--ignore-missing` in that
+case.
+
+The container image is published for linux/amd64 and linux/arm64 as
+`ghcr.io/confuzeus/smob:vX.Y.Z` and `ghcr.io/confuzeus/smob:latest`, and runs as
+UID 65532. The mounts and permissions it needs are in
+[docs/docker.md](docs/docker.md).
+
+### Build from source
+
 Build the static binary with the provided justfile:
 
 ```sh
@@ -450,11 +473,18 @@ The [design and implementation plan](docs/IMPLEMENTATION.md) covers architecture
 the storage layout, delivery phases, testing strategy, and the TODO list.
 
 ```sh
-just test       # fast suite
-just test-all   # extended suite; requires MinIO and Docker for full coverage
-just lint
-just release
+just test                  # fast suite
+just test-all              # extended suite; needs MinIO and Docker
+just lint                  # staticcheck
+just lint-workflows        # actionlint over the workflow files
+just release-notes vX.Y.Z  # print one release's title and body
+just release               # cross-compile release binaries into dist/
 ```
+
+Pushing an annotated `vX.Y.Z` tag publishes the GitHub release and the container
+image through `.github/workflows/release.yml`; agents commit and tag but never
+push, so the push is the maintainer's action. The full process is in
+[.agents/skills/release/SKILL.md](.agents/skills/release/SKILL.md).
 
 ## License
 

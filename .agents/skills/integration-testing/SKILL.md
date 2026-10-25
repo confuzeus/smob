@@ -490,13 +490,27 @@ Required justfile recipes:
 | `test-race`          | Fast suite with `SMOB_TEST_RACE=1`                                      |
 | `test-race-extended` | `CGO_ENABLED=1` race run over `./internal/store/...` and `./internal/source/docker/...` |
 | `test-update`        | Fast suite with `SMOB_TEST_UPDATE=1`; rewrites goldens                  |
+| `fmt-check`          | `gofmt -l .`; fails on unformatted files without writing                |
+| `lint-workflows`     | actionlint over both workflow files (`ci.yml`, `release.yml`)           |
+
+CI invokes the justfile for formatting, vetting, static analysis, and workflow
+lint (`just fmt-check`, `just vet`, `just lint`, `just lint-workflows`) instead
+of inlining the underlying commands, so the justfile is the single source for
+what CI enforces.
 
 CI runs the fast and race suites on the Ubuntu (glibc) runner and the unit and
-fast suites in an Alpine container. The `extended` job starts pinned MinIO,
-checks the runner's Docker daemon, pre-pulls the `busybox:1.36` fixture image,
+fast suites in an Alpine container. The Alpine lane runs as the invoking user
+rather than root, so permission tests such as the read-only parent-directory
+case execute instead of skipping, and a guard checks its pinned toolchain image
+against `go.mod` so the two cannot drift. The `extended` job starts pinned
+MinIO, checks the runner's Docker daemon, pre-pulls the pinned Docker fixture,
 and runs `just test-all` in strict mode with both `SMOB_TEST_S3_*` and
 `SMOB_TEST_DOCKER_SOCKET` set, then `just test-race-extended` over the storage
-and Docker packages. A missing MinIO or Docker service fails that job; it never
+and Docker packages. The fixture is
+`busybox@sha256:73aaf090f3d85aa34ee199857f03fa3a95c8ede2ffd4cc2cdb5b94e566b11662`,
+pinned by digest so the tag cannot be repushed; the same value must match
+`DOCKER_TEST_IMAGE` in the workflow and `dockerTestImage` and `testImage` in the
+two test packages. A missing MinIO or Docker service fails that job; it never
 skips to a pass. The fast/race job sets the same Docker socket but is not
 strict, so Docker-gated tests run when the daemon is reachable and skip with a
 reason when it is not. `go test -race` by itself only instruments the test

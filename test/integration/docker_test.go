@@ -18,8 +18,10 @@ import (
 	"time"
 )
 
-// dockerTestImage is pinned so a cached image does not change between runs.
-const dockerTestImage = "busybox:1.36"
+// dockerTestImage is pinned by digest so the exact image bytes are fixed: the
+// busybox:1.36 tag alone can be repushed, so matching on the tag does not prove
+// a cached image is the one the suite was written against.
+const dockerTestImage = "busybox@sha256:73aaf090f3d85aa34ee199857f03fa3a95c8ede2ffd4cc2cdb5b94e566b11662"
 
 // TestDockerDisabledDoesNotTouchSocket proves that the default disabled source
 // is never constructed: a bogus socket path must not affect a system-only run.

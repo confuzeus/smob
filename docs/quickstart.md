@@ -1,9 +1,9 @@
 # Quickstart
 
-This is the shortest path from source to a first query. It runs smob in the
-foreground against a local data directory. For every field and validation rule,
-see [configuration.md](configuration.md); for deployment depth, see the links
-at the end.
+This is the shortest path from an installed binary to a first query. It runs
+smob in the foreground against a local data directory. For every field and
+validation rule, see [configuration.md](configuration.md); for deployment
+depth, see the links at the end.
 
 ## Requirements
 
@@ -15,7 +15,33 @@ at the end.
   version error.
 - No Docker or S3 service is needed for this walkthrough.
 
-## Build and install
+## Install
+
+### Download a release
+
+Official `smob-linux-amd64` and `smob-linux-arm64` binaries are attached to
+every release on the
+[releases page](https://github.com/confuzeus/smob/releases), together with
+`SHA256SUMS` and `LICENSE`; the [README](../README.md#install) covers the
+release process. Download the binary for your architecture and verify it from
+the directory that holds the binary and the checksum file:
+
+```sh
+sha256sum -c SHA256SUMS
+```
+
+`SHA256SUMS` lists both architectures, so a run with only one binary downloaded
+reports the other as missing; add `--ignore-missing` in that case. Put the
+binary on `PATH`, using the file name you downloaded:
+
+```sh
+sudo install -m 0755 ./smob-linux-amd64 /usr/local/bin/smob
+```
+
+`ghcr.io/confuzeus/smob:vX.Y.Z` is the published container image; see
+[docker.md](docker.md) for container deployment.
+
+### Build from source
 
 From a clone of the repository:
 
@@ -40,7 +66,8 @@ To install the binary system-wide, put it on `PATH`:
 sudo install -m 0755 ./smob /usr/local/bin/smob
 ```
 
-The rest of this page uses `./smob` from the repository checkout.
+The rest of this page uses `./smob`; if the binary is on `PATH`, use `smob`
+instead.
 
 ## Create a minimal configuration
 

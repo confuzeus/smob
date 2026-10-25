@@ -9,8 +9,12 @@ on:
 permissions:
   contents: read
 
-# A new push to a pull request supersedes the previous run. Pushes to master are
-# never cancelled so a landing commit always gets a complete result.
+# A new push to a pull request supersedes the previous run for that PR.
+# Master runs are serialized and never cancelled in progress, so the newest
+# landing commit always gets a complete run. A master run still queued when a
+# newer push arrives is superseded, so an intermediate landing commit may get
+# no result at all. That is deliberate: only the newest master commit matters,
+# and a full run for every intermediate push would queue for hours.
 concurrency:
   group: ${{ github.workflow }}-${{ github.ref }}
   cancel-in-progress: ${{ github.event_name == 'pull_request' }}
@@ -35,15 +39,17 @@ jobs:
           # Read the toolchain from the module so CI cannot drift from go.mod.
           go-version-file: go.mod
           cache: true
-      - uses: extractions/setup-just@53165ef7e734c5c07cb06b3c8e7b647c5aa16db3 # v4
+      - uses: extractions/setup-just@53165ef7e734c5c07cb06b3c8e7b647c5aa16db3 # v4.0.0
         with:
           just-version: ${{ env.JUST_VERSION }}
-      - name: gofmt
-        run: test -z "$(gofmt -l .)"
+      - name: formatting
+        run: just fmt-check
       - name: vet
-        run: go vet -tags=integration ./...
+        run: just vet
       - name: staticcheck
         run: just lint
+      - name: workflow lint
+        run: just lint-workflows
 
   tidy:
     runs-on: ubuntu-latest
@@ -64,7 +70,14 @@ jobs:
 
   test:
     runs-on: ubuntu-latest
-    timeout-minutes: 15
+    # Two Go suites run here: `just test` (13 untagged packages, then the
+    # integration package) and `just test-race` (the integration package again),
+    # each package carrying the justfile's explicit 10m budget. A normal run is
+    # a few minutes, so the cap is not a size estimate: it must outlast one
+    # hung package's 10m timeout plus the remaining work, so Go's panic and
+    # timeout output reach the log instead of the cap cancelling first. If
+    # every package hung, the cap cuts the run short; the first hang matters.
+    timeout-minutes: 30
     env:
       # Docker-gated tests run when the runner daemon is reachable and skip
       # with a reason when it is not: this lane is not strict. The extended
@@ -76,7 +89,7 @@ jobs:
         with:
           go-version-file: go.mod
           cache: true
-      - uses: extractions/setup-just@53165ef7e734c5c07cb06b3c8e7b647c5aa16db3 # v4
+      - uses: extractions/setup-just@53165ef7e734c5c07cb06b3c8e7b647c5aa16db3 # v4.0.0
         with:
           just-version: ${{ env.JUST_VERSION }}
       - run: just test
@@ -96,13 +109,18 @@ jobs:
       # edit that drops that assignment cannot silently turn the gate into a
       # plain test run.
       SMOB_TEST_UPDATE: "1"
+      # Update mode must exercise the same tests as the read-mode run it
+      # validates; if a Docker-gated test ever starts writing a golden, update
+      # mode has to see it. Like the `test` job, this lane stays non-strict: a
+      # missing daemon skips those tests with a reason instead of failing.
+      SMOB_TEST_DOCKER_SOCKET: /var/run/docker.sock
     steps:
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
       - uses: actions/setup-go@40f1582b2485089dde7abd97c1529aa768e1baff # v5.6.0
         with:
           go-version-file: go.mod
           cache: true
-      - uses: extractions/setup-just@53165ef7e734c5c07cb06b3c8e7b647c5aa16db3 # v4
+      - uses: extractions/setup-just@53165ef7e734c5c07cb06b3c8e7b647c5aa16db3 # v4.0.0
         with:
           just-version: ${{ env.JUST_VERSION }}
       - name: regenerated goldens match the committed tree
@@ -117,9 +135,11 @@ jobs:
     # waves per suite -- about 40m of Go budgets -- plus setup, image pulls, and
     # runner variance. The job cap must stay above that sum: if it fired first
     # the run would be cancelled and Go's panic/timeout output, which is the
-    # actionable part of a hang, would never reach the log. Keep one job:
-    # splitting adds coordination without improving reliability.
-    timeout-minutes: 50
+    # actionable part of a hang, would never reach the log. This 60m cap leaves
+    # about 20 minutes over the estimated ~40 minutes of Go budgets, covering
+    # setup, two image pulls, and runner variance. Keep one job: splitting adds
+    # coordination without improving reliability.
+    timeout-minutes: 60
     env:
       # Ephemeral credentials for this job's local MinIO only.
       SMOB_TEST_S3_ENDPOINT: http://127.0.0.1:9000
@@ -129,6 +149,14 @@ jobs:
       AWS_EC2_METADATA_DISABLED: "true"
       SMOB_TEST_STRICT: "1"
       SMOB_TEST_DOCKER_SOCKET: /var/run/docker.sock
+      # The Docker fixture is pinned by digest so CI pulls the exact image bytes
+      # the test packages were written against; a tag such as busybox:1.36 can be
+      # repushed in place. This value must match dockerTestImage in
+      # test/integration/docker_test.go and testImage in
+      # internal/source/docker/stats_integration_test.go: both assert the
+      # container's label against their own constant, so a stale pin here fails
+      # the suite with an image-label mismatch.
+      DOCKER_TEST_IMAGE: busybox@sha256:73aaf090f3d85aa34ee199857f03fa3a95c8ede2ffd4cc2cdb5b94e566b11662 # busybox:1.36
       # The MinIO image is pinned by digest. Pulled explicitly below and reused
       # by the start step so the pull and the run cannot drift apart.
       MINIO_IMAGE: pgsty/minio@sha256:b6bfe7239bfc83fb90d31612d9704d86039dd714f7904b3f1ad68f211e602372
@@ -142,7 +170,7 @@ jobs:
         with:
           go-version-file: go.mod
           cache: true
-      - uses: extractions/setup-just@53165ef7e734c5c07cb06b3c8e7b647c5aa16db3 # v4
+      - uses: extractions/setup-just@53165ef7e734c5c07cb06b3c8e7b647c5aa16db3 # v4.0.0
         with:
           just-version: ${{ env.JUST_VERSION }}
       - name: check Docker daemon
@@ -173,12 +201,15 @@ jobs:
           fi
       - name: pre-pull Docker test image
         run: |
-          if docker image inspect busybox:1.36 >/dev/null 2>&1; then
-            echo "busybox:1.36 is already cached"
+          # DOCKER_TEST_IMAGE is a digest ref, so this is only a cache check:
+          # the digest cannot resolve to different bytes. The error messages name
+          # the env var so a stale pin is obvious in the log.
+          if docker image inspect "$DOCKER_TEST_IMAGE" >/dev/null 2>&1; then
+            echo "$DOCKER_TEST_IMAGE is already cached"
             exit 0
           fi
           for attempt in 1 2; do
-            if docker pull busybox:1.36; then
+            if docker pull "$DOCKER_TEST_IMAGE"; then
               exit 0
             fi
             echo "pull attempt $attempt failed" >&2
@@ -186,7 +217,7 @@ jobs:
               sleep 5
             fi
           done
-          echo "::error::could not pull busybox:1.36 after two attempts; the Docker CLI tests require the pre-pulled fixture image" >&2
+          echo "::error::could not pull DOCKER_TEST_IMAGE=$DOCKER_TEST_IMAGE after two attempts; the Docker CLI tests require the pre-pulled fixture image. If this digest is stale, bump it here and in both test packages." >&2
           exit 1
       - name: verify the test Docker socket runs a container
         run: |
@@ -198,12 +229,12 @@ jobs:
             echo "::error::SMOB_TEST_DOCKER_SOCKET is empty; the extended suite requires the path of a working Docker socket" >&2
             exit 1
           fi
-          if ! out=$(DOCKER_HOST="unix://$SMOB_TEST_DOCKER_SOCKET" timeout 120 docker run --rm busybox:1.36 true 2>&1); then
+          if ! out=$(DOCKER_HOST="unix://$SMOB_TEST_DOCKER_SOCKET" timeout 120 docker run --rm "$DOCKER_TEST_IMAGE" true 2>&1); then
             printf '%s\n' "$out" >&2
-            echo "::error::cannot run a container through DOCKER_HOST=unix://$SMOB_TEST_DOCKER_SOCKET; the extended suite requires this socket to be a working Docker daemon" >&2
+            echo "::error::cannot run a container from DOCKER_TEST_IMAGE=$DOCKER_TEST_IMAGE through DOCKER_HOST=unix://$SMOB_TEST_DOCKER_SOCKET; the extended suite requires this socket to be a working Docker daemon and the pre-pulled fixture image (see the pre-pull step)" >&2
             exit 1
           fi
-          echo "ran a container through unix://$SMOB_TEST_DOCKER_SOCKET"
+          echo "ran $DOCKER_TEST_IMAGE through unix://$SMOB_TEST_DOCKER_SOCKET"
       - name: pre-pull MinIO image
         run: |
           # `docker run` below would otherwise pull this image implicitly, with
@@ -291,6 +322,9 @@ jobs:
     runs-on: ubuntu-latest
     timeout-minutes: 10
     strategy:
+      # Both architectures' results are wanted: an arch-specific failure is the
+      # signal this job exists to produce.
+      fail-fast: false
       matrix:
         goarch: [amd64, arm64]
     steps:
@@ -321,7 +355,7 @@ jobs:
         with:
           go-version-file: go.mod
           cache: true
-      - uses: extractions/setup-just@53165ef7e734c5c07cb06b3c8e7b647c5aa16db3 # v4
+      - uses: extractions/setup-just@53165ef7e734c5c07cb06b3c8e7b647c5aa16db3 # v4.0.0
         with:
           just-version: ${{ env.JUST_VERSION }}
       - name: binary reports its build metadata
@@ -363,17 +397,20 @@ jobs:
             fi
           done
       - name: build the image
-        run: VERSION=ci just docker
+        run: just docker
       - name: image is runnable, non-root, and carries the licence
         run: |
           image="smob:$VERSION"
           banner=$(docker run --rm --entrypoint /smob "$image" --version)
-          want="smob $VERSION (commit $COMMIT, built $DATE)"
           printf '%s\n' "$banner"
-          if [ "$banner" != "$want" ]; then
-            echo "::error::image /smob --version printed '$banner'; expected '$want'" >&2
-            exit 1
-          fi
+          # The format is not frozen here for the same reason as the binary step
+          # above: the contract is that the values survive into the image.
+          for value in "$VERSION" "$COMMIT" "$DATE"; do
+            if ! printf '%s' "$banner" | grep -Fq -- "$value"; then
+              echo "::error::image /smob --version is missing '$value': $banner" >&2
+              exit 1
+            fi
+          done
           # The scratch image has no shell, so inspect the config instead of
           # running `id` inside it.
           user=$(docker image inspect --format '{{.Config.User}}' "$image")
@@ -384,6 +421,39 @@ jobs:
           # /LICENSE cannot be executed, so copy it out and compare contents.
           cid=$(docker create "$image")
           trap 'docker rm -f "$cid" >/dev/null 2>&1 || true; rm -f LICENSE.image' EXIT
+          # Two filesystem claims are invisible to the checks above. First, the
+          # image ships an empty /data owned by 65532: Docker copies a named
+          # volume from that path, ownership included, so an uninitialized
+          # volume is writable by the documented runtime user instead of
+          # root:root. Second, the CA bundle from the build stage makes S3 over
+          # an https:// endpoint work; without it TLS verification fails at
+          # runtime with an obscure x509 error. Inspect one export listing and
+          # assert both, so drift fails here rather than in an operator's
+          # deployment. The listing is also printed on failure: the observed
+          # line is the diagnosis.
+          listing=$(docker export "$cid" | tar -tv)
+          data_line=$(printf '%s\n' "$listing" | awk '$NF == "data/" || $NF == "data" { print; exit }')
+          case "$data_line" in
+            d*65532/65532*)
+              ;;
+            *)
+              printf '%s\n' "$listing" >&2
+              echo "::error::image /data is not a directory owned by 65532/65532: ${data_line:-no /data entry in the image}" >&2
+              exit 1
+              ;;
+          esac
+          ca_line=$(printf '%s\n' "$listing" | awk '$NF == "etc/ssl/certs/ca-certificates.crt" { print; exit }')
+          if [ -z "$ca_line" ]; then
+            printf '%s\n' "$listing" >&2
+            echo "::error::image is missing etc/ssl/certs/ca-certificates.crt; S3 over an https:// endpoint would fail TLS verification at runtime" >&2
+            exit 1
+          fi
+          if ! printf '%s\n' "$ca_line" | awk '$1 ~ /^-/ && $3 + 0 > 0 { ok = 1 } END { exit !ok }'; then
+            printf '%s\n' "$listing" >&2
+            echo "::error::image etc/ssl/certs/ca-certificates.crt is not a non-empty regular file: $ca_line" >&2
+            exit 1
+          fi
+          printf 'data: %s\nca:   %s\n' "$data_line" "$ca_line"
           docker cp "$cid:/LICENSE" LICENSE.image
           if ! cmp -s LICENSE LICENSE.image; then
             echo "::error::image /LICENSE does not match the repository LICENSE" >&2
@@ -393,13 +463,45 @@ jobs:
   alpine:
     runs-on: ubuntu-latest
     timeout-minutes: 10
+    env:
+      # The tag names the toolchain the module requires, and the digest makes
+      # that exact image immutable so a repush of the tag cannot change what
+      # this lane tests. Bump both together. The guard step below fails when the
+      # tag stops matching go.mod, so the two cannot drift. An OCI index digest
+      # is correct: the per-platform manifest is selected on pull.
+      ALPINE_GO_IMAGE: golang:1.27.3-alpine@sha256:b8c9b82affbbb82a020bbcf998dad2ba9516944ac7e883524642a481a9505e9c # 1.27.3
     steps:
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
-      - name: unit and fast suite on an Alpine kernel
-        # The image tag matches the go directive in go.mod, like setup-go's
-        # go-version-file, so this lane tests the module's own toolchain. The
+      - name: check the Alpine toolchain matches go.mod
+        # A digest ref ignores the tag, so a bump of the go directive in go.mod
+        # without touching ALPINE_GO_IMAGE would otherwise silently keep this
+        # lane on the old toolchain: the tag would look right while the digest
+        # still resolved to the previous image.
+        run: |
+          want=$(sed -n 's/^go //p' go.mod)
+          got=${ALPINE_GO_IMAGE#golang:}
+          got=${got%@*}
+          got=${got%-alpine}
+          if [ "$got" != "$want" ]; then
+            echo "::error::ALPINE_GO_IMAGE pins Go $got but go.mod requires $want; bump ALPINE_GO_IMAGE and its @sha256 digest together" >&2
+            exit 1
+          fi
+      - name: unit and fast suite in an Alpine musl userland
+        # The container is a musl userland on the host's kernel, not a different
+        # kernel. The image tag names the module's own toolchain and the guard
+        # step above checks it against go.mod rather than assuming it. The
         # untagged run covers the pure-function tests that the tagged run skips,
         # giving musl coverage of them as well.
+        #
+        # The container runs as the invoking runner user rather than root:
+        # tests such as TestWriteFailsWhenParentDirectoryIsReadOnly skip when
+        # euid is 0, so a root lane would silently lose that permission
+        # coverage. HOME, GOCACHE, and GOPATH point under /tmp because the
+        # image's /root is not writable by that user. The image ships no git,
+        # and `go test` silently skips VCS stamping when git is absent, so the
+        # former `apk add git` is unnecessary.
         run: >
-          docker run --rm -v "$PWD:/src" -w /src golang:1.27.3-alpine
-          sh -c 'apk add --no-cache git && go test -count=1 ./... && go test -tags=integration -count=1 ./test/integration/...'
+          docker run --rm --user "$(id -u):$(id -g)" -v "$PWD:/src" -w /src
+          -e HOME=/tmp -e GOCACHE=/tmp/gocache -e GOPATH=/tmp/gopath
+          "$ALPINE_GO_IMAGE"
+          sh -c 'go test -count=1 ./... && go test -tags=integration -count=1 ./test/integration/...'

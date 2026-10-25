@@ -1,0 +1,348 @@
+name: release
+
+on:
+  push:
+    tags: ['v*']
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: "Release tag to publish, e.g. v0.2.4"
+        required: true
+        type: string
+
+# Publishing a release writes the tag's notes and uploads the artifacts to it,
+# so the token needs write access to repository contents and to packages.
+permissions:
+  contents: write
+  packages: write
+
+# A release must never be cancelled mid-flight: a half-published release is
+# worse than a queued one, so a second run waits instead of superseding the
+# first. The group is keyed on the ref so different tags still run in parallel.
+concurrency:
+  group: release-${{ github.ref }}
+  cancel-in-progress: false
+
+# Third-party and first-party actions are pinned to immutable commit SHAs with
+# the human-readable version in a trailing comment, exactly as in ci.yml.
+env:
+  # Pinned so a new `just` release cannot change how the justfile executes.
+  # 1.59.0 is the release the justfile is verified against.
+  JUST_VERSION: "1.59.0"
+
+jobs:
+  release:
+    runs-on: ubuntu-latest
+    timeout-minutes: 25
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+        with:
+          # A dispatch run needs the requested tag; a tag push checks out the
+          # pushed commit. Both give the same tree either way.
+          ref: ${{ inputs.tag || github.ref }}
+          # Full history and tags: the justfile derives VERSION from
+          # `git describe`, and later steps must be able to prove the tag is an
+          # ancestor of what they publish. A shallow clone has neither.
+          fetch-depth: 0
+      - uses: actions/setup-go@40f1582b2485089dde7abd97c1529aa768e1baff # v5.6.0
+        with:
+          # Read the toolchain from the module so CI cannot drift from go.mod.
+          go-version-file: go.mod
+          cache: true
+      - uses: extractions/setup-just@53165ef7e734c5c07cb06b3c8e7b647c5aa16db3 # v4.0.0
+        with:
+          just-version: ${{ env.JUST_VERSION }}
+
+      - name: resolve the release tag
+        # The tag arrives through the environment rather than an inline
+        # `${{ ... }}` interpolation: a dispatch input is arbitrary text, and
+        # interpolating it into the script would run it before the check below
+        # ever sees it.
+        env:
+          RELEASE_TAG: ${{ inputs.tag || github.ref_name }}
+        run: |
+          if ! printf '%s' "$RELEASE_TAG" | grep -Eq '^v[0-9]+\.[0-9]+\.[0-9]+$'; then
+            echo "::error::'$RELEASE_TAG' is not a release tag; expected vMAJOR.MINOR.PATCH such as v0.2.4" >&2
+            exit 1
+          fi
+          echo "TAG=$RELEASE_TAG" >> "$GITHUB_ENV"
+          echo "resolved release tag: $RELEASE_TAG"
+
+      - name: resolve whether this is the newest release
+        # `:latest` and the GitHub "latest release" marker should name the newest
+        # release, so they move only when this tag is that newest version. A
+        # re-run of an older tag — a workflow_dispatch of v0.2.3 long after
+        # v0.2.4 shipped, or a retry of a run that died after publishing — must
+        # update only its own tag, never drag either marker backwards. The sort
+        # is git's version sort rather than a lexical one, so v0.2.10 comes
+        # after v0.2.9 instead of before it. `fetch-depth: 0` above means every
+        # tag is present, and a tag push always has at least the pushed tag, so
+        # an empty list means the clone is wrong rather than that this is the
+        # oldest release.
+        run: |
+          newest=$(git tag --list 'v[0-9]*' --sort=-v:refname | head -n1)
+          if [ -z "$newest" ]; then
+            echo "::error::no version tags found; full tags are required to decide whether $TAG is the newest release" >&2
+            exit 1
+          fi
+          if [ "$newest" = "$TAG" ]; then
+            is_latest=1
+          else
+            is_latest=0
+          fi
+          echo "IS_LATEST=$is_latest" >> "$GITHUB_ENV"
+          echo "newest release tag: $newest"
+          echo "$TAG is the newest release: $is_latest"
+
+      - name: verify the tag is annotated and on master
+        # Publication cannot be undone, so the two facts the rest of the job
+        # depends on are proven here. An annotated tag records a tagger and a
+        # message; a lightweight tag is just a ref. And the artifact must be the
+        # tree the tag names on a commit that landed on master, because a tag on
+        # an unmerged branch would ship a tree that never passed a master CI run.
+        # HEAD, not GITHUB_SHA, is the checked-out commit: on a workflow_dispatch
+        # run GITHUB_SHA is the dispatched branch tip, not the tag's commit.
+        run: |
+          tag_type=$(git cat-file -t "$TAG" 2>/dev/null || true)
+          if [ "$tag_type" != "tag" ]; then
+            echo "::error::$TAG must be an annotated tag; git reports '$tag_type', so the ref is missing or lightweight and carries no tagger or message" >&2
+            exit 1
+          fi
+          head=$(git rev-parse HEAD)
+          tagged=$(git rev-parse "$TAG^{commit}")
+          if [ "$head" != "$tagged" ]; then
+            echo "::error::checked-out commit $head is not the commit $TAG names ($tagged); the artifact must be the tree the tag names" >&2
+            exit 1
+          fi
+          # Fetch master's current tip rather than trusting the clone, which may
+          # predate the commit this tag was meant to release.
+          git fetch --no-tags origin master
+          if ! git merge-base --is-ancestor "$(git rev-parse HEAD)" FETCH_HEAD; then
+            echo "::error::$TAG must be on master; its commit is not an ancestor of origin/master, so the release would publish a commit that never landed" >&2
+            exit 1
+          fi
+
+      - name: run the fast verification gate
+        # The release re-runs the fast gate instead of trusting the tag: a tag
+        # can be pushed before master's CI run finishes, or on a commit whose CI
+        # never went green, and this job is the last gate before publication.
+        # Only the fast lane, for the same reason ci.yml splits them: test-all
+        # needs MinIO and Docker, test-race needs cgo, and staticcheck is the
+        # lint job's contract rather than a publication prerequisite.
+        run: |
+          just fmt-check
+          just vet
+          just test
+
+      - name: extract the release notes
+        # The notes come from the same section a reader sees: headings are
+        # `# smob vX.Y.Z — Title` with an em dash, and the body is multi-line
+        # markdown. Writing to files and reading them back with $(cat) keeps the
+        # em dash's UTF-8 bytes and the body's newlines intact, where inlining
+        # them through the shell would word-split and may mangle them.
+        # `just release-notes <tag>` runs the same extraction for a local preview.
+        run: |
+          go run ./cmd/release-notes \
+            -tag "$TAG" \
+            -title-file "$RUNNER_TEMP/release-title.txt" \
+            -body-file "$RUNNER_TEMP/release-body.txt"
+          for file in "$RUNNER_TEMP/release-title.txt" "$RUNNER_TEMP/release-body.txt"; do
+            if [ ! -s "$file" ]; then
+              echo "::error::$file is empty; RELEASE_NOTES.md needs a non-empty section for $TAG" >&2
+              exit 1
+            fi
+          done
+          title=$(cat "$RUNNER_TEMP/release-title.txt")
+          body=$(cat "$RUNNER_TEMP/release-body.txt")
+          printf 'release title: %s\n' "$title"
+          printf 'release body:\n%s\n' "$body"
+
+      - name: resolve deterministic build metadata
+        # The banner printed by `smob --version` carries VERSION, COMMIT, and
+        # DATE, so the same tag must always produce the same banner: a rebuild,
+        # or a re-run of this workflow, has to be byte-identical in metadata.
+        # VERSION is the tag. COMMIT is the tagged commit's short hash, in the
+        # same 7-character style the CI assertions use; HEAD is that commit
+        # because the previous step proved HEAD is what the tag names. DATE is
+        # that commit's committer time in UTC, which is part of the release,
+        # rather than the wall clock, which is not. Exporting both to the
+        # environment lets `just release` pick them up instead of falling back
+        # to `git rev-parse --short HEAD` and `date`; the justfile reads
+        # COMMIT/DATE from the environment and runs its own tag/whitespace
+        # validation on them, so they need no quoting tricks here.
+        run: |
+          commit=$(git rev-parse --short HEAD)
+          date=$(TZ=UTC git log -1 --date=format-local:'%Y-%m-%dT%H:%M:%SZ' --format=%cd)
+          echo "COMMIT=$commit" >> "$GITHUB_ENV"
+          echo "DATE=$date" >> "$GITHUB_ENV"
+          echo "build metadata: COMMIT=$commit DATE=$date"
+
+      - name: build the release binaries
+        # VERSION is the tag, so the binaries carry the exact version they are
+        # published as. `just release` is a static CGO_ENABLED=0 cross-build
+        # into dist/.
+        run: |
+          VERSION="$TAG" just release
+          echo "built $TAG"
+          ls -l dist/
+
+      - name: verify the built binaries carry the tag
+        # `just release` links whatever VERSION it is handed, so the assertion is
+        # about the artifacts themselves rather than the build command. Only the
+        # amd64 binary is executed: the arm64 one cannot run on the amd64 runner,
+        # so it is held to existence, executability, and static linking.
+        run: |
+          for arch in amd64 arm64; do
+            bin="dist/smob-linux-$arch"
+            if [ ! -x "$bin" ]; then
+              echo "::error::$bin is missing or not executable" >&2
+              exit 1
+            fi
+            if ! file "$bin" | grep -Fq 'statically linked'; then
+              file "$bin" >&2
+              echo "::error::$bin is not statically linked; the published artifact must not depend on the runner's libc" >&2
+              exit 1
+            fi
+          done
+          banner=$(dist/smob-linux-amd64 --version)
+          printf '%s\n' "$banner"
+          if ! printf '%s' "$banner" | grep -Fq -- "$TAG"; then
+            echo "::error::dist/smob-linux-amd64 --version is missing '$TAG': $banner" >&2
+            exit 1
+          fi
+
+      - name: write checksums
+        # A download is only trustworthy if the user can prove it is the file
+        # that was published, and SHA256SUMS is the record `sha256sum -c` reads.
+        # It is computed from the exact binaries this job is about to upload, so
+        # the checksums and the assets cannot disagree. The LICENSE asset is the
+        # repository file itself and is published as-is, so it gets no entry.
+        # The listing is written from inside dist/ with bare filenames, so it
+        # verifies from wherever a user saved the two binaries; a dist/ prefix
+        # or an absolute path would only match this runner's layout.
+        run: |
+          (cd dist && sha256sum smob-linux-amd64 smob-linux-arm64 > SHA256SUMS)
+          cat dist/SHA256SUMS
+
+      - name: log in to GHCR
+        # The registry credential is the workflow token, not a stored secret:
+        # GITHUB_TOKEN is minted for this run, scoped to this repository, and
+        # revoked when the job ends, so there is no long-lived registry password
+        # to rotate. `packages: write` above is what authorizes the push. GHCR
+        # requires a lowercase image name and GITHUB_REPOSITORY keeps the owner's
+        # case, so the reference is lowercased once here and exported for the
+        # build step rather than rebuilt in each command.
+        env:
+          GITHUB_TOKEN: ${{ github.token }}
+        run: |
+          image="ghcr.io/${GITHUB_REPOSITORY,,}"
+          echo "IMAGE=$image" >> "$GITHUB_ENV"
+          printf '%s' "$GITHUB_TOKEN" | docker login ghcr.io -u "$GITHUB_ACTOR" --password-stdin
+          echo "logged in to ghcr.io as $GITHUB_ACTOR; image will be $image"
+
+      - name: build and push the multi-arch image
+        # The image is derived from the same tag as the binaries, with the same
+        # three build arguments, and those arguments are the only thing that
+        # varies: VERSION is the tag and COMMIT/DATE were resolved from the
+        # tagged commit. That keeps `docker inspect`'s image version label and
+        # the container's `smob --version` banner identical to the dist/
+        # binaries, so a rebuilt image and a downloaded binary describe the same
+        # release. `:latest` tracks the newest release; every tag is pushed under
+        # its own immutable name, so an older tag is pushed only under its own
+        # tag and a re-run cannot move `:latest` backwards.
+        #
+        # The push happens before the release is created: if the registry is
+        # unreachable the job fails here, and a release is never published
+        # pointing at an image that does not exist.
+        #
+        # A docker-container driver is created inline instead of pulling in a
+        # third-party setup action: the default docker driver cannot push a
+        # multi-platform index, and one extra `docker buildx create` is cheaper
+        # than another pinned action to audit. BuildKit is pinned by digest for
+        # the same reason the MinIO image in ci.yml is: `moby/buildkit:latest`
+        # moves under the pin, and buildx rejects a builder it cannot talk to
+        # mid-release. v0.34.0 is the BuildKit the docker 29.x/buildx 0.38.x
+        # pair on the runner ships with.
+        #
+        # No emulation is needed: the Dockerfile builds on $BUILDPLATFORM and
+        # cross-compiles with $TARGETOS/$TARGETARCH, so both platforms are
+        # produced by the runner's own Go toolchain.
+        env:
+          BUILDKIT_IMAGE: moby/buildkit@sha256:b059f8d7226d0b326bc871af489a5dddf65e36af4d20d14251b072974d9ee87c # v0.34.0
+        run: |
+          docker buildx create --name smob-release --driver docker-container \
+            --driver-opt image="$BUILDKIT_IMAGE" --use
+          # `:latest` tracks the newest release, so it is added to the tag list
+          # only when this tag is that newest version; an older tag is pushed
+          # solely under its own tag.
+          tags=(--tag "$IMAGE:$TAG")
+          pushed="$IMAGE:$TAG"
+          if [ "$IS_LATEST" = "1" ]; then
+            tags+=(--tag "$IMAGE:latest")
+            pushed="$pushed and $IMAGE:latest"
+          fi
+          docker buildx build \
+            --platform linux/amd64,linux/arm64 \
+            --build-arg "VERSION=$TAG" \
+            --build-arg "COMMIT=$COMMIT" \
+            --build-arg "DATE=$DATE" \
+            "${tags[@]}" \
+            --push .
+          echo "pushed $pushed (linux/amd64, linux/arm64)"
+
+      - name: publish the GitHub release
+        # Publication is the last step on purpose: a failed build, check, or
+        # (in a later item) image push must never leave a release without its
+        # artifacts. Re-publishing is safe rather than a hazard: the tag is
+        # immutable and the notes section was extracted from the tagged tree, so
+        # every input is fixed by the tag. That makes a converging re-run
+        # preferable to failing when a run dies after the release exists.
+        # GH_TOKEN is the workflow token, not a personal secret, so nothing
+        # extra needs storing as a repository secret.
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          title=$(cat "$RUNNER_TEMP/release-title.txt")
+          if [ -n "$title" ]; then
+            release_title="smob $TAG — $title"
+          else
+            release_title="smob $TAG"
+          fi
+          body="$RUNNER_TEMP/release-body.txt"
+          # One list, used by both paths: a create and a converging re-run must
+          # upload the same set in the same order. `assets` is an array so the
+          # expansion below stays one argument per asset, even if a name ever
+          # grows a space. LICENSE is the repository file, uploaded as-is.
+          assets=(
+            dist/smob-linux-amd64
+            dist/smob-linux-arm64
+            dist/SHA256SUMS
+            LICENSE
+          )
+          # `--latest` moves the repository's "latest release" marker, so it is
+          # passed only when this tag is the newest version: a re-run of an older
+          # tag still creates or edits that release, but leaves the marker where
+          # it is. `latest` is an array so the flag is simply absent otherwise.
+          latest=()
+          if [ "$IS_LATEST" = "1" ]; then
+            latest=(--latest)
+          fi
+          # `gh` is preinstalled on GitHub-hosted runners, so no install step.
+          if gh release view "$TAG" >/dev/null 2>&1; then
+            echo "$TAG already has a release; updating it in place"
+            gh release edit "$TAG" \
+              --title "$release_title" \
+              --notes-file "$body" \
+              "${latest[@]}"
+            gh release upload "$TAG" \
+              "${assets[@]}" \
+              --clobber
+          else
+            gh release create "$TAG" \
+              --verify-tag \
+              --title "$release_title" \
+              --notes-file "$body" \
+              "${latest[@]}" \
+              "${assets[@]}"
+          fi
+          echo "published $release_title"

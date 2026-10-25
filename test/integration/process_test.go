@@ -319,10 +319,12 @@ func TestProcessCPUPercent(t *testing.T) {
 		t.Fatalf("median cpu = %v%%, want at least %v%% for a tight burner", got, medianFloor)
 	}
 
-	// RSS is a plausible resident set for a dynamically linked `yes`, with room
-	// for a different libc without asserting an exact footprint.
+	// The floor catches a unit/scale error, not a footprint: bytes misreported as
+	// KiB, as page counts, or as MiB all land far below it, while a real `yes`
+	// burner keeps roughly 1 MiB resident with glibc and roughly 800 KiB with
+	// busybox's applet, so the floor must accept either libc.
 	const (
-		minRSS = 1 << 20 // 1 MiB
+		minRSS = 1 << 16 // 64 KiB
 		maxRSS = 1 << 30 // 1 GiB
 	)
 	for _, sample := range rssSamples {
