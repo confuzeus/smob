@@ -5,6 +5,31 @@ documentation, and process. User-visible features, behavior changes, bug fixes,
 and upgrade notes live in [RELEASE_NOTES.md](RELEASE_NOTES.md). Every tagged
 release has one entry here, newest first, and the version matches the git tag.
 
+## v0.2.6 — One-Line Installation
+
+User-visible distribution changed: smob now ships a `curl` installer that
+verifies the release checksum and can install and start the systemd service.
+The binary is unchanged. See [RELEASE_NOTES.md](RELEASE_NOTES.md).
+
+- Added `install.sh`, a POSIX `sh` installer published as a release asset at
+  `releases/latest/download/install.sh`. It resolves the latest tag from the
+  release redirect, validates `vX.Y.Z`, selects linux/amd64 or linux/arm64,
+  verifies the binary against `SHA256SUMS`, installs atomically to
+  `/usr/local/bin/smob`, creates `/etc/smob/smob.yaml` only when absent,
+  validates it, and installs and restarts the systemd unit. Non-root use
+  requires `--no-service --install-dir DIR`; the unit's fixed paths are
+  rejected otherwise. `SMOB_RELEASES_BASE_URL` overrides the download prefix for
+  mirrors and CI.
+- `release.yml` publishes `install.sh` and `contrib/systemd/smob.service` (as
+  `smob.service`) with each release, and installs the built binaries through the
+  installer from a local mirror before publishing.
+- Added `test/integration/install_test.go` covering a successful install, a
+  checksum mismatch, a missing asset, and the non-root refusal. The Alpine lane
+  skips it with a reason when curl is absent.
+- Added `just lint-shell` (shellcheck), run by the CI lint job.
+- Docs: README and quickstart lead with the installer; IMPLEMENTATION records
+  the release assets, repository layout, and the distribution item.
+
 ## v0.2.5 — Workflow Lint Fix
 
 Nothing user-visible changed; the binary is identical to v0.2.4. See

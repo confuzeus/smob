@@ -54,6 +54,10 @@ lint:
 lint-workflows:
     go run github.com/rhysd/actionlint/cmd/actionlint@{{actionlint_version}} .github/workflows/*.yml
 
+# Lint the shell installer.
+lint-shell:
+    shellcheck install.sh
+
 # Run pure-function tests (no build tag).
 test-unit:
     go test -count=1 ./...

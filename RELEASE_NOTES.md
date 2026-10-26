@@ -1,3 +1,29 @@
+# smob v0.2.6 — One-Line Installation
+
+smob can now be installed with a single `curl` command. The installer verifies
+the release checksum, installs the static binary, creates a minimal
+configuration when none exists, and sets up the systemd service. The binary,
+configuration, metrics, and storage formats are unchanged from v0.2.5.
+
+## Highlights
+
+- **Install with curl.** Running
+  `curl -fsSL https://github.com/confuzeus/smob/releases/latest/download/install.sh | sudo sh`
+  installs `/usr/local/bin/smob`, writes `/etc/smob/smob.yaml` only when it is
+  absent, installs the hardened systemd unit, and enables and starts the
+  service. Pass `--no-service` for a binary-only install, `--version vX.Y.Z` to
+  pin a release, or `--install-dir DIR` with `--no-service` for another prefix.
+- **Installer and unit are release assets.** `install.sh` and `smob.service`
+  ship with every release, so the installer and the artifacts it downloads come
+  from the same tag. Re-running the installer upgrades the binary, restarts the
+  service, and never overwrites an existing configuration.
+
+## Upgrade notes
+
+- None. The binary, configuration, metrics, and storage formats are unchanged.
+
+---
+
 # smob v0.2.5 — Workflow Lint Fix
 
 This release is a CI-only fix. The `smob` binary, its configuration, its

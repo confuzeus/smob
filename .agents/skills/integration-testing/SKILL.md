@@ -492,11 +492,12 @@ Required justfile recipes:
 | `test-update`        | Fast suite with `SMOB_TEST_UPDATE=1`; rewrites goldens                  |
 | `fmt-check`          | `gofmt -l .`; fails on unformatted files without writing                |
 | `lint-workflows`     | actionlint over both workflow files (`ci.yml`, `release.yml`)           |
+| `lint-shell`         | shellcheck over `install.sh`                                            |
 
-CI invokes the justfile for formatting, vetting, static analysis, and workflow
-lint (`just fmt-check`, `just vet`, `just lint`, `just lint-workflows`) instead
-of inlining the underlying commands, so the justfile is the single source for
-what CI enforces.
+CI invokes the justfile for formatting, vetting, static analysis, workflow
+lint, and shell lint (`just fmt-check`, `just vet`, `just lint`,
+`just lint-workflows`, `just lint-shell`) instead of inlining the underlying
+commands, so the justfile is the single source for what CI enforces.
 
 CI runs the fast and race suites on the Ubuntu (glibc) runner and the unit and
 fast suites in an Alpine container. The Alpine lane runs as the invoking user

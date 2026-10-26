@@ -50,6 +50,8 @@ jobs:
         run: just lint
       - name: workflow lint
         run: just lint-workflows
+      - name: shell lint
+        run: just lint-shell
 
   tidy:
     runs-on: ubuntu-latest

@@ -17,14 +17,30 @@ depth, see the links at the end.
 
 ## Install
 
+### Install script
+
+```sh
+curl -fsSL https://github.com/confuzeus/smob/releases/latest/download/install.sh | sudo sh
+```
+
+On a systemd host this installs the binary to `/usr/local/bin/smob`, writes a
+minimal `/etc/smob/smob.yaml` when none exists, installs the hardened unit from
+`contrib/systemd/smob.service`, and enables and starts `smob`. The generated
+configuration uses `data_dir: /var/lib/smob`, the system source, and the disk
+backend. Pass `--no-service` to install the binary only, `--version vX.Y.Z` to
+pin a release, or `--install-dir DIR` with `--no-service` for another prefix.
+The [README](../README.md#install) describes the script in full. The rest of
+this page uses `./smob`; replace it with `smob` when the binary is on `PATH`.
+
 ### Download a release
 
 Official `smob-linux-amd64` and `smob-linux-arm64` binaries are attached to
 every release on the
 [releases page](https://github.com/confuzeus/smob/releases), together with
-`SHA256SUMS` and `LICENSE`; the [README](../README.md#install) covers the
-release process. Download the binary for your architecture and verify it from
-the directory that holds the binary and the checksum file:
+`SHA256SUMS`, `install.sh`, `smob.service`, and `LICENSE`; the
+[README](../README.md#install) covers the release process. Download the binary
+for your architecture and verify it from the directory that holds the binary and
+the checksum file:
 
 ```sh
 sha256sum -c SHA256SUMS

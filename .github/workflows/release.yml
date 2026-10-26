@@ -215,14 +215,35 @@ jobs:
         # A download is only trustworthy if the user can prove it is the file
         # that was published, and SHA256SUMS is the record `sha256sum -c` reads.
         # It is computed from the exact binaries this job is about to upload, so
-        # the checksums and the assets cannot disagree. The LICENSE asset is the
-        # repository file itself and is published as-is, so it gets no entry.
-        # The listing is written from inside dist/ with bare filenames, so it
-        # verifies from wherever a user saved the two binaries; a dist/ prefix
-        # or an absolute path would only match this runner's layout.
+        # the checksums and the assets cannot disagree. LICENSE, install.sh, and
+        # the systemd unit are repository files published as-is, so they get no
+        # entry. The listing is written from inside dist/ with bare filenames,
+        # so it verifies from wherever a user saved the two binaries; a dist/
+        # prefix or an absolute path would only match this runner's layout.
         run: |
           (cd dist && sha256sum smob-linux-amd64 smob-linux-arm64 > SHA256SUMS)
           cat dist/SHA256SUMS
+
+      - name: install from the built release assets
+        # The installer is published as part of the same release, so the exact
+        # file users will run is exercised before anything is published. The
+        # local mirror has the release layout the script expects
+        # (<base>/<tag>/<asset>), and --no-service keeps the check rootless and
+        # off the runner's systemd.
+        run: |
+          root="$RUNNER_TEMP/smob-install-smoke"
+          rm -rf "$root"
+          mkdir -p "$root/$TAG" "$root/bin"
+          cp dist/smob-linux-amd64 dist/smob-linux-arm64 dist/SHA256SUMS "$root/$TAG/"
+          SMOB_RELEASES_BASE_URL="file://$root" \
+            sh ./install.sh --version "$TAG" --no-service --install-dir "$root/bin"
+          banner=$("$root/bin/smob" --version)
+          printf '%s\n' "$banner"
+          if ! printf '%s' "$banner" | grep -Fq -- "$TAG"; then
+            echo "::error::installed smob --version is missing '$TAG': $banner" >&2
+            exit 1
+          fi
+          rm -rf "$root"
 
       - name: log in to GHCR
         # The registry credential is the workflow token, not a stored secret:
@@ -312,11 +333,18 @@ jobs:
           # One list, used by both paths: a create and a converging re-run must
           # upload the same set in the same order. `assets` is an array so the
           # expansion below stays one argument per asset, even if a name ever
-          # grows a space. LICENSE is the repository file, uploaded as-is.
+          # grows a space. install.sh and contrib/systemd/smob.service are
+          # repository files, not dist/; `gh release upload` uses each file's
+          # basename, so the unit is published as `smob.service`, the name the
+          # installer downloads. LICENSE is uploaded as-is. SHA256SUMS covers
+          # only the two binaries, the files users must verify before running
+          # them.
           assets=(
             dist/smob-linux-amd64
             dist/smob-linux-arm64
             dist/SHA256SUMS
+            install.sh
+            contrib/systemd/smob.service
             LICENSE
           )
           # `--latest` moves the repository's "latest release" marker, so it is

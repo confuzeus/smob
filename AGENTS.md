@@ -46,6 +46,7 @@ the operator entry points. Pushing an annotated tag publishes the GitHub release
 | Check formatting without writing | `just fmt-check` |
 | Vet and static analysis | `just vet`, `just lint` |
 | Lint the workflow files | `just lint-workflows` (actionlint) |
+| Lint the shell installer | `just lint-shell` (shellcheck) |
 | Pure-function tests | `just test-unit` |
 | Fast integration suite | `just test` |
 | Extended suite (MinIO and Docker, strict mode) | `just test-all` |
@@ -111,7 +112,8 @@ See `docs/IMPLEMENTATION.md` for the full repository layout.
 
 ## Definition of done
 
-- [ ] `gofmt -l .` is empty; `just vet`, `just lint`, and `just test` pass.
+- [ ] `gofmt -l .` is empty; `just vet`, `just lint`, `just lint-shell`, and
+      `just test` pass.
 - [ ] `just test-all` passes with MinIO and Docker available. It runs in strict
       mode, so a missing service fails rather than skips; CI's `extended` job
       enforces both.

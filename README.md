@@ -56,13 +56,44 @@ interchangeable and existing data can be copied between them with
 
 ## Install
 
+### Install script
+
+The installer verifies the release checksum, installs the static binary to
+`/usr/local/bin/smob`, writes a minimal `/etc/smob/smob.yaml` only when that
+file is absent, and installs and starts the hardened systemd unit:
+
+```sh
+curl -fsSL https://github.com/confuzeus/smob/releases/latest/download/install.sh | sudo sh
+```
+
+It prompts for nothing, because standard input carries the script. Pin a
+release with `--version vX.Y.Z` (or `SMOB_VERSION`), or install the binary only
+with `--no-service`. `--install-dir DIR` selects another prefix and requires
+`--no-service`, since the unit runs `/usr/local/bin/smob`. Without those flags,
+a non-root run fails and prints the `sudo` form. The script is a release asset,
+so the installer and the artifacts it downloads always come from the same tag.
+Download and read it first if you prefer:
+
+```sh
+curl -fsSLO https://github.com/confuzeus/smob/releases/latest/download/install.sh
+less install.sh
+sudo sh install.sh
+```
+
+Re-running the installer upgrades the binary and restarts the service, and it
+never overwrites an existing `/etc/smob/smob.yaml`. The generated configuration
+uses `data_dir: /var/lib/smob`, the system source, and the disk backend; the
+manual install below remains the fallback and the place to start when you need a
+different layout.
+
 ### Download a release
 
 Each annotated `vX.Y.Z` tag publishes a GitHub release. The
 [releases page](https://github.com/confuzeus/smob/releases) lists them newest
 first, and each release carries `smob-linux-amd64`, `smob-linux-arm64`,
-`SHA256SUMS`, and `LICENSE`. Download the binary for your architecture and
-verify it in the directory that holds the binary and the checksum file:
+`SHA256SUMS`, `install.sh`, `smob.service`, and `LICENSE`. Download the binary
+for your architecture and verify it in the directory that holds the binary and
+the checksum file:
 
 ```sh
 sha256sum -c SHA256SUMS
