@@ -1,3 +1,20 @@
+# smob v0.2.8 — Flaky Collector Test Fix
+
+This release fixes an intermittently failing collector test that could break CI.
+The `smob` binary, its configuration, its metrics, and its storage formats are
+unchanged from v0.2.7, so there is no upgrade action.
+
+## Highlights
+
+- **None.** The only change is to the scheduler unit test, which no longer races
+  its own deadline.
+
+## Upgrade notes
+
+- None.
+
+---
+
 # smob v0.2.7 — Copy-Paste Recipes
 
 smob now ships a [recipes page](docs/recipes.md) with complete, copy-paste

@@ -5,6 +5,20 @@ documentation, and process. User-visible features, behavior changes, bug fixes,
 and upgrade notes live in [RELEASE_NOTES.md](RELEASE_NOTES.md). Every tagged
 release has one entry here, newest first, and the version matches the git tag.
 
+## v0.2.8 — Flaky Collector Test Fix
+
+Nothing user-visible changed; the binary is identical to v0.2.7. See
+[RELEASE_NOTES.md](RELEASE_NOTES.md).
+
+- `internal/collector`: `TestSlowSourceTimesOutAndRunContinues` bounded the run
+  with a 400 ms parent context and then asserted that every tick carried a
+  positive per-tick deadline. Near the parent's expiry a tick could start with
+  its clamped deadline already in the past, which the assertion read as a
+  missing deadline, so the test failed intermittently (about 1 in 20 runs
+  locally). The test now cancels the run when the slow source retries, so the
+  run has no deadline of its own, every tick carries the full `tickTimeout`
+  budget, and the retried sample is still flushed to the store and asserted.
+
 ## v0.2.7 — Copy-Paste Recipes
 
 Documentation only; the binary, configuration, metrics, and storage formats are

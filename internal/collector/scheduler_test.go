@@ -303,34 +303,51 @@ func TestSlowSourceTimesOutAndRunContinues(t *testing.T) {
 
 	var logs bytes.Buffer
 	logger := slog.New(slog.NewJSONHandler(&logs, nil))
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+
 	slow := &funcSource{
 		scope:    "slow",
 		interval: interval,
 		collect: func(ctx context.Context, now time.Time, call int) ([]model.Sample, error) {
-			if call > 1 {
+			switch call {
+			case 1:
+				<-ctx.Done()
+				return nil, ctx.Err()
+			case 2:
 				return tickSamples(now, call), nil
 			}
-			<-ctx.Done()
-			return nil, ctx.Err()
+			// The retry is handed to the collector before the next tick starts,
+			// so cancelling here stops the run with that sample already queued
+			// for the store. A bounded run context instead would race the
+			// deadline assertions below: near its expiry a tick can start with
+			// its context deadline already in the past, which is the parent's
+			// expiry, not the per-tick budget this test is about.
+			cancel()
+			return tickSamples(now, call), nil
 		},
 	}
 	fast := &funcSource{scope: "system", interval: interval}
 	c, st := newTestCollector(t, []Source{slow, fast}, logger)
 
-	ctx, cancel := context.WithTimeout(context.Background(), 400*time.Millisecond)
-	defer cancel()
-	if err := c.Run(ctx); err != nil {
-		t.Fatalf("Run returned %v after a tick timeout, want a clean stop", err)
+	done := make(chan error, 1)
+	go func() { done <- c.Run(ctx) }()
+	select {
+	case err := <-done:
+		if err != nil {
+			t.Fatalf("Run returned %v after a tick timeout, want a clean stop", err)
+		}
+	case <-time.After(5 * time.Second):
+		t.Fatal("Run did not return after the retry")
 	}
 
 	stats := slow.snapshot()
 	if stats.calls < 2 {
 		t.Fatalf("slow source called %d times, want a retry after its timed-out tick", stats.calls)
 	}
-	// The tick context carries tickTimeout(interval). context.WithTimeout also
-	// clamps it to the parent's deadline, so ticks late in a bounded run see
-	// less than the full budget; the first tick, the one that times out, must
-	// carry the derived value.
+	// The run context has no deadline of its own, so every tick context carries
+	// the full tickTimeout(interval). The first tick is the one that times out,
+	// so it must carry the derived value rather than some leftover budget.
 	want := tickTimeout(interval)
 	for i, remaining := range stats.deadlines {
 		if remaining <= 0 {
