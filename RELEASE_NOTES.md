@@ -1,3 +1,22 @@
+# smob v0.2.7 — Copy-Paste Recipes
+
+smob now ships a [recipes page](docs/recipes.md) with complete, copy-paste
+setups for the common deployments. Each recipe includes a full `smob.yaml`, the
+commands that start it, a verification path, and links to the reference guides.
+The binary, configuration, metrics, and storage formats are unchanged from
+v0.2.6.
+
+## Highlights
+
+- **Six starting points.** Local disk on systemd, AWS S3 on systemd, Docker
+  Compose with local disk, Docker Compose with container metrics, a MinIO
+  playground, and a query-only host.
+- **Variants for common changes.** Process filtering, disk retention, smaller
+  chunks, shared S3 buckets, static credentials, bind-mounted Docker data, and
+  S3-backed Compose deployments.
+
+---
+
 # smob v0.2.6 — One-Line Installation
 
 smob can now be installed with a single `curl` command. The installer verifies

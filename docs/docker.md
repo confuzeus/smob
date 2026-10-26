@@ -13,7 +13,8 @@ below.
 The metric catalogue is in the [README](../README.md#metrics-reference),
 S3/MinIO deployment is covered in [s3.md](s3.md), the first-run walkthrough is
 in [quickstart.md](quickstart.md), and the full field reference is in
-[configuration.md](configuration.md).
+[configuration.md](configuration.md). For copy-paste Compose recipes — local
+disk and container metrics — see [recipes.md](recipes.md).
 
 ## What a container's `/proc` shows
 

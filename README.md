@@ -17,12 +17,13 @@ interchangeable and existing data can be copied between them with
 > and S3 backends (including local spool replay), `collect`, `query`, `stats`,
 > disk retention, and aggregation are implemented. The Docker source is
 > disabled by default and is enabled with `sources.docker.enabled: true`.
-> Operator documentation — the [quickstart](docs/quickstart.md), [configuration
-> reference](docs/configuration.md), [S3/MinIO guide](docs/s3.md), [container
-> deployment guide](docs/docker.md), systemd unit, and Compose file — is
-> implemented alongside the code. `tail` remains a stub; live tail, a chunk
-> index, and multi-host aggregation are unscheduled v0.3 candidates. The
-> command and metric reference below describes the current contract. See the
+> Operator documentation — the [quickstart](docs/quickstart.md),
+> [recipes](docs/recipes.md), [configuration reference](docs/configuration.md),
+> [S3/MinIO guide](docs/s3.md), [container deployment guide](docs/docker.md),
+> systemd unit, and Compose file — is implemented alongside the code. `tail`
+> remains a stub; live tail, a chunk index, and multi-host aggregation are
+> unscheduled v0.3 candidates. The command and metric reference below describes
+> the current contract. See the
 > [design and implementation plan](docs/IMPLEMENTATION.md) for architecture,
 > phases, and the TODO list.
 
@@ -138,6 +139,7 @@ container image (`FROM scratch`, non-root user, CA bundle) can be built with
 | Guide | Contents |
 | --- | --- |
 | [Quickstart](docs/quickstart.md) | Build, minimal config, first `collect --once`/`query`, daemon, service. |
+| [Recipes](docs/recipes.md) | Copy-paste setups for systemd, Docker Compose, AWS S3, MinIO, container metrics, and query-only hosts. |
 | [Configuration reference](docs/configuration.md) | Every field with type, default, validation rule, and effect. |
 | [S3 and MinIO](docs/s3.md) | IAM policy, credential chain, MinIO recipe, spool behavior. |
 | [Disk → S3 migration](docs/migration.md) | Quiesce the collector, copy with `aws s3 sync`, verify samples, switch, roll back. |

@@ -333,6 +333,7 @@ test/integration/              # black-box CLI tests
 test/integration/testdata/     # golden files
 docs/IMPLEMENTATION.md         # design, storage internals, phases, TODO
 docs/quickstart.md             # operator quickstart
+docs/recipes.md                # copy-paste deployment recipes
 docs/configuration.md          # canonical YAML field reference
 docs/s3.md, docs/docker.md     # S3/MinIO and container deployment guides
 contrib/systemd/smob.service   # systemd unit

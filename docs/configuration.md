@@ -2,8 +2,9 @@
 
 This page is the canonical reference for every `smob.yaml` field: its type,
 default, validation rule, and effect. Deployment walkthroughs live in
-[quickstart.md](quickstart.md), [s3.md](s3.md), and [docker.md](docker.md); the
-design rationale is in [IMPLEMENTATION.md](IMPLEMENTATION.md).
+[quickstart.md](quickstart.md), [recipes.md](recipes.md), [s3.md](s3.md), and
+[docker.md](docker.md); the design rationale is in
+[IMPLEMENTATION.md](IMPLEMENTATION.md).
 
 ## How configuration is loaded
 
@@ -171,4 +172,6 @@ For a complete S3/MinIO configuration, use
 [s3.md](s3.md#custom-endpoints-and-minio). For a container deployment that
 reads the host procfs and Docker socket, use
 [docker.md](docker.md#host-system-and-process-metrics) and the repository
-[compose.yaml](../compose.yaml).
+[compose.yaml](../compose.yaml). For complete, copy-paste setups for systemd,
+Docker Compose, S3, MinIO, and query-only hosts, see
+[recipes.md](recipes.md).

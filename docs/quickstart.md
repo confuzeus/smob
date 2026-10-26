@@ -284,6 +284,8 @@ optional Docker socket, and data-directory ownership.
 
 ## Next steps
 
+- [Recipes](recipes.md) — complete, copy-paste setups for systemd, Docker
+  Compose, S3, MinIO, container metrics, and query-only hosts.
 - [Configuration reference](configuration.md) — every field, default, and
   validation rule.
 - [S3 and MinIO](s3.md) — IAM policy, credentials, remote storage, and spool

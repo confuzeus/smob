@@ -5,6 +5,19 @@ documentation, and process. User-visible features, behavior changes, bug fixes,
 and upgrade notes live in [RELEASE_NOTES.md](RELEASE_NOTES.md). Every tagged
 release has one entry here, newest first, and the version matches the git tag.
 
+## v0.2.7 — Copy-Paste Recipes
+
+Documentation only; the binary, configuration, metrics, and storage formats are
+unchanged from v0.2.6. See [RELEASE_NOTES.md](RELEASE_NOTES.md).
+
+- Added `docs/recipes.md`: complete copy-paste setups for systemd on local disk,
+  systemd on AWS S3, Docker Compose on local disk, Docker Compose with container
+  metrics, MinIO, and query-only hosts, with variants for process filtering,
+  retention, shared buckets, static credentials, bind mounts, and S3 in Compose.
+- Cross-linked the recipes from `README.md`, `docs/quickstart.md`,
+  `docs/configuration.md`, `docs/s3.md`, `docs/docker.md`, and the repository
+  layout in `docs/IMPLEMENTATION.md`.
+
 ## v0.2.6 — One-Line Installation
 
 User-visible distribution changed: smob now ships a `curl` installer that
